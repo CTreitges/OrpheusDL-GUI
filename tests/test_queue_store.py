@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import builtins
 import os
 import sys
 import threading
@@ -14,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hires.models import QueueItem, QueueStatus  # noqa: E402
+from hires import queue_store as qs
 from hires.queue_store import QueueStore  # noqa: E402
 
 
@@ -728,3 +730,111 @@ def test_set_paused_only_notifies_on_a_real_change(tmp_path):
 
 if __name__ == "__main__":  # pragma: no cover - convenience for manual runs
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# Windows file locking
+#
+# os.replace over an open destination raises PermissionError on Windows but is
+# fine on POSIX, so these simulate the failure to keep the regression covered
+# on every platform.
+# ---------------------------------------------------------------------------
+
+def test_save_retries_a_locked_destination(tmp_path, monkeypatch):
+    """A transient Windows lock must not lose the write."""
+    store = QueueStore(str(tmp_path / "queue.json"))
+    store.add(QueueItem(url="u1", title="First"))
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(qs.os, "replace", flaky_replace)
+    monkeypatch.setattr(qs.time, "sleep", lambda _s: None)
+
+    store.add(QueueItem(url="u2", title="Second"))
+
+    assert calls["n"] > 3, "did not retry"
+    reopened = QueueStore(str(tmp_path / "queue.json"))
+    assert [i.title for i in reopened.list()] == ["First", "Second"]
+
+
+def test_save_gives_up_on_a_permanently_locked_destination(tmp_path, monkeypatch, caplog):
+    """Never crash the download session because the queue file is stuck."""
+    store = QueueStore(str(tmp_path / "queue.json"))
+
+    def always_locked(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(qs.os, "replace", always_locked)
+    monkeypatch.setattr(qs.time, "sleep", lambda _s: None)
+
+    store.add(QueueItem(url="u1"))  # must not raise
+
+    assert len(store.list()) == 1  # in-memory state still correct
+    assert not list(tmp_path.glob("*.tmp")), "temp file left behind"
+
+
+def test_load_retries_a_locked_file_instead_of_discarding_the_queue(tmp_path, monkeypatch):
+    """A lock during startup must not silently empty the queue."""
+    path = str(tmp_path / "queue.json")
+    seed = QueueStore(path)
+    seed.add_many([QueueItem(url="u1", title="First"), QueueItem(url="u2", title="Second")])
+
+    real_open = builtins.open
+    calls = {"n": 0}
+
+    def flaky_open(file, *args, **kwargs):
+        if str(file) == path:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(5, "Access is denied")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    monkeypatch.setattr(qs.time, "sleep", lambda _s: None)
+
+    reopened = QueueStore(path)
+
+    assert [i.title for i in reopened.list()] == ["First", "Second"]
+
+
+def test_load_gives_up_on_a_permanently_locked_file(tmp_path, monkeypatch):
+    path = str(tmp_path / "queue.json")
+    QueueStore(path).add(QueueItem(url="u1"))
+
+    real_open = builtins.open
+
+    def always_locked(file, *args, **kwargs):
+        if str(file) == path:
+            raise PermissionError(5, "Access is denied")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", always_locked)
+    monkeypatch.setattr(qs.time, "sleep", lambda _s: None)
+
+    assert QueueStore(path).list() == []  # empty, but no crash
+
+
+def test_corrupt_file_is_not_retried(tmp_path, monkeypatch):
+    """Retrying a JSON error is pointless; fail fast instead."""
+    path = tmp_path / "queue.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    calls = {"n": 0}
+    real_open = builtins.open
+
+    def counting_open(file, *args, **kwargs):
+        if str(file) == str(path):
+            calls["n"] += 1
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    assert QueueStore(str(path)).list() == []
+    assert calls["n"] == 1, "corrupt file should be read once, not retried"

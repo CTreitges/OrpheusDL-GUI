@@ -33,6 +33,28 @@ from .models import QueueItem, QueueStats, QueueStatus
 
 log = logging.getLogger(__name__)
 
+
+def _replace_with_retry(src: str, dst: str, attempts: int = 12, delay: float = 0.02) -> None:
+    """``os.replace`` that copes with Windows file locking.
+
+    POSIX renames over an open file without complaint. Windows refuses with
+    ``PermissionError`` (WinError 5) for as long as any other handle has the
+    destination open -- and this store is read while it is written (the queue
+    poller reads, worker threads write). The lock is released within
+    milliseconds, so a short backoff is all that is needed.
+
+    Raises the last ``PermissionError`` if the destination stays locked.
+    """
+    last: Optional[PermissionError] = None
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:  # Windows only
+            last = exc
+            time.sleep(delay * (attempt + 1))
+    raise last if last is not None else OSError(f"could not replace {dst}")
+
 #: Bumped whenever the on-disk layout changes in an incompatible way.
 FILE_VERSION = 1
 
@@ -109,7 +131,7 @@ class QueueStore:
                 json.dump(payload, handle, indent=2, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_path, self.path)
+            _replace_with_retry(tmp_path, self.path)
             tmp_path = None
         except OSError:
             # A failing disk must not take the whole download session down.
@@ -153,16 +175,32 @@ class QueueStore:
                 continue
             self._append_locked(item, recover=True)
 
-    def _read_file_locked(self) -> Any:
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as exc:
-            # ValueError covers json.JSONDecodeError.
-            log.warning("queue file %s is unreadable (%s) - starting empty", self.path, exc)
-            return None
+    def _read_file_locked(self, attempts: int = 5, delay: float = 0.02) -> Any:
+        """Read the queue file, retrying a Windows lock.
+
+        On Windows the file is briefly unopenable while a concurrent save
+        replaces it. Treating that as "unreadable" would silently discard a
+        perfectly good queue, so a ``PermissionError`` is retried. A genuinely
+        corrupt file (``ValueError``) is not -- retrying cannot help there.
+        """
+        last_error: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                with open(self.path, "r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except FileNotFoundError:
+                return None
+            except PermissionError as exc:  # Windows: save in flight
+                last_error = exc
+                time.sleep(delay * (attempt + 1))
+            except (OSError, ValueError) as exc:
+                # ValueError covers json.JSONDecodeError.
+                log.warning("queue file %s is unreadable (%s) - starting empty", self.path, exc)
+                return None
+        log.warning(
+            "queue file %s stayed locked (%s) - starting empty", self.path, last_error
+        )
+        return None
 
     # -- mutation -----------------------------------------------------------
     def add(self, item: QueueItem) -> QueueItem:
