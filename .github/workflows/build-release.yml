@@ -80,8 +80,10 @@ jobs:
           git clone --depth 1 "$ORPHEUS_REPO" app
           # GUI files sit alongside orpheus.py. Use cp rather than rsync:
           # Windows runners have Git Bash but no rsync. Drop the GUI checkout's
-          # own .git first so it cannot clobber app/.git.
-          rm -rf gui-src/.git
+          # own .git so it cannot clobber app/.git, and any stray virtualenv --
+          # those contain symlinks that cp cannot recreate on Windows, which
+          # fails the whole build.
+          rm -rf gui-src/.git gui-src/.venv* gui-src/venv
           cp -R gui-src/. app/
           cd app
           # Platform modules the GUI expects. TIDAL needs its submodule

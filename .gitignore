@@ -136,3 +136,6 @@ Thumbs.db
 ehthumbs.db
 desktop.ini
 $RECYCLE.BIN/ 
+# Local virtualenvs used for development/testing
+.venv*
+venv*/
