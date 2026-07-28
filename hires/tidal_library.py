@@ -36,8 +36,10 @@ _ARTWORK_SIZES = (80, 160, 320, 480, 640, 1080, 1280, 1281)
 #: Playlists are only rendered up to 1080x1080 by the CDN.
 _PLAYLIST_MAX_SIZE = 1080
 
+#: The scheme is optional, so the host has to be anchored explicitly - otherwise
+#: ``re.search`` happily finds "tidal.com/track/1" inside "nottidal.com/track/1".
 _URL_RE = re.compile(
-    r"(?:https?://)?(?:www\.|listen\.)?tidal\.com/(?:browse/)?"
+    r"(?:\A|(?<=\s))(?:https?://)?(?:www\.|listen\.)?tidal\.com/(?:browse/)?"
     r"(?P<kind>track|album|playlist|artist)/(?P<id>[A-Za-z0-9-]+)",
     re.IGNORECASE,
 )
@@ -348,7 +350,9 @@ class TidalLibrary:
             raise SourceUnavailableError(
                 f"Could not load items of TIDAL playlist {playlist_id}: {exc}"
             ) from exc
-        if _is_error_payload(data):
+        if not data or _is_error_payload(data):
+            # An empty playlist still answers with a dict, so a falsy body means
+            # the response was unusable - never report that as "0 tracks".
             raise SourceUnavailableError(f"TIDAL playlist {playlist_id} not found")
 
         out: List[TrackRef] = []

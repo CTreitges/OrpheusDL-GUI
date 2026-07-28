@@ -342,6 +342,35 @@ def test_current_user_id_and_is_authenticated():
     assert guest.is_authenticated() is False
 
 
+def test_current_user_id_when_api_cannot_answer():
+    """A missing or exploding authenticated_session() reads as "not logged in"."""
+
+    class NoAuthMethod:
+        pass
+
+    class Exploding(FakeApi):
+        def authenticated_session(self):
+            raise RuntimeError("session storage unreadable")
+
+    assert tl.TidalLibrary(NoAuthMethod()).current_user_id() is None
+    assert tl.TidalLibrary(Exploding()).is_authenticated() is False
+    # ...and the higher-level call turns that into AuthRequiredError, not a crash.
+    with pytest.raises(AuthRequiredError):
+        tl.TidalLibrary(Exploding()).list_playlists()
+
+
+def test_list_playlists_propagates_auth_error_raised_while_iterating():
+    """A session that dies mid-iteration must stay an AuthRequiredError."""
+
+    class Expired(FakeApi):
+        def iter_user_playlist_entries(self, user_id):
+            raise AuthRequiredError("session expired")
+            yield  # pragma: no cover - makes this a generator
+
+    with pytest.raises(AuthRequiredError):
+        tl.TidalLibrary(Expired()).list_playlists()
+
+
 # ---------------------------------------------------------------------------
 # get_playlist_tracks
 # ---------------------------------------------------------------------------
@@ -393,6 +422,32 @@ def test_get_playlist_tracks_wraps_api_errors():
         tl.TidalLibrary(FakeApi()).get_playlist_tracks("missing")
 
 
+def test_get_playlist_tracks_raises_on_404_payload():
+    class Api404(FakeApi):
+        def get_playlist_items(self, playlist_id):
+            return {"status": 404, "error": "Not Found"}
+
+    with pytest.raises(SourceUnavailableError):
+        tl.TidalLibrary(Api404()).get_playlist_tracks("pl-1")
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "nope"])
+def test_get_playlist_tracks_raises_on_unusable_body(body):
+    """A falsy/garbled body must not be reported as an empty playlist."""
+
+    class ApiJunk(FakeApi):
+        def get_playlist_items(self, playlist_id):
+            return body
+
+    with pytest.raises(SourceUnavailableError):
+        tl.TidalLibrary(ApiJunk()).get_playlist_tracks("pl-1")
+
+
+def test_get_playlist_tracks_allows_genuinely_empty_playlist():
+    api = FakeApi(playlist_items={"pl-empty": []})
+    assert tl.TidalLibrary(api).get_playlist_tracks("pl-empty") == []
+
+
 # ---------------------------------------------------------------------------
 # get_playlist
 # ---------------------------------------------------------------------------
@@ -413,6 +468,35 @@ def test_get_playlist_raises_on_404_payload():
         tl.TidalLibrary(FakeApi()).get_playlist("nope")
 
 
+def test_get_playlist_wraps_api_exception():
+    class Boom(FakeApi):
+        def get_playlist(self, playlist_id):
+            raise RuntimeError("TIDAL is down")
+
+    with pytest.raises(SourceUnavailableError):
+        tl.TidalLibrary(Boom()).get_playlist("pl-1")
+
+
+def test_get_playlist_keeps_requested_id_when_payload_has_none():
+    """Some payloads omit the uuid - the result must stay addressable."""
+    api = FakeApi(playlists={"pl-1": {"title": "No uuid", "numberOfTracks": 3}})
+    pl = tl.TidalLibrary(api).get_playlist("pl-1")
+
+    assert pl.id == "pl-1"
+    assert pl.url == "https://tidal.com/browse/playlist/pl-1"
+    assert pl.name == "No uuid"
+
+
+def test_get_playlist_tolerates_non_numeric_counts():
+    api = FakeApi(playlists={"pl-1": {
+        "uuid": "pl-1", "title": "Broken", "numberOfTracks": "many", "duration": None,
+    }})
+    pl = tl.TidalLibrary(api).get_playlist("pl-1")
+
+    assert pl.track_count == 0
+    assert pl.duration_sec is None
+
+
 # ---------------------------------------------------------------------------
 # search / isrc
 # ---------------------------------------------------------------------------
@@ -431,6 +515,15 @@ def test_search_tracks_handles_missing_and_empty_query():
     assert tl.TidalLibrary(FakeApi(search={})).search_tracks("x") == []
     assert tl.TidalLibrary(FakeApi(search={"tracks": None})).search_tracks("x") == []
     assert tl.TidalLibrary(FakeApi()).search_tracks("   ") == []
+
+
+def test_search_tracks_wraps_api_errors():
+    class Boom(FakeApi):
+        def get_search_data(self, search_term, limit=20):
+            raise RuntimeError("TIDAL is down")
+
+    with pytest.raises(SourceUnavailableError):
+        tl.TidalLibrary(Boom()).search_tracks("blue monday")
 
 
 def test_find_by_isrc_returns_tracks():
@@ -477,6 +570,17 @@ def test_from_orpheus_returns_none_without_tidal_module():
     assert tl.TidalLibrary.from_orpheus(FakeOrpheus(loaded={"tidal": object()})) is None
 
 
+def test_from_orpheus_with_unusable_module_list():
+    """module_list is a set on the real Orpheus - anything else must not crash."""
+
+    class WeirdOrpheus:
+        loaded_modules = {}
+        module_list = 42
+        load_module = staticmethod(lambda name: None)
+
+    assert tl.TidalLibrary.from_orpheus(WeirdOrpheus()) is None
+
+
 def test_from_orpheus_raises_when_not_logged_in():
     orpheus = FakeOrpheus(loaded={"tidal": FakeModule(FakeApi(session=guest_session()))})
     with pytest.raises(AuthRequiredError):
@@ -505,6 +609,13 @@ def test_artwork_url_format_and_size_snapping():
     assert tl.artwork_url("") == ""
 
 
+def test_artwork_url_falls_back_on_unusable_size():
+    cover = "12345678-90ab-cdef-1234-567890abcdef"
+    base = "https://resources.tidal.com/images/12345678/90ab/cdef/1234/567890abcdef"
+    assert tl.artwork_url(cover, size="big") == f"{base}/640x640.jpg"
+    assert tl.artwork_url(cover, size=None) == f"{base}/640x640.jpg"
+
+
 @pytest.mark.parametrize("url,expected", [
     ("https://listen.tidal.com/album/12345", ("album", "12345")),
     ("https://tidal.com/browse/track/232917499", ("track", "232917499")),
@@ -512,10 +623,18 @@ def test_artwork_url_format_and_size_snapping():
     ("https://www.tidal.com/browse/playlist/aaaa-bbbb-cccc", ("playlist", "aaaa-bbbb-cccc")),
     ("http://listen.tidal.com/browse/artist/42?u=1", ("artist", "42")),
     ("tidal.com/browse/album/999", ("album", "999")),
+    ("  https://tidal.com/track/1  ", ("track", "1")),
+    ("Listen to https://tidal.com/browse/track/7 now", ("track", "7")),
     ("https://open.spotify.com/track/abc", None),
     ("https://tidal.com/browse/mix/abc", None),
+    # Lookalike hosts must not be accepted just because the scheme is optional.
+    ("https://nottidal.com/track/123", None),
+    ("https://myfaketidal.com/album/9", None),
+    ("https://tidal.com.attacker.net/track/5", None),
+    ("https://evil.example/?next=tidal.com/track/1", None),
     ("", None),
     (None, None),
+    (12345, None),
 ])
 def test_parse_tidal_url(url, expected):
     assert tl.parse_tidal_url(url) == expected

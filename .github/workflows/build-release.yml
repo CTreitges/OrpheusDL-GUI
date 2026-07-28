@@ -78,8 +78,11 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 "$ORPHEUS_REPO" app
-          # GUI files sit alongside orpheus.py.
-          rsync -a --exclude '.git' gui-src/ app/
+          # GUI files sit alongside orpheus.py. Use cp rather than rsync:
+          # Windows runners have Git Bash but no rsync. Drop the GUI checkout's
+          # own .git first so it cannot clobber app/.git.
+          rm -rf gui-src/.git
+          cp -R gui-src/. app/
           cd app
           # Platform modules the GUI expects. TIDAL needs its submodule
           # (mqa_identifier_python) for MQA detection.

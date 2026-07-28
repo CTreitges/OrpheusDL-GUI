@@ -440,6 +440,163 @@ def test_active_items_come_back_as_pending_with_attempts_intact(tmp_path):
     assert store.next_pending().id == "1"
 
 
+def test_interrupted_item_at_max_attempts_is_not_handed_out_again(tmp_path):
+    """A crash on the last attempt counts like a failure on the last attempt.
+
+    Otherwise a download that takes the app down with it would be restarted on
+    every single launch.
+    """
+    path = tmp_path / "queue.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": [
+                    {"url": "a", "id": "1", "status": "active", "attempts": 3, "max_attempts": 3},
+                    {"url": "b", "id": "2", "status": "active", "attempts": 1, "max_attempts": 3},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = QueueStore(str(path))
+    burned = store.get("1")
+    assert burned.status == QueueStatus.FAILED.value
+    assert burned.attempts == 3
+    assert burned.error
+    assert store.retry("1") is False
+    # The item that still had attempts left is queued again.
+    assert store.get("2").status == QueueStatus.PENDING.value
+    assert store.claim_next().id == "2"
+    assert store.claim_next() is None
+
+
+def test_broken_counters_do_not_kill_the_worker(tmp_path):
+    """Hand-edited queue files must not make ``claim_next`` raise."""
+    path = tmp_path / "queue.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "items": [
+                    {"url": "a", "id": "1", "attempts": "2", "max_attempts": "5"},
+                    {"url": "b", "id": "2", "attempts": None, "max_attempts": None},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = QueueStore(str(path))
+    assert (store.get("1").attempts, store.get("1").max_attempts) == (2, 5)
+    assert (store.get("2").attempts, store.get("2").max_attempts) == (0, 3)
+
+    first = store.claim_next()
+    assert (first.id, first.attempts) == ("1", 3)
+    second = store.claim_next()
+    assert (second.id, second.attempts) == ("2", 1)
+
+
+def test_legacy_plain_list_file_still_loads(tmp_path):
+    path = tmp_path / "queue.json"
+    path.write_text(json.dumps([{"url": "a", "id": "1"}, {"url": "b"}]), encoding="utf-8")
+
+    store = QueueStore(str(path))
+    assert urls(store.list()) == ["a", "b"]
+    assert store.is_paused is False
+
+
+def test_duplicate_ids_in_file_are_separated(tmp_path):
+    path = tmp_path / "queue.json"
+    path.write_text(
+        json.dumps({"items": [{"url": "a", "id": "X"}, {"url": "b", "id": "X"}]}),
+        encoding="utf-8",
+    )
+
+    store = QueueStore(str(path))
+    items = store.list()
+    assert urls(items) == ["a", "b"]
+    assert len({i.id for i in items}) == 2
+    assert all(store.get(i.id) is i for i in items)
+
+
+def test_adding_the_same_object_twice_keeps_the_index_consistent(tmp_path):
+    store = new_store(tmp_path)
+    item = make_item("a")
+    first = store.add(item)
+    second = store.add(item)  # caller error, but must not corrupt the index
+
+    assert first is item
+    assert second is not item
+    assert first.id != second.id
+    assert urls(store.list()) == ["a", "a"]
+    assert store.get(first.id) is first
+    assert store.get(second.id) is second
+    assert store.remove(first.id) is True
+    assert urls(store.list()) == ["a"]
+    assert store.get(second.id) is second
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+    reason="needs a directory the current user really cannot write to",
+)
+def test_save_failure_is_logged_not_raised(tmp_path, caplog):
+    folder = tmp_path / "readonly"
+    folder.mkdir()
+    store = QueueStore(str(folder / "queue.json"), autosave=False)
+    store.add(make_item("a"))
+    folder.chmod(0o500)
+    try:
+        with caplog.at_level(logging.ERROR):
+            store.save()  # a full/locked disk must not kill the session
+        assert any("could not write queue file" in r.message for r in caplog.records)
+        # The in-memory queue is untouched and still usable.
+        assert urls(store.list()) == ["a"]
+        assert store.claim_next().url == "a"
+    finally:
+        folder.chmod(0o700)
+
+
+def test_readers_never_see_a_half_written_file(tmp_path):
+    """The temp-file + rename dance has to hold up under concurrent writers."""
+    store = new_store(tmp_path)
+    stop = threading.Event()
+    decode_errors = []
+    good_reads = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                with open(store.path, encoding="utf-8") as handle:
+                    json.load(handle)
+                good_reads.append(1)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - that is the point
+                decode_errors.append(repr(exc))
+
+    def writer(n):
+        for i in range(40):
+            store.add(make_item(f"w{n}-{i}", source={"pad": "x" * 300}))
+
+    readers = [threading.Thread(target=reader) for _ in range(2)]
+    writers = [threading.Thread(target=writer, args=(n,)) for n in range(2)]
+    for thread in readers + writers:
+        thread.start()
+    for thread in writers:
+        thread.join(timeout=60)
+    stop.set()
+    for thread in readers:
+        thread.join(timeout=10)
+
+    assert decode_errors == []
+    assert good_reads
+    assert len(store) == 80
+    assert [p.name for p in tmp_path.iterdir() if p.name != "queue.json"] == []
+
+
 def test_atomic_write_leaves_no_temp_files(tmp_path):
     store = new_store(tmp_path)
     items = store.add_many([make_item(f"u{n}") for n in range(5)])
@@ -530,11 +687,43 @@ def test_callback_may_mutate_the_store(tmp_path):
     def callback():
         # Re-entering from the notifying thread must not deadlock either.
         seen.append(len(store.list()))
+        if len(seen) == 1:
+            # A mutation from inside a callback has to land, not blow up.
+            store.mark_cancelled(store.list()[0].id)
 
     store.subscribe(callback)
+    item = store.add(make_item("a"))
+
+    assert seen == [1, 1]  # the nested mark_cancelled notified once more
+    assert store.get(item.id).status == QueueStatus.CANCELLED.value
+
+
+def test_unsubscribe_from_inside_a_callback(tmp_path):
+    store = new_store(tmp_path)
+    calls = []
+    holder = {}
+
+    def callback():
+        calls.append(1)
+        holder["off"]()  # drop out while the notification is running
+
+    holder["off"] = store.subscribe(callback)
     store.add(make_item("a"))
     store.add(make_item("b"))
-    assert seen == [1, 2]
+    assert calls == [1]
+
+
+def test_set_paused_only_notifies_on_a_real_change(tmp_path):
+    store = new_store(tmp_path)
+    calls = []
+    store.subscribe(lambda: calls.append(1))
+
+    store.set_paused(False)  # already unpaused
+    assert calls == []
+    store.set_paused(True)
+    store.set_paused(True)
+    assert calls == [1]
+    assert store.is_paused is True
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience for manual runs

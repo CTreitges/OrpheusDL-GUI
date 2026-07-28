@@ -19,6 +19,7 @@ Design notes:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -35,6 +36,11 @@ log = logging.getLogger(__name__)
 #: Bumped whenever the on-disk layout changes in an incompatible way.
 FILE_VERSION = 1
 
+#: Taken from the contract so the fallback cannot drift away from it.
+DEFAULT_MAX_ATTEMPTS: int = next(
+    f.default for f in dataclasses.fields(QueueItem) if f.name == "max_attempts"
+)
+
 _STATS_FIELD = {
     QueueStatus.PENDING.value: "pending",
     QueueStatus.ACTIVE.value: "active",
@@ -49,6 +55,14 @@ def _status_value(status: Any) -> Optional[str]:
     if status is None:
         return None
     return getattr(status, "value", status)
+
+
+def _coerce_int(value: Any, fallback: int) -> int:
+    """Queue files are hand-editable, so the counters need a sanity check."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 class QueueStore:
@@ -137,7 +151,7 @@ class QueueStore:
             except (ValueError, TypeError) as exc:
                 log.warning("skipping unusable queue entry (%s): %r", exc, entry)
                 continue
-            self._append_locked(item, requeue_active=True)
+            self._append_locked(item, recover=True)
 
     def _read_file_locked(self) -> Any:
         try:
@@ -152,47 +166,74 @@ class QueueStore:
 
     # -- mutation -----------------------------------------------------------
     def add(self, item: QueueItem) -> QueueItem:
-        """Append one item and return it (its ``id`` may have been replaced)."""
+        """Append one item and return the stored entry.
+
+        The returned item is normally the one that was passed in, with a
+        possibly replaced ``id``. Handing the *same* object to ``add`` twice
+        stores an independent copy instead, so the caller gets that copy back.
+        """
         with self._lock:
-            self._append_locked(item)
+            stored = self._append_locked(item)
             self._maybe_save_locked()
         self._notify()
-        return item
+        return stored
 
     def add_many(self, items: Iterable[QueueItem]) -> List[QueueItem]:
         """Append several items with a single save and a single notification."""
         added: List[QueueItem] = []
         with self._lock:
             for item in items:
-                self._append_locked(item)
-                added.append(item)
+                added.append(self._append_locked(item))
             if added:
                 self._maybe_save_locked()
         if added:
             self._notify()
         return added
 
-    def _append_locked(self, item: QueueItem, requeue_active: bool = False) -> None:
-        item.status = self._normalise_status(item.status, requeue_active=requeue_active)
-        if requeue_active and item.status == QueueStatus.PENDING.value:
-            item.started_at = None
+    def _append_locked(self, item: QueueItem, recover: bool = False) -> QueueItem:
+        """Store ``item`` (or a copy of it) and return the stored entry."""
+        if self._index.get(item.id) is item:
+            # The very same object is already queued. Re-using it would leave
+            # the old index key pointing at an item whose id just changed, so
+            # queue an independent copy instead.
+            item = QueueItem(**item.to_dict())
+        item.status = self._normalise_status(item.status)
+        item.attempts = _coerce_int(item.attempts, 0)
+        item.max_attempts = _coerce_int(item.max_attempts, DEFAULT_MAX_ATTEMPTS)
+        if recover:
+            self._recover_item(item)
         if not item.id or item.id in self._index:
             item.id = uuid.uuid4().hex
         self._items.append(item)
         self._index[item.id] = item
+        return item
 
     @staticmethod
-    def _normalise_status(status: Any, requeue_active: bool = False) -> str:
+    def _normalise_status(status: Any) -> str:
         """Map anything unexpected onto a status the rest of the code trusts."""
         try:
-            known = QueueStatus(_status_value(status))
+            return QueueStatus(_status_value(status)).value
         except ValueError:
             return QueueStatus.PENDING.value
-        if requeue_active and known is QueueStatus.ACTIVE:
-            # The app died mid-download; queue it up again but keep ``attempts``
-            # so the retry limit still applies.
-            return QueueStatus.PENDING.value
-        return known.value
+
+    @staticmethod
+    def _recover_item(item: QueueItem) -> None:
+        """Fix up an entry that was in flight when the app died.
+
+        ``attempts`` is kept either way, and the attempt limit really is
+        honoured: a crash during the last attempt counts like a failure during
+        the last attempt, otherwise a download that takes the app down with it
+        would be retried on every single restart.
+        """
+        if item.status == QueueStatus.ACTIVE.value:
+            if item.attempts >= item.max_attempts:
+                item.status = QueueStatus.FAILED.value
+                item.error = item.error or "interrupted before it could finish"
+                item.finished_at = item.finished_at or time.time()
+            else:
+                item.status = QueueStatus.PENDING.value
+        if item.status == QueueStatus.PENDING.value:
+            item.started_at = None
 
     def remove(self, item_id: str) -> bool:
         with self._lock:
