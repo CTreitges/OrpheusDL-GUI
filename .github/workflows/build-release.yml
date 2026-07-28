@@ -94,6 +94,12 @@ jobs:
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-deezer                      modules/deezer
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-soundcloud                  modules/soundcloud
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-youtube                     modules/youtube
+          # Vendored librespot-python: gui.spec bundles vendor/librespot into
+          # the frozen app; without it the Spotify module dies at runtime with
+          # "No module named librespot". Same recipe as the official
+          # installers, including the patched core.py the Spotify module ships.
+          python -m pip install --no-deps --upgrade --target vendor/librespot "git+https://github.com/kokarare1212/librespot-python"
+          cp modules/spotify/librespot/core.py vendor/librespot/librespot/core.py
 
       - name: Install Python dependencies
         working-directory: app
