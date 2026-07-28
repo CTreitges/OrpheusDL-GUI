@@ -143,3 +143,7 @@ venv*/
 # Hi-Res suite runtime state — contains the Spotify refresh token
 config/hires_spotify_tokens.json
 config/hires_queue.json
+
+# OrpheusDL service modules, cloned in beside the GUI at runtime. They belong
+# to their own repositories and must never be vendored into this one.
+modules/

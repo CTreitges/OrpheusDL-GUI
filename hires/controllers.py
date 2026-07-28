@@ -22,6 +22,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .converter import PlaylistConverter, apply_review, queue_items_for_tracks
 from .models import (
+    AccountState,
+    AccountStatus,
     AuthRequiredError,
     ConversionReport,
     HiresError,
@@ -592,3 +594,231 @@ class SpotifyImportController:
             f"{c.get(MatchDecision.NEEDS_REVIEW.value, 0)} to review · "
             f"{c.get(MatchDecision.NO_MATCH.value, 0)} not found"
         )
+
+
+# ---------------------------------------------------------------------------
+# Accounts tab
+# ---------------------------------------------------------------------------
+
+#: Shown while TIDAL's device flow waits for the user to finish in the browser.
+TIDAL_SIGN_IN_HINT = (
+    "Finish the sign-in in your browser. This window keeps waiting until you do."
+)
+
+
+class AccountsController:
+    """Sign in to TIDAL and Spotify before queueing anything.
+
+    Both services can also be signed into implicitly -- TIDAL when a download
+    needs credentials, Spotify when "My playlists" is first clicked. This
+    controller only makes that step visible and movable to the front, so the
+    first download is not the thing that suddenly opens a browser window.
+
+    Status is *never* cached. Every provider is called on demand, because the
+    TIDAL module may not be loaded yet when the tabs are built and would
+    otherwise be remembered as "unavailable" for the rest of the session.
+    """
+
+    #: Services in the order they are shown.
+    SERVICES = ("TIDAL", "Spotify")
+
+    def __init__(
+        self,
+        *,
+        tidal_status_provider: Callable[[], AccountStatus],
+        spotify_status_provider: Callable[[], AccountStatus],
+        tidal_sign_in: Optional[Callable[[], Any]] = None,
+        spotify_controller: Optional["SpotifyImportController"] = None,
+        dispatch: Optional[UiDispatcher] = None,
+        busy_provider: Optional[Callable[[], bool]] = None,
+    ):
+        """
+        Args:
+            tidal_sign_in: blocking callable that drives TIDAL's device flow.
+                ``None`` when the TIDAL module is not installed.
+            spotify_controller: reused so both tabs share one Spotify source and
+                one set of tokens.
+            busy_provider: True while a download is running. Signing in mid-
+                download would swap the session out from under it.
+        """
+        self.tidal_status_provider = tidal_status_provider
+        self.spotify_status_provider = spotify_status_provider
+        self.tidal_sign_in_callable = tidal_sign_in
+        self.spotify_controller = spotify_controller
+        self.dispatch = dispatch or UiDispatcher()
+        self.busy_provider = busy_provider or (lambda: False)
+
+        # Guards against a second click while a browser flow is still open.
+        self._in_flight: Dict[str, bool] = {}
+
+    # -- status -------------------------------------------------------------
+    def statuses(self) -> List[AccountStatus]:
+        """Current state of every service. Cheap enough to call on every paint."""
+        return [self.status_for(service) for service in self.SERVICES]
+
+    def status_for(self, service: str) -> AccountStatus:
+        provider = (
+            self.tidal_status_provider
+            if service == "TIDAL"
+            else self.spotify_status_provider
+        )
+        try:
+            return provider()
+        except Exception as exc:
+            # A broken provider must not blank the whole tab.
+            return AccountStatus(
+                service=service,
+                state=AccountState.UNAVAILABLE,
+                detail=_describe(exc),
+            )
+
+    def is_busy(self, service: str) -> bool:
+        return bool(self._in_flight.get(service))
+
+    def all_ready(self) -> bool:
+        """True when every service that *can* be signed into, is."""
+        return all(
+            s.state is not AccountState.SIGNED_OUT for s in self.statuses()
+        )
+
+    def summary(self) -> str:
+        signed_in = [s.service for s in self.statuses() if s.is_signed_in]
+        if not signed_in:
+            return "Not signed in to any service."
+        return "Signed in: " + ", ".join(signed_in)
+
+    # -- sign in ------------------------------------------------------------
+    def sign_in(
+        self,
+        service: str,
+        on_done: Callable[[], None],
+        on_error: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]] = None,
+    ) -> Optional[threading.Thread]:
+        """Start the sign-in flow for one service.
+
+        Returns the worker thread, or ``None`` when the click was refused (a
+        flow is already open, or a download is running).
+        """
+        if self.is_busy(service):
+            self.dispatch(on_error, "A sign-in is already in progress.")
+            return None
+        if self.busy_provider():
+            self.dispatch(
+                on_error,
+                "A download is running. Wait for it to finish before signing in.",
+            )
+            return None
+
+        if service == "TIDAL":
+            return self._sign_in_tidal(on_done, on_error, on_status)
+        if service == "Spotify":
+            return self._sign_in_spotify(on_done, on_error, on_status)
+        self.dispatch(on_error, f"Unknown service: {service}")
+        return None
+
+    def _sign_in_tidal(
+        self,
+        on_done: Callable[[], None],
+        on_error: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]],
+    ) -> Optional[threading.Thread]:
+        """Drive the TIDAL device flow on a worker thread.
+
+        The module's own call blocks for as long as the user takes in the
+        browser -- there is no timeout and no way to cancel it -- so this must
+        never touch the main thread. ``run_in_background`` uses daemon threads,
+        so an abandoned sign-in cannot keep the app from closing.
+        """
+        if self.tidal_sign_in_callable is None:
+            self.dispatch(
+                on_error,
+                "TIDAL module not available. Install it under Settings > TIDAL.",
+            )
+            return None
+
+        self._in_flight["TIDAL"] = True
+
+        def work():
+            try:
+                if on_status:
+                    self.dispatch(on_status, TIDAL_SIGN_IN_HINT)
+                self.tidal_sign_in_callable()
+            except Exception as exc:
+                self._finish("TIDAL", on_error, _describe(exc))
+                return
+            # The module reports no result -- ask the status provider whether
+            # the session actually took.
+            status = self.status_for("TIDAL")
+            if not status.is_signed_in:
+                self._finish(
+                    "TIDAL",
+                    on_error,
+                    status.detail or "TIDAL sign-in did not complete.",
+                )
+                return
+            self._finish("TIDAL", None, None)
+            self.dispatch(on_done)
+
+        return run_in_background(work, name="hires-tidal-signin")
+
+    def _sign_in_spotify(
+        self,
+        on_done: Callable[[], None],
+        on_error: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]],
+    ) -> Optional[threading.Thread]:
+        """Reuse the PKCE flow the Spotify tab already owns."""
+        controller = self.spotify_controller
+        if controller is None:
+            self.dispatch(on_error, "Spotify is not configured.")
+            return None
+
+        status = self.status_for("Spotify")
+        if status.state is AccountState.NEEDS_SETUP:
+            # Sending the user to a browser that will reject the request is
+            # worse than saying what is missing.
+            self.dispatch(on_error, status.hint or status.detail)
+            return None
+
+        self._in_flight["Spotify"] = True
+
+        def done():
+            self._finish("Spotify", None, None)
+            on_done()
+
+        def failed(message: str):
+            self._finish("Spotify", on_error, message)
+
+        return controller.sign_in(done, failed, on_status)
+
+    def _finish(
+        self,
+        service: str,
+        on_error: Optional[Callable[[str], None]],
+        message: Optional[str],
+    ) -> None:
+        self._in_flight.pop(service, None)
+        if on_error is not None and message:
+            self.dispatch(on_error, message)
+
+    # -- sign out -----------------------------------------------------------
+    def sign_out(self, service: str) -> bool:
+        """Drop a stored login. Only Spotify's tokens are ours to discard.
+
+        TIDAL's sessions live in OrpheusDL's own settings store, so signing out
+        there belongs in the stock GUI, not here.
+        """
+        if service != "Spotify":
+            return False
+        controller = self.spotify_controller
+        source = controller.source_provider() if controller is not None else None
+        backend = getattr(source, "web", None) if source is not None else None
+        signer = getattr(backend, "sign_out", None)
+        if not callable(signer):
+            return False
+        try:
+            signer()
+        except Exception:
+            return False
+        return True

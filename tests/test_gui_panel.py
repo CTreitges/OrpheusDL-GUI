@@ -40,6 +40,7 @@ from hires.gui_panel import (  # noqa: E402
     build_tabs,
 )
 from hires.models import (  # noqa: E402
+    AccountState,
     ConversionReport,
     MatchCandidate,
     MatchDecision,
@@ -707,7 +708,108 @@ class TestSetupTabsWiring:
         _url, _path, data = gui.calls[0]
         assert data["extra_kwargs"]["download_quality_override"] == "hifi"
 
-    def test_all_three_tabs_are_registered(self, root, tmp_path):
+    def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")
-        assert set(result["tabs"]) == {"queue", "tidal", "spotify"}
+        assert set(result["tabs"]) == {"accounts", "queue", "tidal", "spotify"}
         assert result["runtime"] is not None
+
+    # -- accounts -----------------------------------------------------------
+    def test_accounts_tab_reads_real_status_providers(self, root, tmp_path):
+        """The status shown must come from setup_tabs' own providers.
+
+        A test that injects its own status provider proves nothing about the
+        assembly -- which is precisely how the quality bug above survived.
+        """
+        gui, result = self._build(root, tmp_path, "hifi")
+        accounts = result["tabs"]["accounts"]
+
+        by_service = {s.service: s for s in accounts.controller.statuses()}
+        assert set(by_service) == {"TIDAL", "Spotify"}
+
+        # FakeGui has no orpheus_instance, so TIDAL cannot be reached at all.
+        assert by_service["TIDAL"].state is AccountState.UNAVAILABLE
+        # It does carry a client id/secret, so Spotify is merely signed out --
+        # not "setup needed".
+        assert by_service["Spotify"].state is AccountState.SIGNED_OUT
+
+    def test_missing_spotify_credentials_read_as_setup_not_as_logged_out(
+        self, root, tmp_path
+    ):
+        """Without a client id the sign-in button cannot work; say so instead."""
+        gui = FakeGui(output_path=str(tmp_path))
+        gui.current_settings["credentials"]["Spotify"] = {}
+        gui.app = root
+        gui.application_path = str(tmp_path)
+        tabview = customtkinter.CTkTabview(master=root)
+        tabview.pack(fill="both", expand=True)
+        result = setup_tabs(gui, tabview, queue_path=str(tmp_path / "queue.json"))
+        pump(root)
+
+        accounts = result["tabs"]["accounts"]
+        status = accounts.controller.status_for("Spotify")
+        assert status.state is AccountState.NEEDS_SETUP
+        assert "Settings" in status.hint
+
+        # And the button must refuse rather than open a doomed browser tab.
+        errors = []
+        accounts.controller.sign_in(
+            "Spotify", on_done=lambda: None, on_error=errors.append
+        )
+        pump_until(root, lambda: errors)
+        assert errors and "Settings" in errors[0]
+
+    def test_accounts_and_spotify_tab_share_one_source(self, root, tmp_path):
+        """Signing in on Accounts has to count for the Spotify tab too.
+
+        Two SpotifyImportControllers would mean two token stores and a sign-in
+        that silently does not apply where the user actually converts.
+        """
+        _gui, result = self._build(root, tmp_path, "hifi")
+        tabs = result["tabs"]
+        assert tabs["accounts"].controller.spotify_controller is tabs["spotify"].controller
+
+    def test_tidal_sign_in_reaches_the_module(self, root, tmp_path):
+        """The wiring's whole point: the button drives the real module call."""
+        calls = []
+
+        class FakeTidalModule:
+            def _ensure_credentials(self, force=False):
+                calls.append(force)
+
+        class FakeOrpheus:
+            module_list = ["tidal"]
+            loaded_modules = {"tidal": FakeTidalModule()}
+
+        gui = FakeGui(output_path=str(tmp_path))
+        gui.orpheus_instance = FakeOrpheus()
+        gui.app = root
+        gui.application_path = str(tmp_path)
+        tabview = customtkinter.CTkTabview(master=root)
+        tabview.pack(fill="both", expand=True)
+        result = setup_tabs(gui, tabview, queue_path=str(tmp_path / "queue.json"))
+        pump(root)
+
+        accounts = result["tabs"]["accounts"]
+        accounts.controller.sign_in(
+            "TIDAL", on_done=lambda: None, on_error=lambda _m: None
+        )
+        pump_until(root, lambda: calls)
+
+        # force=True is what makes the module prompt at all: without it a GUI
+        # session stays in guest mode by design.
+        assert calls == [True]
+
+    def test_sign_in_is_refused_while_a_download_runs(self, root, tmp_path):
+        """Re-authenticating mid-transfer swaps the session out from under it."""
+        gui, result = self._build(root, tmp_path, "hifi")
+        gui.download_process_active = True
+
+        accounts = result["tabs"]["accounts"]
+        errors = []
+        thread = accounts.controller.sign_in(
+            "Spotify", on_done=lambda: None, on_error=errors.append
+        )
+        pump_until(root, lambda: errors)
+
+        assert thread is None
+        assert errors and "download" in errors[0].lower()

@@ -533,3 +533,171 @@ class TestInstall:
         gui = FakeGui()
         gui.orpheus_instance = None
         assert integration.make_matcher_provider(gui)() is None
+
+
+# ---------------------------------------------------------------------------
+# Account status providers
+#
+# These decide what the Accounts tab says, and the distinctions matter: "no
+# TIDAL module" must never be presented as a failed login, and "no Spotify
+# client id" must never be presented as "not signed in" -- the sign-in button
+# cannot fix either.
+# ---------------------------------------------------------------------------
+
+from hires.models import AccountState, AuthRequiredError  # noqa: E402
+
+
+class FakeTidalModule:
+    def __init__(self, session=None, raises=None):
+        self.session = session
+        self.calls = []
+        self._raises = raises
+
+    def _ensure_credentials(self, force=False):
+        self.calls.append(force)
+        if self._raises:
+            raise self._raises
+
+
+class FakeSession:
+    """The `.session` attribute TidalLibrary duck types against."""
+
+    def __init__(self, user_id=None):
+        self._user_id = user_id
+
+    def authenticated_session(self):
+        if self._user_id is None:
+            return None
+        return type("S", (), {"user_id": self._user_id})()
+
+
+class FakeOrpheus:
+    def __init__(self, module=None, module_list=("tidal",), load_raises=None):
+        self.module_list = list(module_list)
+        self.loaded_modules = {"tidal": module} if module is not None else {}
+        self._load_raises = load_raises
+        self.load_calls = []
+
+    def load_module(self, name):
+        self.load_calls.append(name)
+        if self._load_raises:
+            raise self._load_raises
+        return self.loaded_modules.get(name)
+
+
+class TestTidalStatusProvider:
+    def test_no_orpheus_instance_is_unavailable_not_signed_out(self):
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        status = integration.make_tidal_status_provider(gui)()
+
+        assert status.state is AccountState.UNAVAILABLE
+        assert status.service == "TIDAL"
+
+    def test_module_not_in_the_list_is_unavailable(self):
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=None, module_list=())
+        assert integration.make_tidal_status_provider(gui)().state is AccountState.UNAVAILABLE
+
+    def test_loaded_but_logged_out_is_signed_out(self):
+        """The module is there, nobody is logged in -- that is the button's job."""
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=FakeTidalModule(FakeSession(user_id=None)))
+        status = integration.make_tidal_status_provider(gui)()
+
+        assert status.state is AccountState.SIGNED_OUT
+        assert "guest" in status.detail.lower()
+
+    def test_logged_in_reports_the_user(self):
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=FakeTidalModule(FakeSession(user_id=4242)))
+        status = integration.make_tidal_status_provider(gui)()
+
+        assert status.state is AccountState.SIGNED_IN
+        assert "4242" in status.account
+
+    def test_the_module_is_loaded_on_demand(self):
+        """The tabs are built before modules load; a snapshot would be wrong."""
+        module = FakeTidalModule(FakeSession(user_id=1))
+        orpheus = FakeOrpheus(module=None)
+        orpheus.loaded_modules = {}
+        orpheus.load_module = lambda name: module
+
+        gui = FakeGui()
+        gui.orpheus_instance = orpheus
+        assert integration.make_tidal_status_provider(gui)().state is AccountState.SIGNED_IN
+
+    def test_a_failing_module_load_is_unavailable_not_a_crash(self):
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=None, load_raises=RuntimeError("boom"))
+        assert integration.make_tidal_status_provider(gui)().state is AccountState.UNAVAILABLE
+
+
+class TestTidalSignInCallable:
+    def test_it_forces_the_credential_prompt(self):
+        """Without force=True a GUI session stays in guest mode by design."""
+        module = FakeTidalModule(FakeSession(user_id=None))
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=module)
+
+        integration.make_tidal_sign_in(gui)()
+        assert module.calls == [True]
+
+    def test_it_resolves_the_module_at_call_time(self):
+        """Built before TIDAL loads, it must still work once TIDAL is there."""
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        sign_in = integration.make_tidal_sign_in(gui)
+
+        module = FakeTidalModule(FakeSession(user_id=None))
+        gui.orpheus_instance = FakeOrpheus(module=module)
+
+        sign_in()
+        assert module.calls == [True]
+
+    def test_without_the_module_it_raises_something_readable(self):
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        with pytest.raises(Exception) as excinfo:
+            integration.make_tidal_sign_in(gui)()
+        assert "TIDAL" in str(excinfo.value)
+
+    def test_an_old_module_without_the_entry_point_is_reported(self):
+        class Old:
+            session = None
+
+        gui = FakeGui()
+        gui.orpheus_instance = FakeOrpheus(module=Old())
+        with pytest.raises(Exception) as excinfo:
+            integration.make_tidal_sign_in(gui)()
+        assert "cannot be signed in" in str(excinfo.value)
+
+
+class TestSpotifyStatusProvider:
+    def test_without_credentials_it_is_setup_not_signed_out(self):
+        """The sign-in button cannot succeed without a client id -- say why."""
+        gui = FakeGui()
+        gui.current_settings["credentials"]["Spotify"] = {}
+        status = integration.make_spotify_status_provider(gui)()
+
+        assert status.state is AccountState.NEEDS_SETUP
+        assert "Settings" in status.hint
+
+    def test_with_credentials_but_no_token_it_is_signed_out(self):
+        gui = FakeGui()
+        status = integration.make_spotify_status_provider(gui)()
+
+        assert status.state is AccountState.SIGNED_OUT
+        assert status.service == "Spotify"
+
+    def test_status_is_reread_so_entering_credentials_takes_effect(self):
+        gui = FakeGui()
+        gui.current_settings["credentials"]["Spotify"] = {}
+        provider = integration.make_spotify_status_provider(gui)
+        assert provider().state is AccountState.NEEDS_SETUP
+
+        gui.current_settings["credentials"]["Spotify"] = {
+            "client_id": "cid",
+            "client_secret": "secret",
+        }
+        assert provider().state is AccountState.SIGNED_OUT

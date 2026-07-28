@@ -326,6 +326,65 @@ class ConversionReport:
 
 
 # ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+class AccountState(str, Enum):
+    """How far a service is from being usable.
+
+    Four states rather than a bool, because "you have not logged in" and "you
+    cannot log in until you enter a client id" need completely different words
+    on screen -- and ``UNAVAILABLE`` (module not installed at all) must not be
+    presented as a failed login.
+    """
+
+    #: Logged in and ready.
+    SIGNED_IN = "signed_in"
+    #: Everything is in place, the user simply has not signed in yet.
+    SIGNED_OUT = "signed_out"
+    #: Signing in is impossible until something else is configured first.
+    NEEDS_SETUP = "needs_setup"
+    #: The service is not installed / not loadable at all.
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass
+class AccountStatus:
+    """One service's sign-in state, ready to render.
+
+    Deliberately a snapshot with no live handles: it is produced on demand by a
+    provider and thrown away after painting, so it can never go stale in place.
+    """
+
+    service: str
+    state: AccountState
+    #: One line under the service name explaining the state.
+    detail: str = ""
+    #: Account name, when the service tells us one.
+    account: str = ""
+    #: What to do first when ``state`` is ``NEEDS_SETUP``.
+    hint: str = ""
+
+    @property
+    def is_signed_in(self) -> bool:
+        return self.state is AccountState.SIGNED_IN
+
+    @property
+    def can_sign_in(self) -> bool:
+        """Whether offering a sign-in button makes sense at all."""
+        return self.state in (AccountState.SIGNED_OUT, AccountState.SIGNED_IN)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "service": self.service,
+            "state": self.state.value,
+            "detail": self.detail,
+            "account": self.account,
+            "hint": self.hint,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 

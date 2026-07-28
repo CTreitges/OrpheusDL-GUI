@@ -14,13 +14,14 @@ import customtkinter
 import tkinter
 
 from .controllers import (
+    AccountsController,
     QueueController,
     ReviewRow,
     SpotifyImportController,
     TidalBrowserController,
     UiDispatcher,
 )
-from .models import ConversionReport, PlaylistRef, QueueStatus
+from .models import AccountState, ConversionReport, PlaylistRef, QueueStatus
 from .quality import HIRES, label_for
 
 # Mirrors the palette in gui.py. Duplicated rather than imported because gui.py
@@ -331,7 +332,7 @@ class TidalPlaylistTab:
         self.list.pack(fill="both", expand=True)
         self.list.set_message(
             "Click “Load playlists” to show your TIDAL playlists.\n"
-            "Requires the TIDAL module to be installed and logged in."
+            "Not signed in yet? The Accounts tab does that first."
         )
 
     def _on_select(self, playlist: PlaylistRef) -> None:
@@ -406,7 +407,8 @@ class SpotifyConvertTab:
         self.list.pack(fill="both", expand=True, pady=(0, 8))
         self.list.set_message(
             "Paste a public Spotify playlist link above, or click “My playlists”\n"
-            "to sign in and list your own playlists and Liked Songs."
+            "to list your own playlists and Liked Songs.\n"
+            "Signing in ahead of time is done on the Accounts tab."
         )
 
         # -- progress -------------------------------------------------------
@@ -541,6 +543,193 @@ class SpotifyConvertTab:
 
 
 # ---------------------------------------------------------------------------
+# Accounts tab
+# ---------------------------------------------------------------------------
+
+#: Dot colour per account state.
+ACCOUNT_COLORS = {
+    AccountState.SIGNED_IN.value: SUCCESS,
+    AccountState.SIGNED_OUT.value: WARNING,
+    AccountState.NEEDS_SETUP.value: WARNING,
+    AccountState.UNAVAILABLE.value: GRAY_TEXT,
+}
+
+#: Short state label next to the service name.
+ACCOUNT_LABELS = {
+    AccountState.SIGNED_IN.value: "Signed in",
+    AccountState.SIGNED_OUT.value: "Not signed in",
+    AccountState.NEEDS_SETUP.value: "Setup needed",
+    AccountState.UNAVAILABLE.value: "Unavailable",
+}
+
+
+class AccountsTab:
+    """Sign in to TIDAL and Spotify up front, before queueing anything.
+
+    Nothing here gates the other tabs. TIDAL deliberately allows guest
+    browsing, and public Spotify links need no login at all -- this tab only
+    moves the sign-in to a place the user can find before the first download
+    surprises them with a browser window.
+    """
+
+    def __init__(self, parent, controller: AccountsController):
+        self.controller = controller
+        self._cards: Dict[str, Dict[str, Any]] = {}
+
+        self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
+        self.frame.pack(fill="both", expand=True, padx=9, pady=10)
+
+        customtkinter.CTkLabel(
+            self.frame,
+            text=(
+                "Sign in here before you queue your first playlist — otherwise the "
+                "first download is what opens a browser window."
+            ),
+            text_color=SECONDARY_TEXT,
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        ).pack(fill="x", pady=(0, 10))
+
+        self.cards_frame = customtkinter.CTkFrame(self.frame, fg_color="transparent")
+        self.cards_frame.pack(fill="x")
+
+        for service in self.controller.SERVICES:
+            self._build_card(service)
+
+        bar = customtkinter.CTkFrame(self.frame, fg_color="transparent")
+        bar.pack(fill="x", pady=(10, 0))
+        _button(bar, "⟳  Refresh", self.refresh, width=100).pack(side="left")
+
+        self.summary_label = customtkinter.CTkLabel(
+            bar, text="", text_color=SECONDARY_TEXT, anchor="e"
+        )
+        self.summary_label.pack(side="right")
+
+        self.refresh()
+
+    # -- construction -------------------------------------------------------
+    def _build_card(self, service: str) -> None:
+        card = customtkinter.CTkFrame(self.cards_frame, fg_color=CONTAINER, corner_radius=6)
+        card.pack(fill="x", pady=(0, 8))
+
+        header = customtkinter.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 2))
+
+        dot = customtkinter.CTkLabel(header, text="●", width=16, text_color=GRAY_TEXT)
+        dot.pack(side="left")
+
+        customtkinter.CTkLabel(
+            header, text=service, text_color=WHITE_TEXT, anchor="w"
+        ).pack(side="left", padx=(4, 10))
+
+        state_label = customtkinter.CTkLabel(
+            header, text="", text_color=SECONDARY_TEXT, font=("", 11), anchor="w"
+        )
+        state_label.pack(side="left", fill="x", expand=True)
+
+        button = _button(header, "Sign in", lambda s=service: self.sign_in(s), width=110)
+        button.pack(side="right")
+
+        detail = customtkinter.CTkLabel(
+            card,
+            text="",
+            text_color=GRAY_TEXT,
+            font=("", 11),
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        )
+        detail.pack(fill="x", padx=12, pady=(0, 10))
+
+        self._cards[service] = {
+            "dot": dot,
+            "state": state_label,
+            "button": button,
+            "detail": detail,
+        }
+
+    # -- rendering ----------------------------------------------------------
+    def refresh(self) -> None:
+        """Re-read every service's state. Cheap; safe to call after any change."""
+        try:
+            if not self.frame.winfo_exists():
+                return
+        except Exception:
+            return
+
+        for status in self.controller.statuses():
+            self._render(status)
+        self.summary_label.configure(text=self.controller.summary())
+
+    def _render(self, status) -> None:
+        card = self._cards.get(status.service)
+        if card is None:
+            return
+
+        state = status.state.value
+        card["dot"].configure(text_color=ACCOUNT_COLORS.get(state, GRAY_TEXT))
+
+        label = ACCOUNT_LABELS.get(state, state)
+        if status.is_signed_in and status.account:
+            label = f"{label} as {status.account}"
+        card["state"].configure(text=label)
+
+        detail = status.detail
+        if status.hint:
+            detail = f"{detail}  {status.hint}" if detail else status.hint
+        card["detail"].configure(text=detail, text_color=GRAY_TEXT)
+
+        busy = self.controller.is_busy(status.service)
+        if busy:
+            card["button"].configure(text="Waiting…", state="disabled")
+        elif status.is_signed_in:
+            # Re-authenticating is legitimate (expired session, wrong account),
+            # so the button stays live rather than vanishing.
+            card["button"].configure(text="Sign in again", state="normal")
+        elif status.can_sign_in:
+            card["button"].configure(text="Sign in", state="normal")
+        else:
+            card["button"].configure(text="Sign in", state="disabled")
+
+    # -- actions ------------------------------------------------------------
+    def sign_in(self, service: str) -> None:
+        card = self._cards.get(service)
+        if card is None:
+            return
+        card["button"].configure(text="Waiting…", state="disabled")
+        card["detail"].configure(text="Starting sign-in…", text_color=SECONDARY_TEXT)
+
+        self.controller.sign_in(
+            service,
+            on_done=lambda s=service: self._on_done(s),
+            on_error=lambda message, s=service: self._on_error(s, message),
+            on_status=lambda message, s=service: self._on_status(s, message),
+        )
+        # A refused click never reaches a callback, so repaint from live state.
+        if not self.controller.is_busy(service):
+            self.refresh()
+
+    def _on_status(self, service: str, message: str) -> None:
+        card = self._cards.get(service)
+        if card is None:
+            return
+        card["detail"].configure(text=message, text_color=SECONDARY_TEXT)
+
+    def _on_done(self, service: str) -> None:
+        self.refresh()
+        card = self._cards.get(service)
+        if card is not None:
+            card["detail"].configure(text=f"Signed in to {service}.", text_color=SUCCESS)
+
+    def _on_error(self, service: str, message: str) -> None:
+        self.refresh()
+        card = self._cards.get(service)
+        if card is not None:
+            card["detail"].configure(text=message, text_color=ERROR)
+
+
+# ---------------------------------------------------------------------------
 # Review dialog
 # ---------------------------------------------------------------------------
 
@@ -666,16 +855,51 @@ def build_tabs(
     matcher_provider: Callable[[], Any],
     quality_provider: Optional[Callable[[], str]] = None,
     output_provider: Optional[Callable[[], Optional[str]]] = None,
+    tidal_status_provider: Optional[Callable[[], Any]] = None,
+    spotify_status_provider: Optional[Callable[[], Any]] = None,
+    tidal_sign_in: Optional[Callable[[], Any]] = None,
+    busy_provider: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
-    """Add the three hi-res tabs to an existing CTkTabview.
+    """Add the hi-res tabs to an existing CTkTabview.
 
-    Returns the tab objects so gui.py can refresh them later.
+    Returns the tab objects so gui.py can refresh them later. The Accounts tab
+    is only built when both status providers are supplied -- without them there
+    is nothing truthful to show.
     """
     dispatch = UiDispatcher(app)
 
-    queue_tab = QueueTab(tabview.add("Queue"), QueueController(queue), dispatch=dispatch)
+    spotify_controller = SpotifyImportController(
+        spotify_source_provider,
+        matcher_provider,
+        queue,
+        dispatch=dispatch,
+        quality_provider=quality_provider,
+        output_provider=output_provider,
+    )
 
-    tidal_tab = TidalPlaylistTab(
+    tabs: Dict[str, Any] = {}
+
+    # Accounts comes first: it is the step that belongs before the others.
+    if tidal_status_provider is not None and spotify_status_provider is not None:
+        tabs["accounts"] = AccountsTab(
+            tabview.add("Accounts"),
+            AccountsController(
+                tidal_status_provider=tidal_status_provider,
+                spotify_status_provider=spotify_status_provider,
+                tidal_sign_in=tidal_sign_in,
+                # Shared so a sign-in here is immediately visible over there:
+                # one source object, one set of tokens.
+                spotify_controller=spotify_controller,
+                dispatch=dispatch,
+                busy_provider=busy_provider,
+            ),
+        )
+
+    tabs["queue"] = QueueTab(
+        tabview.add("Queue"), QueueController(queue), dispatch=dispatch
+    )
+
+    tabs["tidal"] = TidalPlaylistTab(
         tabview.add("TIDAL Playlists"),
         TidalBrowserController(
             tidal_library_provider,
@@ -686,16 +910,8 @@ def build_tabs(
         ),
     )
 
-    spotify_tab = SpotifyConvertTab(
-        tabview.add("Spotify → TIDAL"),
-        SpotifyImportController(
-            spotify_source_provider,
-            matcher_provider,
-            queue,
-            dispatch=dispatch,
-            quality_provider=quality_provider,
-            output_provider=output_provider,
-        ),
+    tabs["spotify"] = SpotifyConvertTab(
+        tabview.add("Spotify → TIDAL"), spotify_controller
     )
 
-    return {"queue": queue_tab, "tidal": tidal_tab, "spotify": spotify_tab}
+    return tabs

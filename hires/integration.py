@@ -26,9 +26,12 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
-from .models import QueueItem, QueueStatus
+from .models import AuthRequiredError, HiresError, QueueItem, QueueStatus
 from .queue_store import QueueStore
 from .quality import HIRES, build_search_result_data
+
+#: Service name of the TIDAL module inside an Orpheus instance.
+TIDAL_MODULE_NAME = "tidal"
 
 #: Extensions OrpheusDL can produce. Used to detect that a download did something.
 AUDIO_EXTENSIONS = frozenset(
@@ -169,6 +172,14 @@ class HiresRuntime:
             return True
         batch = getattr(self.gui, "file_download_queue", None)
         return bool(batch)
+
+    def is_busy(self) -> bool:
+        """True while anything is downloading -- the GUI's work or ours.
+
+        Public because the Accounts tab needs it: re-authenticating TIDAL
+        mid-transfer replaces the session the running download is using.
+        """
+        return self._active_id is not None or self._gui_is_busy()
 
     # -- dispatch / completion ---------------------------------------------
     def _dispatch(self, item: QueueItem) -> None:
@@ -395,6 +406,162 @@ def make_spotify_source_provider(gui: Any) -> Callable[[], Any]:
     return provider
 
 
+def _tidal_module(gui: Any) -> Any:
+    """The loaded TIDAL ``ModuleInterface``, loading it if it is not up yet.
+
+    Returns ``None`` when TIDAL is not installed. Never raises: every caller
+    treats "no module" as a state to display, not an error.
+    """
+    orpheus = getattr(gui, "orpheus_instance", None)
+    if orpheus is None:
+        return None
+
+    loaded = getattr(orpheus, "loaded_modules", None)
+    module = loaded.get(TIDAL_MODULE_NAME) if isinstance(loaded, dict) else None
+    if module is not None:
+        return module
+
+    known = getattr(orpheus, "module_list", None) or ()
+    loader = getattr(orpheus, "load_module", None)
+    try:
+        available = TIDAL_MODULE_NAME in known
+    except TypeError:
+        available = False
+    if not available or not callable(loader):
+        return None
+    try:
+        return loader(TIDAL_MODULE_NAME)
+    except Exception:
+        return None
+
+
+def make_tidal_status_provider(gui: Any) -> Callable[[], Any]:
+    """Report TIDAL's sign-in state, resolved fresh on every call."""
+
+    def provider():
+        from .models import AccountState, AccountStatus
+        from .tidal_library import TidalLibrary
+
+        def status(state, detail="", account="", hint=""):
+            return AccountStatus(
+                service="TIDAL", state=state, detail=detail, account=account, hint=hint
+            )
+
+        if _tidal_module(gui) is None:
+            return status(
+                AccountState.UNAVAILABLE,
+                "TIDAL module not installed.",
+                hint="Install it under Settings > TIDAL.",
+            )
+
+        try:
+            library = TidalLibrary.from_orpheus(getattr(gui, "orpheus_instance", None))
+        except AuthRequiredError:
+            # The module is there, nobody is logged in -- exactly what the
+            # sign-in button is for.
+            library = None
+        except Exception as exc:
+            return status(AccountState.UNAVAILABLE, str(exc))
+
+        if library is None:
+            return status(
+                AccountState.SIGNED_OUT,
+                "Browsing as guest. Sign in to download in hi-res.",
+            )
+
+        user_id = ""
+        try:
+            user_id = library.current_user_id() or ""
+        except Exception:
+            pass
+        return status(
+            AccountState.SIGNED_IN,
+            "Ready for hi-res downloads.",
+            account=f"User {user_id}" if user_id else "",
+        )
+
+    return provider
+
+
+def make_tidal_sign_in(gui: Any) -> Optional[Callable[[], Any]]:
+    """A blocking callable that runs TIDAL's device flow, or ``None``.
+
+    Resolution is deferred to call time: at tab-build time the TIDAL module is
+    usually not loaded yet, so deciding now would permanently disable the
+    button. The returned callable blocks for the whole browser consent window,
+    so callers must run it off the main thread.
+    """
+
+    def sign_in():
+        module = _tidal_module(gui)
+        if module is None:
+            raise HiresError(
+                "TIDAL module not available. Install it under Settings > TIDAL."
+            )
+        ensure = getattr(module, "_ensure_credentials", None)
+        if not callable(ensure):
+            raise HiresError(
+                "This version of the TIDAL module cannot be signed in from here. "
+                "Start a download to trigger its own login."
+            )
+        # force=True is what makes it prompt: without it the module stays in
+        # guest mode on purpose whenever ORPHEUS_GUI is set. The module holds
+        # its own lock, so a concurrent trigger is already serialised.
+        ensure(force=True)
+
+    return sign_in
+
+
+def make_spotify_status_provider(gui: Any) -> Callable[[], Any]:
+    """Report Spotify's sign-in state, resolved fresh on every call."""
+    source_provider = make_spotify_source_provider(gui)
+
+    def provider():
+        from .models import AccountState, AccountStatus
+
+        def status(state, detail="", account="", hint=""):
+            return AccountStatus(
+                service="Spotify", state=state, detail=detail, account=account, hint=hint
+            )
+
+        try:
+            source = source_provider()
+        except Exception as exc:
+            return status(AccountState.UNAVAILABLE, str(exc))
+        if source is None:
+            return status(AccountState.UNAVAILABLE, "Spotify is not configured.")
+
+        # No client id is a precondition, not a failed login: the sign-in
+        # cannot even be attempted, and saying "not signed in" would send the
+        # user to a button that can only fail.
+        if not source.has_web_api():
+            return status(
+                AccountState.NEEDS_SETUP,
+                "Client ID and Secret missing — only public playlist links work.",
+                hint="Enter them under Settings > Spotify, then come back here.",
+            )
+
+        if not source.is_user_authorized():
+            return status(
+                AccountState.SIGNED_OUT,
+                "Sign in to reach your own playlists and Liked Songs.",
+            )
+
+        account = ""
+        try:
+            profile = source.web.current_user()
+            account = (profile.get("display_name") or profile.get("id") or "").strip()
+        except Exception:
+            # A stored token that cannot be spent is still a token; the next
+            # real call reports the problem properly.
+            pass
+        return status(
+            AccountState.SIGNED_IN, "Your playlists and Liked Songs are readable.", account=account
+        )
+
+    return provider
+
+
 def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> Optional[dict]:
     """Add the Queue / TIDAL / Spotify tabs and start the queue runner.
 
@@ -427,6 +594,12 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
             # to whatever the user had picked for normal downloads.
             quality_provider=lambda: HIRES,
             output_provider=runtime.default_output_path,
+            tidal_status_provider=make_tidal_status_provider(gui),
+            spotify_status_provider=make_spotify_status_provider(gui),
+            tidal_sign_in=make_tidal_sign_in(gui),
+            # Signing in mid-download would swap the TIDAL session out from
+            # under the running transfer.
+            busy_provider=runtime.is_busy,
         )
         runtime.start()
 

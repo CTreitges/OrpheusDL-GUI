@@ -1,14 +1,75 @@
 # Hi-Res Suite
 
-Three additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
+Four additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
 
-1. **Download queue** — a persistent, reorderable queue that survives restarts.
-2. **TIDAL playlist browser** — pick your own TIDAL playlists inside the app.
-3. **Spotify → TIDAL** — convert a Spotify playlist and download it in hi-res.
+1. **Accounts** — sign in to TIDAL and Spotify before you queue anything.
+2. **Download queue** — a persistent, reorderable queue that survives restarts.
+3. **TIDAL playlist browser** — pick your own TIDAL playlists inside the app.
+4. **Spotify → TIDAL** — convert a Spotify playlist and download it in hi-res.
 
 Everything lives in the `hires/` package. The only change to `gui.py` is four
 lines that add the tabs, wrapped in a `try/except` — if anything here breaks,
-the stock GUI still starts, just without the three extra tabs.
+the stock GUI still starts, just without the extra tabs.
+
+---
+
+## Accounts
+
+Both services can be signed into implicitly — TIDAL when a download first needs
+credentials, Spotify when you first click **My playlists**. That works, but it
+means your *first download* is what suddenly opens a browser window. The
+**Accounts** tab moves that step to the front.
+
+Each service shows a state and, where it makes sense, a button:
+
+| State | Means | Button |
+|-------|-------|--------|
+| **Signed in** | Ready. Shows the account where the service tells us one. | *Sign in again* (expired session, wrong account) |
+| **Not signed in** | Everything is in place, you just have not signed in. | *Sign in* |
+| **Setup needed** | Signing in cannot work yet — Spotify without a Client ID. | disabled, with what to do |
+| **Unavailable** | The service is not installed at all. | disabled |
+
+"Setup needed" and "Unavailable" are deliberately not shown as failed logins:
+no button can fix either, so the tab says what actually has to happen instead.
+
+### This tab gates nothing
+
+Signing in stays optional. TIDAL browses as a guest on purpose, and public
+Spotify playlist links need no login at all — so the other tabs keep working
+untouched whether you use this one or not.
+
+### TIDAL
+
+Uses the TIDAL module's own TV/browser flow, the same one a download triggers.
+Your browser opens at `link.tidal.com`; the app waits until you finish there.
+
+Two consequences worth knowing:
+
+- **There is no timeout and no cancel.** The module polls until you either
+  finish or close the app. Abandoning the browser tab leaves a harmless daemon
+  thread polling until you quit — it never blocks shutdown, but the button
+  stays on *Waiting…* until then.
+- **The module reports no result.** After the call returns, the tab re-reads
+  the login state rather than assuming success, so an abandoned flow shows as
+  failed instead of a green tick.
+
+Sessions are stored by OrpheusDL, not by this suite — so signing *out* of TIDAL
+belongs in the stock GUI, and this tab does not offer it.
+
+### Spotify
+
+Runs the same PKCE flow described under *Spotify → TIDAL* below, just started
+explicitly. It needs the Client ID and Secret from *Settings → Spotify*; without
+them the tab reports "Setup needed" rather than sending you to a consent page
+that can only be rejected.
+
+The Accounts tab and the Spotify tab share one source object, so signing in
+here immediately counts over there.
+
+### While a download runs
+
+Sign-in is refused with a message. Re-authenticating replaces the session the
+running transfer is using.
 
 ---
 
@@ -204,3 +265,10 @@ really assembled, and nothing exercised it.
 and asserts hi-res survives every global setting. When you add a provider or
 change how the tabs are built, extend that class — a test that supplies its own
 parameters cannot catch a wiring mistake.
+
+The Accounts tab followed that rule: alongside its controller tests in
+`tests/test_accounts.py`, `TestSetupTabsWiring` asserts against the *real*
+`setup_tabs` output that the status providers are the ones it built, that the
+sign-in button reaches the TIDAL module with `force=True`, and that the
+Accounts and Spotify tabs share one controller — three things a test with
+injected providers would pass without ever proving.
