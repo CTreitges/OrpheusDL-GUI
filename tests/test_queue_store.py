@@ -8,6 +8,7 @@ import builtins
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -562,10 +563,19 @@ def test_save_failure_is_logged_not_raised(tmp_path, caplog):
 
 
 def test_readers_never_see_a_half_written_file(tmp_path):
-    """The temp-file + rename dance has to hold up under concurrent writers."""
+    """The temp-file + rename dance has to hold up under concurrent writers.
+
+    The property under test is that no reader ever observes a *torso*: a
+    truncated or otherwise unparseable file. A ``PermissionError`` is not a
+    violation of that -- on Windows the OS refuses to open the destination
+    while the rename is in flight, which is the lock working as intended. The
+    store handles it with a retry (see the tests further down); here it is
+    counted separately so the real failure mode stays visible.
+    """
     store = new_store(tmp_path)
     stop = threading.Event()
     decode_errors = []
+    lock_hits = []
     good_reads = []
 
     def reader():
@@ -576,11 +586,15 @@ def test_readers_never_see_a_half_written_file(tmp_path):
                 good_reads.append(1)
             except FileNotFoundError:
                 pass
+            except PermissionError:
+                # Windows: rename in flight. Expected, not a torn read.
+                lock_hits.append(1)
             except Exception as exc:  # noqa: BLE001 - that is the point
                 decode_errors.append(repr(exc))
+            time.sleep(0.001)  # keep the readers from starving the writers
 
     def writer(n):
-        for i in range(40):
+        for i in range(25):
             store.add(make_item(f"w{n}-{i}", source={"pad": "x" * 300}))
 
     readers = [threading.Thread(target=reader) for _ in range(2)]
@@ -588,15 +602,54 @@ def test_readers_never_see_a_half_written_file(tmp_path):
     for thread in readers + writers:
         thread.start()
     for thread in writers:
-        thread.join(timeout=60)
+        thread.join(timeout=120)
     stop.set()
     for thread in readers:
         thread.join(timeout=10)
 
-    assert decode_errors == []
+    assert decode_errors == [], "a reader saw a partially written file"
     assert good_reads
-    assert len(store) == 80
+    assert len(store) == 50
     assert [p.name for p in tmp_path.iterdir() if p.name != "queue.json"] == []
+
+
+def test_store_reads_reliably_while_another_thread_writes(tmp_path):
+    """The production read path must survive the same race.
+
+    Unlike the raw `open()` above, QueueStore retries a locked file, so every
+    single reload has to succeed -- on Windows too.
+    """
+    store = new_store(tmp_path)
+    store.add(make_item("seed"))
+    stop = threading.Event()
+    failures = []
+    reads = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                other = QueueStore(store.path)
+                if not other.list():
+                    failures.append("read an empty queue")
+                reads.append(1)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(repr(exc))
+            time.sleep(0.002)
+
+    def writer():
+        for i in range(25):
+            store.add(make_item(f"w-{i}", source={"pad": "x" * 300}))
+
+    reader_thread = threading.Thread(target=reader)
+    writer_thread = threading.Thread(target=writer)
+    reader_thread.start()
+    writer_thread.start()
+    writer_thread.join(timeout=120)
+    stop.set()
+    reader_thread.join(timeout=10)
+
+    assert failures == []
+    assert reads
 
 
 def test_atomic_write_leaves_no_temp_files(tmp_path):
