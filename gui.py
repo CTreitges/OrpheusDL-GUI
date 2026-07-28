@@ -20501,6 +20501,17 @@ if __name__ == "__main__":
         clear_output_button = customtkinter.CTkButton(bottom_frame, text="Clear Output", width=100, height=30, command=clear_output_log, fg_color=UI_ELEMENT_BG_COLOR, hover_color=LINK_COLOR); clear_output_button.grid(row=0, column=1, sticky="e", padx=(5, 10))
         stop_button = customtkinter.CTkButton(bottom_frame, text="Stop", width=100, height=30, command=stop_download, fg_color=UI_ELEMENT_BG_COLOR, hover_color=LINK_COLOR, state=tkinter.DISABLED); stop_button.grid(row=0, column=2, sticky="e", padx=(0, 5))
         search_tab = tabview.add("Search"); search_main_frame = customtkinter.CTkFrame(search_tab, fg_color="transparent"); search_main_frame.pack(fill="both", expand=True, padx=9, pady=(10,0))
+
+        # Hi-Res suite: persistent download queue, TIDAL playlist browser and
+        # Spotify -> TIDAL conversion. Fails soft — if anything in here breaks,
+        # the stock GUI must still come up, just without the three extra tabs.
+        try:
+            from hires.integration import setup_tabs as _hires_setup_tabs
+            hires_runtime = _hires_setup_tabs(sys.modules[__name__], tabview)
+        except Exception as _hires_error:
+            hires_runtime = None
+            print(f"[Hi-Res] Tabs unavailable: {_hires_error}")
+
         # Add tabs early so their buttons are available on first paint.
         tabview.add("Settings")
         tabview.add("About")

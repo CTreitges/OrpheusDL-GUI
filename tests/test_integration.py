@@ -1,0 +1,535 @@
+"""Tests for hires.integration -- the bridge into gui.py.
+
+The GUI is faked here: a plain object carrying the same globals and functions
+that gui.py exposes. That is exactly the surface the runtime is allowed to
+touch, so these tests double as a contract check -- if gui.py ever renames one
+of them, the fake stops matching reality and this file needs updating too.
+"""
+
+import os
+import sys
+import threading
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from hires import integration  # noqa: E402
+from hires.integration import (  # noqa: E402
+    DISPATCH_GRACE_SEC,
+    HiresRuntime,
+    _walk_audio_files,
+    default_queue_path,
+    install,
+)
+from hires.models import QueueItem, QueueStatus  # noqa: E402
+from hires.queue_store import QueueStore  # noqa: E402
+
+
+class FakeApp:
+    """Stands in for the tkinter root: records `after` callbacks."""
+
+    def __init__(self):
+        self.scheduled = []
+        self.cancelled = []
+
+    def after(self, delay, fn=None):
+        self.scheduled.append((delay, fn))
+        return f"after#{len(self.scheduled)}"
+
+    def after_cancel(self, token):
+        self.cancelled.append(token)
+
+
+class FakeGui:
+    """The subset of gui.py globals the runtime is allowed to use."""
+
+    def __init__(self, output_path=None, start_result=None, start_raises=None):
+        self.app = FakeApp()
+        self.download_process_active = False
+        self.file_download_queue = []
+        self.stop_event = threading.Event()
+        self.application_path = "/tmp/fake-app"
+        self.current_settings = {
+            "globals": {"general": {"output_path": output_path, "quality": "hifi"}},
+            "credentials": {"Spotify": {"client_id": "cid", "client_secret": "secret"}},
+        }
+        self.calls = []
+        self._start_result = start_result
+        self._start_raises = start_raises
+
+    def _start_single_download(self, url, path, search_result_data=None):
+        self.calls.append((url, path, search_result_data))
+        if self._start_raises:
+            raise self._start_raises
+        # Mimic gui.py: the download runs on its own thread, so the flag flips
+        # to True and only clears once it is done.
+        if self._start_result is not False:
+            self.download_process_active = True
+        return self._start_result
+
+
+@pytest.fixture
+def queue(tmp_path):
+    return QueueStore(str(tmp_path / "queue.json"))
+
+
+def make_runtime(gui, queue, **kwargs):
+    logs = []
+    runtime = HiresRuntime(gui, queue, logger=logs.append, **kwargs)
+    runtime.logs = logs
+    return runtime
+
+
+def write_audio(folder, name="track.flac"):
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    with open(path, "wb") as fh:
+        fh.write(b"\x00" * 32)
+    return path
+
+
+def finish_download(runtime, gui):
+    """Simulate the GUI's download thread finishing."""
+    gui.download_process_active = False
+    runtime._active_since = 0.0  # skip the dispatch grace period
+    runtime._pump()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class TestWalkAudioFiles:
+    def test_finds_audio_recursively(self, tmp_path):
+        write_audio(str(tmp_path), "a.flac")
+        write_audio(str(tmp_path / "sub"), "b.mp3")
+        assert len(_walk_audio_files(str(tmp_path))) == 2
+
+    def test_ignores_non_audio(self, tmp_path):
+        write_audio(str(tmp_path), "cover.jpg")
+        write_audio(str(tmp_path), "playlist.m3u")
+        assert _walk_audio_files(str(tmp_path)) == []
+
+    def test_missing_folder_is_empty(self, tmp_path):
+        assert _walk_audio_files(str(tmp_path / "nope")) == []
+
+    def test_empty_path_is_empty(self):
+        assert _walk_audio_files("") == []
+
+    def test_extension_matching_is_case_insensitive(self, tmp_path):
+        write_audio(str(tmp_path), "TRACK.FLAC")
+        assert len(_walk_audio_files(str(tmp_path))) == 1
+
+
+class TestDefaultQueuePath:
+    def test_uses_the_app_config_folder(self):
+        gui = FakeGui()
+        assert default_queue_path(gui) == os.path.join(
+            "/tmp/fake-app", "config", "hires_queue.json"
+        )
+
+    def test_falls_back_to_cwd(self):
+        assert default_queue_path(None).endswith(os.path.join("config", "hires_queue.json"))
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+class TestLifecycle:
+    def test_start_schedules_a_poll(self, queue):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+
+        assert runtime.start() is True
+        assert len(gui.app.scheduled) == 1
+
+    def test_start_is_idempotent(self, queue):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+        runtime.start()
+        runtime.start()
+
+        assert len(gui.app.scheduled) == 1
+
+    def test_start_without_an_app_fails_gracefully(self, queue):
+        gui = FakeGui()
+        gui.app = None
+        runtime = make_runtime(gui, queue)
+
+        assert runtime.start() is False
+        assert any("not available" in line for line in runtime.logs)
+
+    def test_stop_cancels_the_timer(self, queue):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+        runtime.start()
+        runtime.stop()
+
+        assert gui.app.cancelled
+
+    def test_tick_reschedules_even_after_an_error(self, queue, monkeypatch):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+        runtime.start()
+        gui.app.scheduled.clear()
+
+        monkeypatch.setattr(runtime, "_pump", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        runtime._tick()
+
+        assert len(gui.app.scheduled) == 1  # timer survived
+        assert any("boom" in line for line in runtime.logs)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+class TestDispatch:
+    def test_claims_and_starts_the_next_item(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="https://tidal.com/browse/track/1", title="T", quality="hifi"))
+
+        runtime._pump()
+
+        assert len(gui.calls) == 1
+        url, path, data = gui.calls[0]
+        assert url == "https://tidal.com/browse/track/1"
+        assert path == str(tmp_path)
+        assert data["extra_kwargs"]["download_quality_override"] == "hifi"
+        assert queue.list()[0].status == QueueStatus.ACTIVE.value
+
+    def test_item_output_path_wins_over_the_default(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path / "default"))
+        runtime = make_runtime(gui, queue)
+        target = str(tmp_path / "custom")
+        queue.add(QueueItem(url="u", output_path=target))
+
+        runtime._pump()
+
+        assert gui.calls[0][1] == target
+        assert os.path.isdir(target)  # created up front
+
+    def test_does_not_dispatch_while_a_download_runs(self, queue):
+        gui = FakeGui()
+        gui.download_process_active = True
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+
+        assert gui.calls == []
+        assert queue.list()[0].status == QueueStatus.PENDING.value
+
+    def test_does_not_dispatch_while_a_batch_is_pending(self, queue):
+        gui = FakeGui()
+        gui.file_download_queue = ["https://example.com/other"]
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+
+        assert gui.calls == []
+
+    def test_paused_queue_dispatches_nothing(self, queue):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+        queue.set_paused(True)
+
+        runtime._pump()
+
+        assert gui.calls == []
+
+    def test_empty_queue_is_a_no_op(self, queue):
+        gui = FakeGui()
+        make_runtime(gui, queue)._pump()
+        assert gui.calls == []
+
+    def test_only_one_item_at_a_time(self, queue):
+        gui = FakeGui()
+        runtime = make_runtime(gui, queue)
+        queue.add_many([QueueItem(url="u1"), QueueItem(url="u2")])
+
+        runtime._pump()
+        runtime._pump()  # still busy
+
+        assert len(gui.calls) == 1
+
+    def test_missing_entry_point_fails_the_item(self, queue):
+        gui = FakeGui()
+        gui._start_single_download = None  # gui.py renamed or not loaded yet
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.FAILED.value
+        assert "entry point" in item.error
+
+    def test_exception_on_start_fails_the_item(self, queue):
+        gui = FakeGui(start_raises=RuntimeError("kaboom"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.FAILED.value
+        assert "kaboom" in item.error
+        assert runtime._active_id is None  # not stuck
+
+    def test_gui_refusal_requeues_the_item(self, queue):
+        gui = FakeGui(start_result=False)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u", max_attempts=3))
+
+        runtime._pump()
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.PENDING.value
+        assert item.attempts == 1
+        assert runtime._active_id is None
+
+    def test_persistent_refusal_gives_up_after_max_attempts(self, queue):
+        gui = FakeGui(start_result=False)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u", max_attempts=2))
+
+        for _ in range(5):
+            runtime._pump()
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.FAILED.value
+        assert item.attempts == 2  # stopped instead of spinning forever
+
+
+# ---------------------------------------------------------------------------
+# Completion
+# ---------------------------------------------------------------------------
+
+class TestCompletion:
+    def test_new_audio_file_means_success(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        write_audio(target, "downloaded.flac")
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+
+    def test_no_audio_file_means_failure(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path / "out"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        finish_download(runtime, gui)
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.FAILED.value
+        assert "No audio file" in item.error
+
+    def test_pre_existing_files_do_not_count_as_success(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        write_audio(target, "old.flac")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.FAILED.value
+
+    def test_overwriting_an_existing_file_counts_as_success(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        existing = write_audio(target, "same.flac")
+        old = os.path.getmtime(existing) - 3600
+        os.utime(existing, (old, old))
+
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        os.utime(existing, None)  # re-downloaded, same filename
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+
+    def test_cancellation_marks_cancelled_not_failed(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path / "out"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        gui.stop_event.set()
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.CANCELLED.value
+
+    def test_unknown_target_folder_gets_benefit_of_the_doubt(self, queue):
+        gui = FakeGui(output_path=None)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+
+    def test_grace_period_prevents_a_premature_verdict(self, queue, tmp_path):
+        # gui.py starts the download on a thread; for a moment the flag is
+        # still False. Without the grace period we would call it finished.
+        gui = FakeGui(output_path=str(tmp_path))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        gui.download_process_active = False  # thread has not flipped it yet
+        runtime._pump()
+
+        assert queue.list()[0].status == QueueStatus.ACTIVE.value
+        assert time.time() - runtime._active_since < DISPATCH_GRACE_SEC
+
+    def test_next_item_starts_after_the_previous_finishes(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add_many([QueueItem(url="u1"), QueueItem(url="u2")])
+
+        runtime._pump()
+        write_audio(target, "one.flac")
+        finish_download(runtime, gui)
+        runtime._pump()
+
+        assert [c[0] for c in gui.calls] == ["u1", "u2"]
+
+
+class TestReportResult:
+    def test_success_overrides_the_heuristic(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path / "out"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+        runtime._pump()
+
+        runtime.report_result(True)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+        assert runtime._active_id is None
+
+    def test_failure_records_the_message(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+        runtime._pump()
+
+        runtime.report_result(False, "quota exceeded")
+
+        assert queue.list()[0].error == "quota exceeded"
+
+    def test_without_an_active_item_it_is_a_no_op(self, queue):
+        runtime = make_runtime(FakeGui(), queue)
+        runtime.report_result(True)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Settings access
+# ---------------------------------------------------------------------------
+
+class TestSettings:
+    def test_reads_output_path_and_quality(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
+        runtime = make_runtime(gui, queue)
+
+        assert runtime.default_output_path() == str(tmp_path)
+        assert runtime.default_quality() == "hifi"
+
+    def test_accepts_the_orpheus_key_name(self, queue):
+        gui = FakeGui()
+        gui.current_settings = {"globals": {"general": {"download_path": "/music", "download_quality": "lossless"}}}
+        runtime = make_runtime(gui, queue)
+
+        assert runtime.default_output_path() == "/music"
+        assert runtime.default_quality() == "lossless"
+
+    def test_missing_settings_return_none(self, queue):
+        gui = FakeGui()
+        gui.current_settings = None
+        runtime = make_runtime(gui, queue)
+
+        assert runtime.default_output_path() is None
+        assert runtime.default_quality() is None
+
+    def test_blank_values_are_treated_as_missing(self, queue):
+        gui = FakeGui()
+        gui.current_settings = {"globals": {"general": {"output_path": "   "}}}
+        assert make_runtime(gui, queue).default_output_path() is None
+
+    def test_spotify_credentials_are_reused_from_gui_settings(self):
+        gui = FakeGui()
+        assert integration._spotify_credentials(gui) == ("cid", "secret")
+
+    def test_spotify_credentials_missing(self):
+        gui = FakeGui()
+        gui.current_settings = {}
+        assert integration._spotify_credentials(gui) == ("", "")
+
+
+# ---------------------------------------------------------------------------
+# install / setup_tabs must never break the GUI
+# ---------------------------------------------------------------------------
+
+class TestInstall:
+    def test_install_returns_a_running_runtime(self, tmp_path):
+        gui = FakeGui()
+        runtime = install(gui, queue_path=str(tmp_path / "q.json"))
+
+        assert isinstance(runtime, HiresRuntime)
+        assert gui.app.scheduled
+
+    def test_install_never_raises(self, tmp_path):
+        gui = FakeGui()
+        gui.app = None  # start() will refuse
+        assert install(gui, queue_path=str(tmp_path / "q.json")) is not None
+
+    def test_install_survives_an_unwritable_queue_path(self):
+        gui = FakeGui()
+        # A path that cannot exist (a file used as a directory). The store
+        # degrades to in-memory rather than taking the GUI down with it.
+        runtime = install(gui, queue_path="/dev/null/queue.json")
+
+        assert runtime is not None
+        assert runtime.queue.list() == []
+
+    def test_setup_tabs_degrades_without_customtkinter(self, tmp_path, monkeypatch):
+        # tkinter is genuinely absent on the build machine, so this is the
+        # real-world path: the GUI must still start, just without the tabs.
+        gui = FakeGui()
+        result = integration.setup_tabs(gui, object(), queue_path=str(tmp_path / "q.json"))
+        assert result is None
+
+    def test_providers_are_lazy_and_do_not_raise_at_build_time(self):
+        gui = FakeGui()
+        # Building a provider must not import or contact anything.
+        assert callable(integration.make_tidal_library_provider(gui))
+        assert callable(integration.make_matcher_provider(gui))
+        assert callable(integration.make_spotify_source_provider(gui))
+
+    def test_tidal_provider_returns_none_without_orpheus(self):
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        assert integration.make_tidal_library_provider(gui)() is None
+
+    def test_matcher_provider_returns_none_without_tidal(self):
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        assert integration.make_matcher_provider(gui)() is None

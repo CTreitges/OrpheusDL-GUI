@@ -1,0 +1,151 @@
+name: Build & Release
+
+# Builds standalone binaries for Windows, macOS and Linux and attaches them to
+# the GitHub release for the pushed tag.
+#
+# The GUI is not standalone: its files live *next to* orpheus.py in an OrpheusDL
+# checkout, and gui.spec expects the platform modules under ./modules/. So every
+# build job assembles that full tree first, then runs PyInstaller on it.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (leave empty to build the current ref)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  ORPHEUS_REPO: https://github.com/bascurtiz/OrpheusDL
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest requests
+      - run: python -m pytest tests/ -v
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            artifact: OrpheusDL-GUI-windows
+          - os: macos-latest
+            label: macos
+            artifact: OrpheusDL-GUI-macos
+          - os: ubuntu-latest
+            label: linux
+            artifact: OrpheusDL-GUI-linux
+
+    steps:
+      - name: Checkout GUI
+        uses: actions/checkout@v4
+        with:
+          path: gui-src
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (Linux)
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk ffmpeg libgirepository1.0-dev
+
+      - name: Install ffmpeg (macOS)
+        if: matrix.label == 'macos'
+        run: brew install ffmpeg || true
+
+      - name: Assemble OrpheusDL tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$ORPHEUS_REPO" app
+          # GUI files sit alongside orpheus.py.
+          rsync -a --exclude '.git' gui-src/ app/
+          cd app
+          # Platform modules the GUI expects. TIDAL needs its submodule
+          # (mqa_identifier_python) for MQA detection.
+          git clone --depth 1 --recurse-submodules https://github.com/bascurtiz/orpheusdl-tidal   modules/tidal
+          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-spotify                     modules/spotify
+          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-qobuz                       modules/qobuz
+          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-deezer                      modules/deezer
+          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-soundcloud                  modules/soundcloud
+          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-youtube                     modules/youtube
+
+      - name: Install Python dependencies
+        working-directory: app
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip install -r requirements-gui.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        working-directory: app
+        run: pyinstaller gui.spec --noconfirm
+
+      - name: Package (Windows)
+        if: matrix.label == 'windows'
+        working-directory: app
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "../${{ matrix.artifact }}.zip" ./*
+
+      - name: Package (macOS)
+        if: matrix.label == 'macos'
+        working-directory: app
+        run: |
+          cd dist
+          zip -qry "../${{ matrix.artifact }}.zip" .
+
+      - name: Package (Linux)
+        if: matrix.label == 'linux'
+        working-directory: app
+        run: |
+          cd dist
+          tar -czf "../${{ matrix.artifact }}.tar.gz" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            app/${{ matrix.artifact }}.zip
+            app/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Attach binaries to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          fail_on_unmatched_files: false
