@@ -1187,30 +1187,47 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _run_callback(redirect_uri, state, query, timeout=10.0):
-    """Start the callback server, hit it once, return (result, error)."""
+def _run_callback(redirect_uri, state, query, timeout=15.0):
+    """Start the callback server, hit it once, return {"code"|"error"}.
+
+    Readiness is signalled by the server_factory seam instead of a sleep:
+    HTTPServer.__init__ binds *and* listens, and on macOS its server_bind()
+    reverse-resolves the host, which is slow enough on CI that a fixed sleep
+    raced the request.
+    """
     import threading
     import urllib.error
     import urllib.request
 
     out = {}
+    listening = threading.Event()
+
+    def factory(address, handler):
+        from http.server import HTTPServer
+
+        server = HTTPServer(address, handler)
+        listening.set()
+        return server
 
     def serve():
         try:
             out["code"] = ss.wait_for_authorization_code(
-                redirect_uri, expected_state=state, timeout=timeout
+                redirect_uri, expected_state=state, timeout=timeout,
+                server_factory=factory,
             )
         except Exception as exc:  # noqa: BLE001
             out["error"] = exc
+        finally:
+            listening.set()  # never leave the caller hanging
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    time.sleep(0.3)  # let the socket bind
+    assert listening.wait(timeout), "server never started listening"
 
     try:
-        urllib.request.urlopen(f"{redirect_uri}?{query}", timeout=5).read()
+        urllib.request.urlopen(f"{redirect_uri}?{query}", timeout=timeout).read()
     except urllib.error.HTTPError:
-        pass  # 400 page on failure is expected
+        pass  # the 400 page on failure is expected
     thread.join(timeout=timeout)
     return out
 
@@ -1244,15 +1261,22 @@ def test_callback_server_times_out_without_a_request():
 
 
 def test_callback_server_reports_an_unusable_port():
-    """A port already in use must say so instead of hanging."""
-    import socket
+    """A bind failure must explain itself rather than hang.
 
-    port = _free_port()
-    with socket.socket() as blocker:
-        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        blocker.bind(("127.0.0.1", port))
-        blocker.listen(1)
-        with pytest.raises(AuthRequiredError, match="Cannot listen"):
-            ss.wait_for_authorization_code(
-                f"http://127.0.0.1:{port}/callback", expected_state="S", timeout=2.0
-            )
+    Driven through the server_factory seam: Windows lets two sockets share a
+    port via SO_REUSEADDR, so a real occupied port cannot produce this state
+    everywhere. What matters is that OSError becomes a readable message.
+    """
+
+    def refuses(_address, _handler):
+        raise OSError(48, "Address already in use")
+
+    with pytest.raises(AuthRequiredError, match="Cannot listen") as excinfo:
+        ss.wait_for_authorization_code(
+            "http://127.0.0.1:8888/callback",
+            expected_state="S",
+            timeout=2.0,
+            server_factory=refuses,
+        )
+    assert "8888" in str(excinfo.value)
+    assert "Address already in use" in str(excinfo.value)
