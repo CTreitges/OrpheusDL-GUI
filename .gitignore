@@ -139,3 +139,7 @@ $RECYCLE.BIN/
 # Local virtualenvs used for development/testing
 .venv*
 venv*/
+
+# Hi-Res suite runtime state — contains the Spotify refresh token
+config/hires_spotify_tokens.json
+config/hires_queue.json

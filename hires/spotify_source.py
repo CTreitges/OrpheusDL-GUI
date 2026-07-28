@@ -303,6 +303,106 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
         pass
 
 
+#: Page the browser lands on once Spotify has redirected back.
+_CALLBACK_PAGE = (
+    "<!doctype html><meta charset='utf-8'><title>OrpheusDL GUI</title>"
+    "<body style='font-family:system-ui;background:#1d1e1e;color:#e4e5e6;"
+    "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+    "<div style='text-align:center'><h2>{heading}</h2><p>{message}</p></div>"
+)
+
+
+def wait_for_authorization_code(
+    redirect_uri: str = DEFAULT_REDIRECT_URI,
+    expected_state: str = "",
+    timeout: float = 300.0,
+    *,
+    server_factory: Any = None,
+) -> str:
+    """Serve ``redirect_uri`` locally and return the ``code`` Spotify sends back.
+
+    Spotify hands the authorization code to a redirect URI rather than showing
+    it, so something has to listen. This runs a single-shot HTTP server on the
+    host/port of ``redirect_uri`` until the browser hits it.
+
+    ``expected_state`` is compared against the ``state`` parameter and a
+    mismatch is rejected -- without that check any page the user happens to
+    visit could feed us a code.
+
+    Raises :class:`AuthRequiredError` on denial, state mismatch or timeout.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(redirect_uri or DEFAULT_REDIRECT_URI)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    outcome: Dict[str, Any] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            params = parse_qs(urlparse(self.path).query)
+            code = (params.get("code") or [""])[0]
+            state = (params.get("state") or [""])[0]
+            error = (params.get("error") or [""])[0]
+
+            if error:
+                outcome["error"] = f"Spotify denied the request: {error}"
+            elif expected_state and state != expected_state:
+                outcome["error"] = "Authorization state did not match - ignoring the response"
+            elif code:
+                outcome["code"] = code
+            else:
+                # Some other request (favicon, etc.) - keep waiting.
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            ok = "code" in outcome
+            body = _CALLBACK_PAGE.format(
+                heading="Signed in" if ok else "Sign-in failed",
+                message=(
+                    "You can close this tab and go back to OrpheusDL GUI."
+                    if ok
+                    else outcome.get("error", "")
+                ),
+            ).encode("utf-8")
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):  # keep the console clean
+            pass
+
+    factory = server_factory or HTTPServer
+    try:
+        server = factory((host, port), Handler)
+    except OSError as exc:
+        raise AuthRequiredError(
+            f"Cannot listen on {host}:{port} for the Spotify redirect ({exc}). "
+            "Close whatever is using that port and try again."
+        ) from exc
+
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    try:
+        server.timeout = 1.0
+        while not outcome and time.monotonic() < deadline:
+            server.handle_request()
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    if outcome.get("code"):
+        return str(outcome["code"])
+    raise AuthRequiredError(
+        outcome.get("error") or "Timed out waiting for Spotify to redirect back"
+    )
+
+
 def _default_http() -> Any:
     """A ``requests.Session``; imported lazily so the module stays dependency free."""
     import requests  # noqa: PLC0415 - deliberately lazy

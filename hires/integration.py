@@ -28,7 +28,7 @@ from typing import Any, Callable, List, Optional
 
 from .models import QueueItem, QueueStatus
 from .queue_store import QueueStore
-from .quality import build_search_result_data
+from .quality import HIRES, build_search_result_data
 
 #: Extensions OrpheusDL can produce. Used to detect that a download did something.
 AUDIO_EXTENSIONS = frozenset(
@@ -421,7 +421,11 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
             tidal_library_provider=make_tidal_library_provider(gui),
             spotify_source_provider=make_spotify_source_provider(gui),
             matcher_provider=make_matcher_provider(gui),
-            quality_provider=lambda: runtime.default_quality() or "hifi",
+            # Deliberately NOT the GUI's global quality: the whole point of
+            # this suite is hi-res, and both tabs say so on screen. Reading the
+            # global setting here silently downgraded every converted playlist
+            # to whatever the user had picked for normal downloads.
+            quality_provider=lambda: HIRES,
             output_provider=runtime.default_output_path,
         )
         runtime.start()

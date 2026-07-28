@@ -76,8 +76,20 @@ If the Web API is configured it is used first; on any failure the embed backend
 takes over. Paste a link and it just works; click **My playlists** to sign in and
 browse your own.
 
-To list private playlists the app opens a Spotify authorisation page once. The
-refresh token is stored in `config/hires_spotify_tokens.json`.
+### Signing in
+
+Clicking **My playlists** starts the sign-in automatically if it has not
+happened yet:
+
+1. Your browser opens Spotify's consent page (PKCE, no secret leaves the app).
+2. Spotify redirects to `http://127.0.0.1:8888/callback`, where the app listens
+   once to catch the authorization code. A random `state` is generated per
+   attempt and verified, so a stray page cannot feed the app a code.
+3. The refresh token is written to `config/hires_spotify_tokens.json` with
+   `0600` permissions. That file is gitignored — never commit it.
+
+If port 8888 is occupied the app says so instead of hanging. Needs the Client
+ID and Secret from *Settings → Spotify*.
 
 ### Matching
 
@@ -179,3 +191,16 @@ thread drains. Never call `after()` (or touch a widget) directly from a worker.
 This is not theoretical: an earlier build used `after()` from worker threads,
 which left "Load playlists" spinning forever and the Spotify conversion stuck at
 "Reading playlist…". Only the widget tests catch it.
+
+### Test the wiring, not just the parts
+
+Every unit test injects its own providers, which is precisely how a bug in
+`setup_tabs()` survived 424 passing tests: it passed the GUI's *global* quality
+into the converter, so a user with "High" selected silently got 320 kbit AAC
+while the UI promised 24 bit FLAC. `setup_tabs()` is the only place the app is
+really assembled, and nothing exercised it.
+
+`TestSetupTabsWiring` in `tests/test_gui_panel.py` now drives the real assembly
+and asserts hi-res survives every global setting. When you add a provider or
+change how the tabs are built, extend that class — a test that supplies its own
+parameters cannot catch a wiring mistake.

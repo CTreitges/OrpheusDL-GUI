@@ -17,6 +17,7 @@ from hires.controllers import (  # noqa: E402
     run_in_background,
 )
 from hires.models import (  # noqa: E402
+    AuthRequiredError,
     ConversionReport,
     MatchCandidate,
     MatchDecision,
@@ -375,6 +376,11 @@ class FakeSpotifySource:
         self._tracks = tracks or []
         self._error = error
 
+    def is_user_authorized(self):
+        # Mirrors the real SpotifySource facade. AuthAwareSource further down
+        # overrides this to exercise the sign-in path.
+        return True
+
     def list_user_playlists(self):
         if self._error:
             raise self._error
@@ -598,3 +604,175 @@ class TestReviewRow:
     def test_score_text_rounds(self):
         row = ReviewRow("s", "a", "b", 0.876, "", [])
         assert row.score_text == "88%"
+
+
+# ---------------------------------------------------------------------------
+# Spotify sign-in (PKCE)
+# ---------------------------------------------------------------------------
+
+class FakeWebBackend:
+    def __init__(self, client_id="cid", redirect_uri="http://127.0.0.1:8888/callback"):
+        self.client_id = client_id
+        self.redirect_uri = redirect_uri
+        self.states = []
+        self.exchanged = []
+
+    def begin_authorization(self, state=""):
+        self.states.append(state)
+        return f"https://accounts.spotify.com/authorize?state={state}", "VERIFIER"
+
+    def exchange_code(self, code, verifier):
+        self.exchanged.append((code, verifier))
+        return {"access_token": "AT", "refresh_token": "RT"}
+
+
+class AuthAwareSource(FakeSpotifySource):
+    """Spotify source that only lists playlists once authorized."""
+
+    def __init__(self, playlists=None, web=None, authorized=False):
+        super().__init__(playlists=playlists)
+        self.web = web if web is not None else FakeWebBackend()
+        self._authorized = authorized
+
+    def is_user_authorized(self):
+        return self._authorized
+
+    def list_user_playlists(self):
+        if not self._authorized:
+            raise AuthRequiredError("Spotify sign-in required")
+        return list(self._playlists)
+
+
+class TestSpotifySignIn:
+    def _ctrl(self, queue, source, *, opened=None, code="THECODE", fail=None):
+        return SpotifyImportController(
+            lambda: source,
+            lambda: FakeMatcher([]),
+            queue,
+            dispatch=SyncDispatcher(),
+            open_url=(opened.append if opened is not None else (lambda _u: None)),
+            wait_for_code=(
+                (lambda _uri, _state: (_ for _ in ()).throw(fail))
+                if fail
+                else (lambda _uri, _state: code)
+            ),
+        )
+
+    def test_load_playlists_signs_in_first_when_unauthorized(self, queue):
+        """The regression: this path previously could not work at all."""
+        source = AuthAwareSource(
+            playlists=[PlaylistRef(id="liked", name="Liked Songs", kind="liked")],
+            authorized=False,
+        )
+        opened, done, errors, status = [], [], [], []
+
+        def on_done(playlists):
+            source._authorized = True  # token now stored
+            done.append(playlists)
+
+        # Authorizing must flip the source to authorized before listing.
+        original = source.web.exchange_code
+
+        def exchange(code, verifier):
+            source._authorized = True
+            return original(code, verifier)
+
+        source.web.exchange_code = exchange
+
+        ctrl = self._ctrl(queue, source, opened=opened)
+        wait(ctrl.load_playlists(done.append, errors.append, on_status=status.append))
+
+        assert errors == []
+        assert opened and "accounts.spotify.com" in opened[0]
+        assert source.web.exchanged == [("THECODE", "VERIFIER")]
+        assert [p.name for p in done[0]] == ["Liked Songs"]
+        assert any("browser" in s.lower() for s in status)
+
+    def test_already_authorized_skips_the_browser(self, queue):
+        source = AuthAwareSource(
+            playlists=[PlaylistRef(id="p1", name="Mine")], authorized=True
+        )
+        opened, done = [], []
+
+        ctrl = self._ctrl(queue, source, opened=opened)
+        wait(ctrl.load_playlists(done.append, lambda e: None))
+
+        assert opened == []
+        assert source.web.exchanged == []
+        assert [p.name for p in done[0]] == ["Mine"]
+
+    def test_state_is_random_per_attempt(self, queue):
+        source = AuthAwareSource(authorized=False)
+        ctrl = self._ctrl(queue, source)
+
+        wait(ctrl.sign_in(lambda: None, lambda e: None))
+        wait(ctrl.sign_in(lambda: None, lambda e: None))
+
+        assert len(source.web.states) == 2
+        assert source.web.states[0] != source.web.states[1]
+        assert all(len(s) >= 16 for s in source.web.states)
+
+    def test_missing_client_id_explains_what_to_do(self, queue):
+        source = AuthAwareSource(web=FakeWebBackend(client_id=""), authorized=False)
+        errors = []
+
+        ctrl = self._ctrl(queue, source)
+        wait(ctrl.sign_in(lambda: None, errors.append))
+
+        assert errors and "Client ID" in errors[0]
+        assert "Settings" in errors[0]
+
+    def test_denied_authorization_surfaces_the_reason(self, queue):
+        source = AuthAwareSource(authorized=False)
+        errors = []
+
+        ctrl = self._ctrl(
+            queue, source, fail=AuthRequiredError("Spotify denied the request: access_denied")
+        )
+        wait(ctrl.sign_in(lambda: None, errors.append))
+
+        assert errors and "access_denied" in errors[0]
+        assert source.web.exchanged == []
+
+    def test_sign_in_reports_success(self, queue):
+        source = AuthAwareSource(authorized=False)
+        done, errors = [], []
+
+        ctrl = self._ctrl(queue, source)
+        wait(ctrl.sign_in(lambda: done.append(True), errors.append))
+
+        assert done == [True]
+        assert errors == []
+
+
+class MinimalSource:
+    """A source that cannot report its auth state (no is_user_authorized).
+
+    Listing must still be attempted rather than crashing -- the source gets to
+    raise AuthRequiredError on its own terms.
+    """
+
+    def __init__(self, playlists=None):
+        self._playlists = playlists or []
+
+    def list_user_playlists(self):
+        return list(self._playlists)
+
+
+def test_source_without_auth_reporting_is_listed_anyway(queue):
+    opened = []
+    ctrl = SpotifyImportController(
+        lambda: MinimalSource([PlaylistRef(id="p1", name="Mine")]),
+        lambda: None,
+        queue,
+        dispatch=SyncDispatcher(),
+        open_url=opened.append,
+        wait_for_code=lambda _u, _s: "CODE",
+    )
+    done, errors = [], []
+
+    wait(ctrl.load_playlists(done.append, errors.append))
+
+    assert errors == []
+    assert opened == [], "must not open a browser for a source that never asked"
+    assert [p.name for p in done[0]] == ["Mine"]

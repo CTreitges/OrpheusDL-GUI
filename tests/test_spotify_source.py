@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -1172,3 +1173,86 @@ def test_module_imports_without_tkinter():
     )
     assert result.returncode == 0, result.stderr
     assert "clean" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Local OAuth callback server
+# ---------------------------------------------------------------------------
+
+def _free_port():
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _run_callback(redirect_uri, state, query, timeout=10.0):
+    """Start the callback server, hit it once, return (result, error)."""
+    import threading
+    import urllib.error
+    import urllib.request
+
+    out = {}
+
+    def serve():
+        try:
+            out["code"] = ss.wait_for_authorization_code(
+                redirect_uri, expected_state=state, timeout=timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = exc
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    time.sleep(0.3)  # let the socket bind
+
+    try:
+        urllib.request.urlopen(f"{redirect_uri}?{query}", timeout=5).read()
+    except urllib.error.HTTPError:
+        pass  # 400 page on failure is expected
+    thread.join(timeout=timeout)
+    return out
+
+
+def test_callback_server_returns_the_code():
+    uri = f"http://127.0.0.1:{_free_port()}/callback"
+    out = _run_callback(uri, "STATE123", "code=THECODE&state=STATE123")
+    assert out.get("code") == "THECODE"
+
+
+def test_callback_server_rejects_a_mismatched_state():
+    """Without this check any page could feed us a code."""
+    uri = f"http://127.0.0.1:{_free_port()}/callback"
+    out = _run_callback(uri, "STATE123", "code=THECODE&state=WRONG")
+    assert isinstance(out.get("error"), AuthRequiredError)
+    assert "state" in str(out["error"]).lower()
+    assert "code" not in out
+
+
+def test_callback_server_reports_a_denial():
+    uri = f"http://127.0.0.1:{_free_port()}/callback"
+    out = _run_callback(uri, "STATE123", "error=access_denied&state=STATE123")
+    assert isinstance(out.get("error"), AuthRequiredError)
+    assert "access_denied" in str(out["error"])
+
+
+def test_callback_server_times_out_without_a_request():
+    uri = f"http://127.0.0.1:{_free_port()}/callback"
+    with pytest.raises(AuthRequiredError, match="Timed out"):
+        ss.wait_for_authorization_code(uri, expected_state="S", timeout=1.0)
+
+
+def test_callback_server_reports_an_unusable_port():
+    """A port already in use must say so instead of hanging."""
+    import socket
+
+    port = _free_port()
+    with socket.socket() as blocker:
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen(1)
+        with pytest.raises(AuthRequiredError, match="Cannot listen"):
+            ss.wait_for_authorization_code(
+                f"http://127.0.0.1:{port}/callback", expected_state="S", timeout=2.0
+            )

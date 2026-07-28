@@ -442,8 +442,17 @@ class SpotifyConvertTab:
 
     # -- loading ------------------------------------------------------------
     def load_playlists(self) -> None:
+        """List the user's own playlists, signing in to Spotify if needed."""
         self.list.set_message("Loading your Spotify playlists…")
-        self.controller.load_playlists(self._on_playlists, self._on_error)
+        self.status_label.configure(text="", text_color=SECONDARY_TEXT)
+        self.controller.load_playlists(
+            self._on_playlists, self._on_error, on_status=self._on_status
+        )
+
+    def _on_status(self, message: str) -> None:
+        """Progress from the sign-in flow (browser consent can take a while)."""
+        self.list.set_message(message)
+        self.status_label.configure(text=message, text_color=SECONDARY_TEXT)
 
     def _on_playlists(self, playlists: List[PlaylistRef]) -> None:
         self.list.set_playlists(playlists)

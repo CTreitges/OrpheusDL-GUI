@@ -642,3 +642,72 @@ class TestBuildTabs:
         pump(root, times=5)
 
         assert len(tabs["queue"].list_frame.winfo_children()) == 1
+
+
+# ---------------------------------------------------------------------------
+# The real assembly
+#
+# Every other test injects its own providers, which is exactly how the hi-res
+# pinning bug survived 424 tests: setup_tabs() -- the one place where the app is
+# actually wired together -- was never exercised. These tests use it directly.
+# ---------------------------------------------------------------------------
+
+from hires.integration import setup_tabs  # noqa: E402
+from test_integration import FakeGui  # noqa: E402
+
+
+class TestSetupTabsWiring:
+    def _build(self, root, tmp_path, global_quality):
+        gui = FakeGui(output_path=str(tmp_path))
+        gui.current_settings["globals"]["general"]["quality"] = global_quality
+        gui.app = root
+        gui.application_path = str(tmp_path)
+        tabview = customtkinter.CTkTabview(master=root)
+        tabview.pack(fill="both", expand=True)
+        result = setup_tabs(gui, tabview, queue_path=str(tmp_path / "queue.json"))
+        pump(root)
+        return gui, result
+
+    @pytest.mark.parametrize("global_quality", ["high", "low", "lossless", "minimum"])
+    def test_downloads_are_pinned_to_hi_res_whatever_the_global_setting(
+        self, root, tmp_path, global_quality
+    ):
+        """The suite promises hi-res on screen and in the docs -- it must deliver it.
+
+        Regression: setup_tabs used to pass the GUI's global quality through,
+        so a user with "high" selected silently got 320 kbit AAC.
+        """
+        gui, result = self._build(root, tmp_path, global_quality)
+        assert result is not None, "setup_tabs failed to build the tabs"
+
+        tabs, queue = result["tabs"], result["queue"]
+        playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
+        tabs["tidal"].list.set_playlists([playlist])
+        tabs["tidal"].list.selected = playlist
+        tabs["tidal"].enqueue_selected()
+        pump(root)
+
+        assert queue.list(), "nothing was queued"
+        assert queue.list()[0].quality == "hifi"
+
+    def test_dispatched_download_carries_the_hi_res_override(self, root, tmp_path):
+        """End of the chain: what actually reaches gui.py must say hifi."""
+        gui, result = self._build(root, tmp_path, "high")
+        tabs, queue, runtime = result["tabs"], result["queue"], result["runtime"]
+
+        playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
+        tabs["tidal"].list.set_playlists([playlist])
+        tabs["tidal"].list.selected = playlist
+        tabs["tidal"].enqueue_selected()
+        pump(root)
+
+        runtime._pump()
+
+        assert gui.calls, "runtime never handed anything to gui.py"
+        _url, _path, data = gui.calls[0]
+        assert data["extra_kwargs"]["download_quality_override"] == "hifi"
+
+    def test_all_three_tabs_are_registered(self, root, tmp_path):
+        _gui, result = self._build(root, tmp_path, "hifi")
+        assert set(result["tabs"]) == {"queue", "tidal", "spotify"}
+        assert result["runtime"] is not None

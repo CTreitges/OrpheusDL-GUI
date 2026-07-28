@@ -13,6 +13,7 @@ the tkinter main thread. Tests inject a synchronous dispatcher.
 from __future__ import annotations
 
 import queue
+import secrets
 import threading
 import time
 import traceback
@@ -21,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .converter import PlaylistConverter, apply_review, queue_items_for_tracks
 from .models import (
+    AuthRequiredError,
     ConversionReport,
     HiresError,
     MatchDecision,
@@ -111,6 +113,20 @@ def _describe(exc: BaseException) -> str:
     """A message worth showing a user."""
     text = str(exc).strip()
     return text or exc.__class__.__name__
+
+
+def _open_in_browser(url: str) -> None:
+    """Open the Spotify consent page. Imported lazily; webbrowser is optional."""
+    import webbrowser
+
+    webbrowser.open(url)
+
+
+def _default_wait_for_code(redirect_uri: str, state: str) -> str:
+    """Listen on the redirect URI for Spotify's authorization code."""
+    from .spotify_source import wait_for_authorization_code
+
+    return wait_for_authorization_code(redirect_uri, expected_state=state)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +391,8 @@ class SpotifyImportController:
         dispatch: Optional[UiDispatcher] = None,
         quality_provider: Optional[Callable[[], str]] = None,
         output_provider: Optional[Callable[[], Optional[str]]] = None,
+        open_url: Optional[Callable[[str], Any]] = None,
+        wait_for_code: Optional[Callable[..., str]] = None,
     ):
         self.source_provider = source_provider
         self.matcher_provider = matcher_provider
@@ -382,22 +400,78 @@ class SpotifyImportController:
         self.dispatch = dispatch or UiDispatcher()
         self.quality_provider = quality_provider or (lambda: HIRES)
         self.output_provider = output_provider or (lambda: None)
+        # Injectable so the sign-in flow can be tested without a browser.
+        self._open_url = open_url or _open_in_browser
+        self._wait_for_code = wait_for_code or _default_wait_for_code
 
         self.playlists: List[PlaylistRef] = []
         self.report: Optional[ConversionReport] = None
         self._cancel = threading.Event()
+
+    # -- sign-in ------------------------------------------------------------
+    def _authorize_blocking(self, source: Any, on_status: Optional[Callable[[str], None]]) -> None:
+        """Run the PKCE dance. Blocking; call from a worker thread.
+
+        Spotify only hands out private playlists and Liked Songs to a
+        user-authorized token, so this has to happen before the first listing.
+        """
+        backend = getattr(source, "web", None)
+        if backend is None or not getattr(backend, "client_id", ""):
+            raise AuthRequiredError(
+                "Signing in to Spotify needs a Client ID and Secret. "
+                "Enter them under Settings > Spotify, then try again."
+            )
+
+        state = secrets.token_urlsafe(16)
+        url, verifier = backend.begin_authorization(state=state)
+        if on_status:
+            self.dispatch(on_status, "Opening your browser to sign in to Spotify…")
+        self._open_url(url)
+        code = self._wait_for_code(backend.redirect_uri, state)
+        backend.exchange_code(code, verifier)
+
+    def sign_in(
+        self,
+        on_done: Callable[[], None],
+        on_error: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]] = None,
+    ) -> threading.Thread:
+        """Authorize without listing anything (explicit "Sign in" button)."""
+
+        def work():
+            try:
+                source = self.source_provider()
+                if source is None:
+                    raise HiresError("Spotify is not configured.")
+                self._authorize_blocking(source, on_status)
+            except Exception as exc:
+                self.dispatch(on_error, _describe(exc))
+                return
+            self.dispatch(on_done)
+
+        return run_in_background(work, name="hires-spotify-signin")
 
     # -- loading ------------------------------------------------------------
     def load_playlists(
         self,
         on_done: Callable[[List[PlaylistRef]], None],
         on_error: Callable[[str], None],
+        on_status: Optional[Callable[[str], None]] = None,
     ) -> threading.Thread:
+        """List the user's playlists, signing in first if that has not happened."""
+
         def work():
             try:
                 source = self.source_provider()
                 if source is None:
                     raise HiresError("Spotify is not configured.")
+                # A source that cannot report its auth state is left alone: let
+                # list_user_playlists raise AuthRequiredError on its own terms.
+                is_authorized = getattr(source, "is_user_authorized", None)
+                if callable(is_authorized) and not is_authorized():
+                    self._authorize_blocking(source, on_status)
+                    if on_status:
+                        self.dispatch(on_status, "Loading your playlists…")
                 playlists = source.list_user_playlists()
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
