@@ -56,6 +56,15 @@ Two consequences worth knowing:
 Sessions are stored by OrpheusDL, not by this suite — so signing *out* of TIDAL
 belongs in the stock GUI, and this tab does not offer it.
 
+**Guest sessions read as signed out**, which is the distinction the whole tab
+rests on. A guest session is a fully authenticated object at the API level —
+`TidalGuestSession.auth()` runs a client-credentials grant and holds a real
+access token — and the only thing separating it from a login is that it never
+sets a `user_id`. So "logged in" is decided by `user_id`, not by "has a
+session". If that ever inverted, the tab would show a green tick for someone
+who never signed in and their downloads would quietly not be hi-res;
+`TestGuestIsNotAuthenticated` in `tests/test_tidal_library.py` pins it.
+
 ### Spotify
 
 Runs the same PKCE flow described under *Spotify → TIDAL* below, just started

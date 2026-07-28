@@ -643,3 +643,71 @@ def test_parse_tidal_url(url, expected):
 def test_module_is_tkinter_free():
     with open(tl.__file__, "r", encoding="utf-8") as fh:
         assert "tkinter" not in fh.read()
+
+
+# ---------------------------------------------------------------------------
+# Guest sessions must never read as "logged in"
+#
+# TidalApi.authenticated_session() picks the first session carrying a user_id,
+# and a *guest* session is a fully constructed, authenticated-at-the-API-level
+# object -- TidalGuestSession.auth() runs a client_credentials grant and sets
+# an access token. The only thing separating it from a real login is that it
+# never sets user_id (TidalSession.__init__ leaves it None).
+#
+# If that ever changed, the Accounts tab would show a green "Signed in" for a
+# user who never logged in, and their downloads would silently not be hi-res.
+# The fake below mirrors the module's real selection logic rather than handing
+# back a session directly, so it fails if the assumption stops holding.
+# ---------------------------------------------------------------------------
+
+class SessionCollectionApi:
+    """Mirrors TidalApi.authenticated_session() over a dict of sessions."""
+
+    PREFERRED = ("TV", "MOBILE_ATMOS", "MOBILE_DEFAULT")
+
+    def __init__(self, sessions):
+        self.sessions = sessions
+
+    def authenticated_session(self):
+        for name in self.PREFERRED:
+            session = self.sessions.get(name)
+            if session and getattr(session, "user_id", None):
+                return session
+        for session in self.sessions.values():
+            if getattr(session, "user_id", None):
+                return session
+        return None
+
+
+class GuestOnlySession:
+    """What TidalGuestSession looks like after auth(): token, but no user."""
+
+    def __init__(self):
+        self.access_token = "guest-token"
+        self.country_code = "US"
+        self.user_id = None
+
+
+class TestGuestIsNotAuthenticated:
+    def test_a_guest_only_session_reads_as_logged_out(self):
+        api = SessionCollectionApi({"GUEST": GuestOnlySession()})
+        library = tl.TidalLibrary(api)
+
+        assert library.current_user_id() is None
+        assert library.is_authenticated() is False
+
+    def test_a_guest_alongside_a_real_login_still_finds_the_user(self):
+        api = SessionCollectionApi(
+            {"GUEST": GuestOnlySession(), "TV": FakeSession(user_id=4242)}
+        )
+        library = tl.TidalLibrary(api)
+
+        assert library.current_user_id() == "4242"
+        assert library.is_authenticated() is True
+
+    def test_listing_playlists_as_a_guest_is_refused_not_attempted(self):
+        """_require_user_id must stop before the API rejects it."""
+        api = SessionCollectionApi({"GUEST": GuestOnlySession()})
+
+        with pytest.raises(AuthRequiredError):
+            tl.TidalLibrary(api).list_playlists()

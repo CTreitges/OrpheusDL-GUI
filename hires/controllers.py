@@ -675,12 +675,6 @@ class AccountsController:
     def is_busy(self, service: str) -> bool:
         return bool(self._in_flight.get(service))
 
-    def all_ready(self) -> bool:
-        """True when every service that *can* be signed into, is."""
-        return all(
-            s.state is not AccountState.SIGNED_OUT for s in self.statuses()
-        )
-
     def summary(self) -> str:
         signed_in = [s.service for s in self.statuses() if s.is_signed_in]
         if not signed_in:

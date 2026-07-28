@@ -94,17 +94,6 @@ class TestAccountStatus:
         assert make_accounts(tidal_status_provider=signed_in()).summary() == "Signed in: TIDAL"
         assert make_accounts().summary() == "Not signed in to any service."
 
-    def test_all_ready_ignores_services_that_cannot_be_signed_into(self):
-        """A missing TIDAL module is not an outstanding to-do."""
-        ctrl = make_accounts(
-            tidal_status_provider=lambda: account("TIDAL", AccountState.UNAVAILABLE),
-            spotify_status_provider=signed_in("Spotify"),
-        )
-        assert ctrl.all_ready()
-
-        ctrl = make_accounts(spotify_status_provider=signed_in("Spotify"))
-        assert not ctrl.all_ready(), "TIDAL is signed out and could be signed in"
-
     def test_needs_setup_is_not_offered_a_sign_in_button(self):
         status = account("Spotify", AccountState.NEEDS_SETUP)
         assert not status.can_sign_in
