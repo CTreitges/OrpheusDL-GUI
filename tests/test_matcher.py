@@ -64,6 +64,8 @@ class FakeProvider:
         if self.per_query is not None:
             for needle, hits in self.per_query.items():
                 if needle in query.lower():
+                    if isinstance(hits, Exception):
+                        raise hits
                     return list(hits)
             return []
         return list(self.results)
@@ -511,3 +513,134 @@ class TestMatchMany:
 
         assert len(results) == 2
         assert all(r.decision == MatchDecision.NO_MATCH.value for r in results)
+
+    def test_accepts_a_generator(self):
+        provider = FakeProvider(results=[track("t1", "Song")])
+
+        results = TrackMatcher(provider).match_many(track(f"s{i}", "Song") for i in range(3))
+
+        assert len(results) == 3
+
+
+# ---------------------------------------------------------------------------
+# Robustness against malformed payloads
+# ---------------------------------------------------------------------------
+
+class TestMalformedPayloads:
+    def test_artists_as_a_bare_string_counts_as_one_name(self):
+        # A single artist sometimes arrives unwrapped; iterating it per
+        # character would turn an exact match into a review case.
+        source = TrackRef(id="s1", title="Song", artists="The Weeknd", duration_sec=200)
+        candidate = track("t1", "Song", duration=200)
+
+        score, reasons = score_candidate(source, candidate)
+
+        assert score >= AUTO_ACCEPT
+        assert "same artist" in reasons
+
+    def test_unusable_artists_field_does_not_raise(self):
+        candidate = track("t1", "Song", duration=200)
+        for broken in (5, object(), None, ["ok", 5, None]):
+            source = TrackRef(id="s1", title="Song", artists=broken, duration_sec=200)
+            score, _ = score_candidate(source, candidate)
+            assert 0.0 <= score <= 1.0
+
+    def test_match_survives_a_broken_artists_field(self):
+        # One malformed track must not abort a 200 track playlist.
+        provider = FakeProvider(results=[track("t1", "Song")])
+        sources = [
+            TrackRef(id="s1", title="Song", artists=5, duration_sec=200),
+            track("s2", "Song"),
+        ]
+
+        results = TrackMatcher(provider).match_many(sources)
+
+        assert len(results) == 2
+
+    def test_artists_overlap_tolerates_non_lists(self):
+        assert artists_overlap(5, ["Metallica"]) == NEUTRAL_SCORE
+        assert artists_overlap("Metallica", ["Metallica"]) == 1.0
+
+    def test_punctuation_only_title_is_still_searched(self):
+        # "!!!" normalises to the empty string - without a raw-title fallback
+        # the provider would never be asked at all.
+        provider = FakeProvider(results=[track("t1", "!!!")])
+
+        result = TrackMatcher(provider).match(track("s1", "!!!"))
+
+        assert provider.queries
+        assert any("!!!" in q for q in provider.queries)
+        assert result.best is not None  # shown for manual review
+
+    def test_completely_empty_title_searches_nothing(self):
+        provider = FakeProvider(results=[track("t1", "Song")])
+
+        result = TrackMatcher(provider).match(TrackRef(id="s1", title="", artists=[]))
+
+        assert provider.queries == []
+        assert result.decision == MatchDecision.NO_MATCH.value
+
+    def test_reasons_name_the_missing_pieces(self):
+        source = TrackRef(id="s1", title="Song", artists=[], duration_sec=None)
+        candidate = TrackRef(id="t1", title="Song", artists=["Someone"], duration_sec=None)
+
+        _, reasons = score_candidate(source, candidate)
+
+        assert "artist missing on one side" in reasons
+        assert "duration unknown" in reasons
+
+    def test_partial_artist_overlap_is_reported_as_such(self):
+        source = track("s1", "Song", artists=["Daft Punk", "Pharrell Williams"])
+        candidate = track("t1", "Song", artists=["Daft Punk"])
+
+        _, reasons = score_candidate(source, candidate)
+
+        assert any("artist partially matches" in r for r in reasons)
+
+
+class TestProviderContract:
+    def test_provider_without_find_by_isrc_falls_back_to_search(self):
+        class SearchOnlyProvider:
+            def __init__(self):
+                self.queries = []
+
+            def search_tracks(self, query, limit=20):
+                self.queries.append(query)
+                return [track("t1", "Song")]
+
+        provider = SearchOnlyProvider()
+
+        result = TrackMatcher(provider).match(track("s1", "Song", isrc="ABC"))
+
+        assert result.decision == MatchDecision.AUTO_ACCEPT.value
+        assert provider.queries
+
+    def test_one_failing_query_variant_does_not_lose_the_match(self):
+        provider = FakeProvider(per_query={
+            "the weeknd blinding lights": RuntimeError("rate limit"),
+            "blinding lights": [track("t1", "Blinding Lights", duration=200)],
+        })
+
+        result = TrackMatcher(provider).match(track("s1", "Blinding Lights", duration=200))
+
+        assert result.decision == MatchDecision.AUTO_ACCEPT.value
+        assert result.best.track.id == "t1"
+        assert "rate limit" in result.note
+
+    def test_thresholds_are_inclusive(self):
+        source = track("s1", "Blinding Lights", duration=200)
+        candidate = track("t1", "Blinding Lights", duration=222)
+        score, _ = score_candidate(source, candidate)
+
+        exact = TrackMatcher(FakeProvider(results=[candidate]),
+                             auto_accept_threshold=score).match(source)
+        just_above = TrackMatcher(FakeProvider(results=[candidate]),
+                                  auto_accept_threshold=score + 1e-6).match(source)
+
+        assert exact.decision == MatchDecision.AUTO_ACCEPT.value
+        assert just_above.decision == MatchDecision.NEEDS_REVIEW.value
+
+    def test_custom_duration_tolerance(self):
+        assert duration_score(200, 208, tolerance=10) == 1.0
+        assert duration_score(200, 201, tolerance=0) < 1.0
+        assert duration_score(200, 250, tolerance=99) == 1.0

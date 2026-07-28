@@ -296,10 +296,25 @@ def token_set_ratio(a: Any, b: Any) -> float:
     return round(0.6 * seq + 0.4 * jaccard, 6)
 
 
+def _name_list(value: Any) -> List[str]:
+    """Tolerant view on an artist list.
+
+    Payloads are not always the ``List[str]`` the contract asks for: a single
+    name sometimes arrives as a bare string, and a broken response can put
+    anything at all in there. Nothing usable simply means "no artists" - this
+    must not raise, because one malformed track may not abort a playlist.
+    """
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [v for v in value if isinstance(v, str) and v.strip()]
+    return []
+
+
 def _artist_keys(names: Any) -> List[str]:
     out: List[str] = []
     seen = set()
-    for name in names or []:
+    for name in _name_list(names):
         key = normalize_artist(name)
         if key and key not in seen:
             seen.add(key)
@@ -370,7 +385,7 @@ def _track_tags(track: Any) -> Set[str]:
 
 
 def _effective_artists(track: Any) -> List[str]:
-    artists = [a for a in (getattr(track, "artists", None) or []) if isinstance(a, str) and a.strip()]
+    artists = _name_list(getattr(track, "artists", None))
     return artists + extract_featured_artists(getattr(track, "title", ""))
 
 
@@ -588,18 +603,23 @@ class TrackMatcher:
         """Search variants, most specific first."""
         title = (getattr(source, "title", None) or "").strip()
         base = normalize_title(title)
-        artist = next(
-            (a.strip() for a in (getattr(source, "artists", None) or [])
-             if isinstance(a, str) and a.strip()),
-            "",
+        artist = next(iter(_name_list(getattr(source, "artists", None))), "").strip()
+
+        # ``base`` is empty for titles made of punctuation only ("!!!", "+"):
+        # fall back to the raw title so those still get searched instead of
+        # being reported as "no result" without ever asking the provider.
+        variants = (
+            (f"{artist} {title}", f"{artist} {base}", title, base)
+            if base
+            else (f"{artist} {title}", title)
         )
 
         out: List[str] = []
         seen = set()
-        for query in (f"{artist} {title}", f"{artist} {base}", title, base):
+        for query in variants:
             query = query.strip()
             key = query.lower()
-            if not query or not base or key in seen:
+            if not query or key in seen:
                 continue
             seen.add(key)
             out.append(query)

@@ -302,6 +302,21 @@ def test_parse_bare_base62_id_is_treated_as_playlist():
     assert ss.parse_spotify_url(PLAYLIST_ID) == ("playlist", PLAYLIST_ID)
 
 
+def test_parse_region_qualified_locale_prefix():
+    url = f"https://open.spotify.com/intl-pt-br/playlist/{PLAYLIST_ID}"
+    assert ss.parse_spotify_url(url) == ("playlist", PLAYLIST_ID)
+
+
+def test_parse_liked_songs_link_round_trips():
+    # liked_playlist_ref() hands out exactly this URL, so it has to parse back.
+    assert ss.parse_spotify_url(ss.liked_playlist_ref().url) == ("liked", ss.LIKED_ID)
+    assert ss.parse_spotify_url("spotify:collection:tracks") == ("liked", ss.LIKED_ID)
+    assert ss.parse_spotify_url("https://open.spotify.com/intl-de/collection/tracks") == (
+        "liked",
+        ss.LIKED_ID,
+    )
+
+
 def test_parse_other_kinds():
     assert ss.parse_spotify_url("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT") == (
         "track",
@@ -579,6 +594,88 @@ def test_missing_isrc_and_empty_artists_do_not_crash():
     assert track.url == "https://open.spotify.com/track/brokenid"
 
 
+def test_non_finite_numbers_do_not_crash_the_whole_playlist():
+    # json.loads() accepts NaN/Infinity, so a broken payload must not take the
+    # int() conversion (and with it every other track) down with it.
+    broken = dict(api_track("nanid", "Nan Track"))
+    broken["duration_ms"] = float("nan")
+    worse = dict(api_track("infid", "Inf Track"))
+    worse["duration_ms"] = float("inf")
+    worse["track_number"] = float("inf")
+    routes = {
+        ss.TOKEN_URL: token_response("BQapp"),
+        TRACKS_URL: FakeResponse(
+            payload={"items": [api_item(broken), api_item(worse), api_item(api_track())], "next": None}
+        ),
+    }
+    backend, _ = make_backend(routes)
+
+    tracks = backend.get_playlist_tracks(PLAYLIST_ID)
+
+    assert [t.title for t in tracks] == ["Nan Track", "Inf Track", "Never Gonna Give You Up"]
+    assert tracks[0].duration_sec is None
+    assert tracks[1].duration_sec is None
+    assert tracks[1].track_number is None
+
+
+def test_offsite_next_link_is_not_followed():
+    routes = {
+        ss.TOKEN_URL: token_response("BQapp"),
+        TRACKS_URL: FakeResponse(
+            payload={"items": [api_item(api_track())], "next": "https://evil.example/steal?limit=100"}
+        ),
+        "https://evil.example/steal?limit=100": FakeResponse(payload={"items": [], "next": None}),
+    }
+    backend, http = make_backend(routes)
+
+    tracks = backend.get_playlist_tracks(PLAYLIST_ID)
+
+    assert len(tracks) == 1
+    # The bearer token must never leave api.spotify.com.
+    assert "https://evil.example/steal?limit=100" not in http.urls()
+
+
+def test_self_referencing_next_link_terminates():
+    routes = {
+        ss.TOKEN_URL: token_response("BQapp"),
+        TRACKS_URL: FakeResponse(payload={"items": [api_item(api_track())], "next": TRACKS_URL}),
+    }
+    backend, http = make_backend(routes)
+
+    assert len(backend.get_playlist_tracks(PLAYLIST_ID)) == 1
+    assert http.count(TRACKS_URL, "GET") == 1
+
+
+def test_revoked_refresh_token_reports_auth_required_not_outage():
+    # Spotify answers invalid_grant with HTTP 400 - that is a login problem,
+    # and the GUI has to tell the user to log in again.
+    routes = {
+        ss.TOKEN_URL: FakeResponse(
+            payload={"error": "invalid_grant", "error_description": "Refresh token revoked"},
+            status_code=400,
+        ),
+    }
+    backend, _ = make_backend(routes)
+    backend._user_token = {"refresh_token": "REVOKED"}
+
+    with pytest.raises(AuthRequiredError):
+        backend.refresh()
+    with pytest.raises(AuthRequiredError):
+        backend.get_playlist(PLAYLIST_ID)
+
+
+def test_wrong_client_credentials_report_auth_required():
+    routes = {ss.TOKEN_URL: FakeResponse(payload={"error": "invalid_client"}, status_code=400)}
+    backend, _ = make_backend(routes)
+    with pytest.raises(AuthRequiredError):
+        backend.get_playlist(PLAYLIST_ID)
+
+
+def test_liked_track_count_survives_a_failing_request():
+    backend, _ = authorized_backend({})  # every URL 404s
+    assert backend.liked_track_count() == 0
+
+
 def test_get_playlist_maps_metadata():
     routes = {
         ss.TOKEN_URL: token_response("BQapp"),
@@ -739,6 +836,151 @@ def test_embed_backend_maps_playlist_metadata():
     assert playlist.platform == ss.PLATFORM
 
 
+def embed_track_node(index):
+    return {
+        "uid": f"u{index}",
+        "itemV2": {
+            "__typename": "TrackResponseWrapper",
+            "data": {
+                "__typename": "Track",
+                "uri": f"spotify:track:t{index:022d}",
+                "name": f"Track {index}",
+                "trackDuration": {"totalMilliseconds": 100000},
+                "artists": {"items": [{"profile": {"name": "A"}}]},
+                "albumOfTrack": {"name": "Album"},
+            },
+        },
+    }
+
+
+def embed_payload(items, total):
+    return FakeResponse(
+        payload={
+            "data": {
+                "playlistV2": {
+                    "__typename": "Playlist",
+                    "name": "Big One",
+                    "content": {"totalCount": total, "items": items},
+                }
+            }
+        }
+    )
+
+
+def test_embed_backend_pages_through_a_long_playlist():
+    limit = ss._EMBED_PAGE_LIMIT
+    total = 2 * limit + 7
+    nodes = [embed_track_node(i) for i in range(total)]
+    routes = {
+        ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+        ss._GRAPHQL_ENDPOINT: [
+            embed_payload(nodes[0:limit], total),
+            embed_payload(nodes[limit : 2 * limit], total),
+            embed_payload(nodes[2 * limit :], total),
+        ],
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=FakeClock())
+
+    tracks = backend.get_playlist_tracks(PLAYLIST_ID)
+
+    assert len(tracks) == total
+    assert [t.title for t in tracks] == [f"Track {i}" for i in range(total)]
+    offsets = [c["json"]["variables"]["offset"] for c in http.calls if c["method"] == "POST"]
+    assert offsets == [0, limit, 2 * limit]
+
+
+def test_embed_backend_stops_when_a_page_is_short_even_without_total():
+    limit = ss._EMBED_PAGE_LIMIT
+    nodes = [embed_track_node(i) for i in range(limit + 1)]
+    routes = {
+        ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+        ss._GRAPHQL_ENDPOINT: [
+            embed_payload(nodes[:limit], None),
+            embed_payload(nodes[limit:], None),
+        ],
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=FakeClock())
+
+    assert len(backend.get_playlist_tracks(PLAYLIST_ID)) == limit + 1
+    assert http.count(ss._GRAPHQL_ENDPOINT, "POST") == 2
+
+
+def test_embed_get_playlist_reads_only_the_first_page():
+    limit = ss._EMBED_PAGE_LIMIT
+    total = 3 * limit
+    nodes = [embed_track_node(i) for i in range(limit)]
+    routes = {
+        ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+        ss._GRAPHQL_ENDPOINT: [embed_payload(nodes, total)],
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=FakeClock())
+
+    playlist = backend.get_playlist(PLAYLIST_ID)
+
+    assert playlist.track_count == total
+    assert http.count(ss._GRAPHQL_ENDPOINT, "POST") == 1
+
+
+def test_embed_backend_refreshes_a_rejected_anonymous_token_once():
+    routes = {
+        ss._TOKEN_SEED_URL: [
+            FakeResponse(text=EMBED_PAGE),
+            FakeResponse(text=EMBED_PAGE.replace("BQanonymous123", "BQfresh")),
+        ],
+        ss._GRAPHQL_ENDPOINT: [
+            FakeResponse(status_code=401),
+            FakeResponse(payload=EMBED_PLAYLIST_DATA),
+        ],
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=FakeClock())
+
+    tracks = backend.get_playlist_tracks(PLAYLIST_ID)
+
+    assert [t.title for t in tracks] == ["Never Gonna Give You Up"]
+    assert http.count(ss._TOKEN_SEED_URL, "GET") == 2
+    posts = [c for c in http.calls if c["method"] == "POST"]
+    assert posts[0]["headers"]["Authorization"] == "Bearer BQanonymous123"
+    assert posts[1]["headers"]["Authorization"] == "Bearer BQfresh"
+
+
+def test_embed_backend_gives_up_after_one_token_refresh():
+    routes = {
+        ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+        ss._GRAPHQL_ENDPOINT: [FakeResponse(status_code=401) for _ in range(4)],
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=FakeClock())
+
+    with pytest.raises(SourceUnavailableError):
+        backend.get_playlist_tracks(PLAYLIST_ID)
+    assert http.count(ss._GRAPHQL_ENDPOINT, "POST") == 2
+
+
+def test_embed_token_expiry_from_the_page_wins_when_it_is_shorter():
+    clock = FakeClock()
+    page = (
+        '<script>{"accessToken":"BQshortlived",'
+        f'"accessTokenExpirationTimestampMs":{int((clock() + 120) * 1000)}'
+        "}</script>"
+    )
+    routes = {
+        ss._TOKEN_SEED_URL: [FakeResponse(text=page), FakeResponse(text=page)],
+        ss._GRAPHQL_ENDPOINT: FakeResponse(payload=EMBED_PLAYLIST_DATA),
+    }
+    http = FakeHttp(routes)
+    backend = ss.EmbedBackend(http=http, now=clock)
+
+    backend.get_playlist_tracks(PLAYLIST_ID)
+    clock.advance(90)  # past the page's deadline, far inside the 50 min default
+    backend.get_playlist_tracks(PLAYLIST_ID)
+
+    assert http.count(ss._TOKEN_SEED_URL, "GET") == 2
+
+
 def test_embed_backend_reports_graphql_errors():
     backend, _ = embed_backend(
         {
@@ -802,6 +1044,21 @@ def test_liked_playlist_resolves_to_liked_tracks():
     tracks = source.get_playlist_tracks(ss.liked_playlist_ref())
 
     assert [t.title for t in tracks] == ["Liked One"]
+
+
+def test_liked_songs_url_resolves_to_liked_tracks():
+    routes = {
+        f"{ss.API_BASE}/me/tracks": FakeResponse(
+            payload={"items": [api_item(api_track("l1", "Liked One"))], "next": None, "total": 1}
+        ),
+    }
+    backend, _ = authorized_backend(routes)
+    source = ss.SpotifySource(backend, None)
+
+    tracks = source.get_playlist_tracks("https://open.spotify.com/collection/tracks")
+
+    assert [t.title for t in tracks] == ["Liked One"]
+    assert source.get_playlist("spotify:collection:tracks").id == ss.LIKED_ID
 
 
 def test_liked_tracks_require_user_login():

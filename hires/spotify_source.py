@@ -30,6 +30,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -95,12 +96,23 @@ _TOKEN_FILE_VERSION = 1
 
 _KINDS = "playlist|track|album|artist|show|episode|user"
 
+#: ``/intl-de/``, but also region qualified forms such as ``/intl-pt-br/``.
+_LOCALE = r"(?:intl-[a-z]{2,3}(?:-[a-z]{2,4})?/)?"
+
 _URL_RE = re.compile(
     r"(?:https?://)?(?:open|play)\.spotify\.com/"
-    r"(?:intl-[a-z]{2,5}/)?(?:embed/)?"
+    + _LOCALE
+    + r"(?:embed/)?"
     # Old links put the owner in front: /user/<name>/playlist/<id>
     r"(?:user/[A-Za-z0-9._~%-]+/)?"
     r"(?P<kind>" + _KINDS + r")/(?P<id>[A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+
+#: Liked Songs have no playlist id; this is the link the web player uses.
+_LIKED_RE = re.compile(
+    r"(?:(?:https?://)?(?:open|play)\.spotify\.com/" + _LOCALE + r"collection/tracks"
+    r"|spotify:collection:tracks)",
     re.IGNORECASE,
 )
 
@@ -120,7 +132,9 @@ def parse_spotify_url(url_or_uri: Any) -> Optional[Tuple[str, str]]:
     and ``?si=`` tracking parameters), ``spotify:playlist:ID`` URIs including
     the legacy ``spotify:user:me:playlist:ID`` form, and a bare 22 character
     base62 id (which is assumed to be a playlist - that is what the converter
-    asks for).  Returns ``None`` when the input addresses nothing.
+    asks for).  The Liked Songs link comes back as ``("liked", "liked")``
+    because that collection has no id of its own.  Returns ``None`` when the
+    input addresses nothing.
     """
     if not isinstance(url_or_uri, str):
         return None
@@ -130,6 +144,9 @@ def parse_spotify_url(url_or_uri: Any) -> Optional[Tuple[str, str]]:
 
     if _BARE_ID_RE.match(text):
         return "playlist", text
+
+    if _LIKED_RE.search(text):
+        return "liked", LIKED_ID
 
     match = _URI_RE.search(text)
     if match:
@@ -208,7 +225,8 @@ def _int_or_none(value: Any) -> Optional[int]:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: json.loads() happily produces Infinity/NaN floats.
         return None
 
 
@@ -216,9 +234,11 @@ def _float_or_none(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    # NaN/Infinity are legal JSON for Python's parser but useless as numbers.
+    return number if math.isfinite(number) else None
 
 
 def _ms_to_sec(value: Any) -> Optional[int]:
@@ -465,8 +485,14 @@ class WebApiBackend:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        auth_request: bool = False,
     ) -> Dict[str, Any]:
-        """One HTTP round trip, with 429 handling. Returns the parsed body."""
+        """One HTTP round trip, with 429 handling. Returns the parsed body.
+
+        ``auth_request`` marks a call to the token endpoint, where every 4xx
+        means "these credentials do not work" (Spotify answers a revoked
+        refresh token with ``400 invalid_grant``) rather than "service down".
+        """
         attempt = 0
         while True:
             try:
@@ -494,6 +520,10 @@ class WebApiBackend:
                 self._sleep(wait)
                 continue
 
+            if auth_request and 400 <= status < 500:
+                raise AuthRequiredError(
+                    f"Spotify rejected the login request (HTTP {status}) - log in again"
+                )
             if status == 401:
                 raise AuthRequiredError(f"Spotify rejected the access token for {url}")
             if status == 403:
@@ -592,7 +622,9 @@ class WebApiBackend:
         }
         if self.client_secret:
             payload["client_secret"] = self.client_secret
-        return self._store_user_token(self._send("POST", TOKEN_URL, data=payload))
+        return self._store_user_token(
+            self._send("POST", TOKEN_URL, data=payload, auth_request=True)
+        )
 
     def refresh(self, refresh_token: str = "") -> Dict[str, Any]:
         """Renew the user access token. Spotify may or may not send a new
@@ -609,7 +641,10 @@ class WebApiBackend:
         }
         if self.client_secret:
             payload["client_secret"] = self.client_secret
-        return self._store_user_token(self._send("POST", TOKEN_URL, data=payload), fallback_refresh=token)
+        return self._store_user_token(
+            self._send("POST", TOKEN_URL, data=payload, auth_request=True),
+            fallback_refresh=token,
+        )
 
     def _store_user_token(
         self, data: Dict[str, Any], fallback_refresh: str = ""
@@ -649,6 +684,7 @@ class WebApiBackend:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             data={"grant_type": "client_credentials"},
+            auth_request=True,
         )
         access = _text(data.get("access_token"))
         if not access:
@@ -706,7 +742,12 @@ class WebApiBackend:
             seen_urls.add(url)
             data = self._api_get(url, query, user_only=user_only)
             items.extend(_as_list(data.get("items")))
-            url = _text(data.get("next")) or None
+            next_url = _text(data.get("next"))
+            if next_url and not next_url.startswith(API_BASE + "/"):
+                # Never send the bearer token to a host Spotify did not name.
+                log.warning("ignoring off-site Spotify next link %s", next_url)
+                next_url = ""
+            url = next_url or None
             # The next link already carries limit/offset.
             query = None
         return items
@@ -764,6 +805,7 @@ _GRAPHQL_ENDPOINT = "https://api-partner.spotify.com/pathfinder/v1/query"
 _TOKEN_SEED_URL = "https://open.spotify.com/embed/track/0VjIjW4GlUZAMYd2vXMi3b"
 
 _EMBED_TOKEN_RE = re.compile(r'"accessToken":"([^"]+)"')
+_EMBED_EXPIRY_RE = re.compile(r'"accessTokenExpirationTimestampMs":(\d+)')
 
 #: The anonymous token lives an hour; renew a little earlier than that.
 _EMBED_TOKEN_TTL = 50 * 60
@@ -892,6 +934,14 @@ class EmbedBackend:
 
         self._token = match.group(1)
         self._token_expires_at = self._now() + _EMBED_TOKEN_TTL
+
+        # The page states when the token dies; trust it when it is shorter
+        # than our guess (and ignore obvious nonsense pointing at the past).
+        stated = _EMBED_EXPIRY_RE.search(getattr(response, "text", "") or "")
+        if stated:
+            deadline = (_float_or_none(stated.group(1)) or 0.0) / 1000.0 - TOKEN_EXPIRY_MARGIN
+            if deadline > self._now():
+                self._token_expires_at = min(self._token_expires_at, deadline)
         return self._token
 
     # -- graphql ------------------------------------------------------------
@@ -905,22 +955,30 @@ class EmbedBackend:
             "variables": variables,
             "extensions": {"persistedQuery": {"version": 1, "sha256Hash": query_hash}},
         }
-        token = self.get_anonymous_token()
-        try:
-            response = self.http.post(
-                _GRAPHQL_ENDPOINT,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": _EMBED_USER_AGENT,
-                },
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise SourceUnavailableError(f"Spotify GraphQL {operation} failed: {exc}") from exc
+        # Spotify can drop an anonymous token before it formally expires, so a
+        # rejected token is worth exactly one retry with a freshly scraped one.
+        for attempt in range(2):
+            token = self.get_anonymous_token(force_refresh=attempt > 0)
+            try:
+                response = self.http.post(
+                    _GRAPHQL_ENDPOINT,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": _EMBED_USER_AGENT,
+                    },
+                    json=payload,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise SourceUnavailableError(f"Spotify GraphQL {operation} failed: {exc}") from exc
 
-        status = _int_or_none(getattr(response, "status_code", None)) or 0
+            status = _int_or_none(getattr(response, "status_code", None)) or 0
+            if status in (401, 403) and attempt == 0:
+                log.info("anonymous Spotify token rejected (HTTP %s), refreshing it", status)
+                continue
+            break
+
         if status >= 400:
             raise SourceUnavailableError(f"Spotify GraphQL {operation} returned HTTP {status}")
 
@@ -936,8 +994,15 @@ class EmbedBackend:
             raise SourceUnavailableError(f"Spotify GraphQL {operation}: {', '.join(messages)}")
         return _as_dict(body.get("data"))
 
-    def _fetch_playlist(self, playlist_id: str) -> Tuple[Dict[str, Any], List[Any]]:
-        """Return ``(playlistV2, all_items)`` for a public playlist."""
+    def _fetch_playlist(
+        self, playlist_id: str, *, all_pages: bool = True
+    ) -> Tuple[Dict[str, Any], List[Any]]:
+        """Return ``(playlistV2, items)`` for a public playlist.
+
+        ``all_pages=False`` stops after the first page - enough for the
+        metadata, and it keeps a 10.000 track playlist from costing 100
+        requests just to read its name.
+        """
         offset = 0
         first: Optional[Dict[str, Any]] = None
         items: List[Any] = []
@@ -961,14 +1026,19 @@ class EmbedBackend:
             page = _as_list(content.get("items"))
             items.extend(page)
             total = _int_or_none(content.get("totalCount"))
-            if not page or (total is not None and len(items) >= total) or len(page) < _EMBED_PAGE_LIMIT:
+            if (
+                not all_pages
+                or not page
+                or (total is not None and len(items) >= total)
+                or len(page) < _EMBED_PAGE_LIMIT
+            ):
                 break
             offset += len(page)
         return _as_dict(first), items
 
     # -- public surface -----------------------------------------------------
     def get_playlist(self, playlist_id: str) -> PlaylistRef:
-        playlist, items = self._fetch_playlist(playlist_id)
+        playlist, items = self._fetch_playlist(playlist_id, all_pages=False)
         ref = _embed_playlist(playlist, str(playlist_id))
         if not ref.track_count:
             ref.track_count = len(items)
@@ -1047,6 +1117,8 @@ class SpotifySource:
         if parsed is None:
             raise SourceUnavailableError(f"Not a Spotify playlist: {candidate!r}")
         kind, spotify_id = parsed
+        if kind == "liked":
+            return LIKED_ID
         if kind != "playlist":
             raise SourceUnavailableError(f"Spotify {kind} is not a playlist: {candidate!r}")
         return spotify_id
