@@ -1152,4 +1152,23 @@ def test_from_config_builds_both_backends():
 
 
 def test_module_imports_without_tkinter():
-    assert "tkinter" not in sys.modules
+    """Importing the module must not pull in tkinter.
+
+    Checked in a subprocess: ``sys.modules`` is process-global, so once the
+    widget tests have run in the same session tkinter is loaded regardless of
+    what this module does.
+    """
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = (
+        "import sys; sys.path.insert(0, %r);"
+        "import hires.spotify_source;"
+        "assert 'tkinter' not in sys.modules, sorted(m for m in sys.modules if 'tk' in m);"
+        "print('clean')" % repo
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert "clean" in result.stdout

@@ -68,8 +68,11 @@ def _button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):
 class QueueTab:
     """Shows the persistent download queue and lets the user reorder it."""
 
-    def __init__(self, parent, controller: QueueController):
+    def __init__(self, parent, controller: QueueController, dispatch: Optional[UiDispatcher] = None):
         self.controller = controller
+        # Queue mutations arrive from worker threads, and widget.after() is not
+        # thread-safe -- everything has to go through the dispatcher.
+        self.dispatch = dispatch or UiDispatcher(parent.winfo_toplevel())
         self.selected_id: Optional[str] = None
         self._row_widgets: Dict[str, Any] = {}
 
@@ -106,10 +109,7 @@ class QueueTab:
     # -- events -------------------------------------------------------------
     def _on_queue_changed(self) -> None:
         """Queue mutated, possibly from a worker thread -> hop to the UI thread."""
-        try:
-            self.frame.after(0, self.refresh)
-        except Exception:
-            pass
+        self.dispatch(self.refresh)
 
     def _toggle_pause(self) -> None:
         paused = self.controller.toggle_pause()
@@ -664,7 +664,7 @@ def build_tabs(
     """
     dispatch = UiDispatcher(app)
 
-    queue_tab = QueueTab(tabview.add("Queue"), QueueController(queue))
+    queue_tab = QueueTab(tabview.add("Queue"), QueueController(queue), dispatch=dispatch)
 
     tidal_tab = TidalPlaylistTab(
         tabview.add("TIDAL Playlists"),

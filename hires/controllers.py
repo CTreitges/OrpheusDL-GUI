@@ -12,6 +12,7 @@ the tkinter main thread. Tests inject a synchronous dispatcher.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import traceback
@@ -39,23 +40,57 @@ from .quality import HIRES, label_for, normalize_tier
 class UiDispatcher:
     """Marshals a callable onto the tkinter main thread.
 
-    Without an app object it runs the callable immediately, which is what tests
-    want and also what happens if the GUI is torn down mid-flight.
+    ``widget.after()`` is **not** thread-safe: called from a worker thread it is
+    silently dropped, so the callback never runs and the UI sits there showing a
+    spinner forever. Everything here runs on worker threads, so instead we hand
+    work over through a queue that a timer on the main thread drains.
+
+    The timer is started from ``__init__``, which the GUI calls while building
+    its widgets -- i.e. on the main thread, where scheduling is legal.
+
+    Without an app object the callable runs immediately: that is what tests want,
+    and also the right behaviour once the GUI is gone.
     """
 
-    def __init__(self, app: Any = None):
+    #: How often the main thread looks for work handed over by a worker.
+    POLL_MS = 40
+
+    def __init__(self, app: Any = None, poll_ms: int = POLL_MS):
         self.app = app
+        self.poll_ms = max(10, int(poll_ms))
+        self._pending: "queue.Queue" = queue.Queue()
+        self._stopped = False
+        if app is not None and hasattr(app, "after"):
+            self._schedule()
 
     def __call__(self, fn: Callable, *args, **kwargs) -> None:
         app = self.app
-        if app is None or not hasattr(app, "after"):
+        if app is None or not hasattr(app, "after") or self._stopped:
             self._safe(fn, *args, **kwargs)
             return
+        # Safe from any thread: Queue is synchronised, tkinter is not touched.
+        self._pending.put((fn, args, kwargs))
+
+    def _schedule(self) -> None:
+        if self._stopped:
+            return
         try:
-            app.after(0, lambda: self._safe(fn, *args, **kwargs))
+            self.app.after(self.poll_ms, self._drain)
         except Exception:
-            # App already destroyed; dropping the update is correct.
-            pass
+            # App is being torn down.
+            self._stopped = True
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                fn, args, kwargs = self._pending.get_nowait()
+            except queue.Empty:
+                break
+            self._safe(fn, *args, **kwargs)
+        self._schedule()
+
+    def stop(self) -> None:
+        self._stopped = True
 
     @staticmethod
     def _safe(fn: Callable, *args, **kwargs) -> None:

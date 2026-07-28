@@ -151,10 +151,31 @@ free of tkinter and can be tested headlessly:
 | `integration.py` | The bridge into `gui.py` |
 
 ```bash
+# Headless: everything except the widget tests (which skip themselves).
 pip install pytest requests
 python -m pytest tests/ -v
+
+# Including the widget tests, on a machine with no display:
+pip install customtkinter
+xvfb-run -a --server-args="-screen 0 1280x900x24" python -m pytest tests/ -v
 ```
 
-`tests/test_end_to_end.py` wires the real modules together and fakes only the
-two outside edges (the Spotify and TIDAL APIs), so it catches drift between
-modules that the per-module tests cannot.
+Two suites are worth knowing about:
+
+- `tests/test_end_to_end.py` wires the real modules together and fakes only the
+  two outside edges (the Spotify and TIDAL APIs), so it catches drift between
+  modules that the per-module tests cannot.
+- `tests/test_gui_panel.py` builds real widgets. It skips itself without
+  tkinter or a display, and runs in CI under Xvfb.
+
+### Threading
+
+`widget.after()` is **not** thread-safe — called from a worker thread it is
+silently dropped, and the callback simply never runs. Since all network work
+happens on worker threads, results are handed over through
+`UiDispatcher`, which puts them on a `queue.Queue` that a timer on the main
+thread drains. Never call `after()` (or touch a widget) directly from a worker.
+
+This is not theoretical: an earlier build used `after()` from worker threads,
+which left "Load playlists" spinning forever and the Spotify conversion stuck at
+"Reading playlist…". Only the widget tests catch it.
