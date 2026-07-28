@@ -1203,9 +1203,9 @@ def _run_callback(redirect_uri, state, query, timeout=15.0):
     listening = threading.Event()
 
     def factory(address, handler):
-        from http.server import HTTPServer
-
-        server = HTTPServer(address, handler)
+        # Wrap the production factory so the test exercises the real bind path
+        # (which deliberately skips the slow reverse-DNS lookup on macOS).
+        server = ss.make_callback_server(address, handler)
         listening.set()
         return server
 

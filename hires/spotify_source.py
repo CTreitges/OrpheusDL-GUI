@@ -312,6 +312,28 @@ _CALLBACK_PAGE = (
 )
 
 
+def make_callback_server(address: Any, handler: Any) -> Any:
+    """Default server factory for :func:`wait_for_authorization_code`.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn(host)`` purely to fill in
+    ``server_name``. On macOS that reverse lookup can stall for tens of seconds
+    when nothing answers for 127.0.0.1 -- long enough that the browser redirect
+    arrives before the socket is serving and sign-in fails. We serve exactly one
+    local request, so the FQDN is worthless to us; skip it.
+    """
+    import socketserver
+    from http.server import HTTPServer
+
+    class _FastBindHTTPServer(HTTPServer):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            bound_host, bound_port = self.server_address[:2]
+            self.server_name = str(bound_host)
+            self.server_port = bound_port
+
+    return _FastBindHTTPServer(address, handler)
+
+
 def wait_for_authorization_code(
     redirect_uri: str = DEFAULT_REDIRECT_URI,
     expected_state: str = "",
@@ -331,7 +353,7 @@ def wait_for_authorization_code(
 
     Raises :class:`AuthRequiredError` on denial, state mismatch or timeout.
     """
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler
     from urllib.parse import parse_qs, urlparse
 
     parsed = urlparse(redirect_uri or DEFAULT_REDIRECT_URI)
@@ -376,7 +398,7 @@ def wait_for_authorization_code(
         def log_message(self, *_args):  # keep the console clean
             pass
 
-    factory = server_factory or HTTPServer
+    factory = server_factory or make_callback_server
     try:
         server = factory((host, port), Handler)
     except OSError as exc:
