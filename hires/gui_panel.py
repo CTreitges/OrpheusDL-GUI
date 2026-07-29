@@ -56,6 +56,16 @@ STATUS_COLORS = {
     QueueStatus.CANCELLED.value: GRAY_TEXT,
 }
 
+#: How many queue rows we are willing to have on screen at once.
+#:
+#: Queueing whole folders puts one item per *track* in the queue, so a handful
+#: of playlists is easily two thousand entries. Building a row for each of them
+#: costs ~14 widgets and takes tens of seconds on the tkinter main thread --
+#: long enough for Windows to declare the app hung and for Tcl to abort. Nobody
+#: scrolls through two thousand rows anyway, so we draw the head of the queue
+#: and tell the user how much is behind it.
+MAX_RENDERED_ROWS = 150
+
 
 def _count_label(count: int, noun: str) -> str:
     """``3 playlists`` / ``1 playlist`` -- these strings are read constantly."""
@@ -67,6 +77,20 @@ def _selection_label(playlists) -> str:
     tracks = sum(p.track_count or 0 for p in playlists)
     label = _count_label(len(playlists), "playlist")
     return f"{label} · {_count_label(tracks, 'track')}" if tracks else label
+
+
+def _distinct_label(label: str, taken) -> str:
+    """``label``, numbered if something already claimed it.
+
+    Dropdown entries double as dictionary keys, so two options that read alike
+    must not be alike.
+    """
+    if label not in taken:
+        return label
+    suffix = 2
+    while f"{label}  ·  {suffix}" in taken:
+        suffix += 1
+    return f"{label}  ·  {suffix}"
 
 
 def _button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):
@@ -86,6 +110,83 @@ def _button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):
 # Queue tab
 # ---------------------------------------------------------------------------
 
+class _QueueRowWidgets:
+    """The widgets of one queue line, kept alive so they can be reused.
+
+    Rebuilding rows from scratch on every refresh is what made a large queue
+    freeze the app: ``destroy()`` plus construction of ~14 CTk widgets per item,
+    on the main thread, for every single queue mutation. A row is cheap to
+    *retarget* -- only the texts and colours ever differ -- so we build the
+    widgets once and reconfigure them afterwards.
+    """
+
+    def __init__(self, parent, on_click: Callable[[str], None]):
+        self._on_click = on_click
+        self.item_id: str = ""
+
+        self.container = customtkinter.CTkFrame(parent, corner_radius=4)
+        self.status = customtkinter.CTkLabel(self.container, text="", width=24)
+        self.status.pack(side="left", padx=(6, 2))
+
+        self.text_frame = customtkinter.CTkFrame(self.container, fg_color="transparent")
+        self.text_frame.pack(side="left", fill="x", expand=True, pady=3)
+
+        self.title = customtkinter.CTkLabel(
+            self.text_frame, text="", text_color=WHITE_TEXT, anchor="w"
+        )
+        self.title.pack(fill="x")
+
+        self.detail = customtkinter.CTkLabel(
+            self.text_frame, text="", text_color=GRAY_TEXT, anchor="w", font=("", 11)
+        )
+
+        self.quality = customtkinter.CTkLabel(
+            self.container, text="", text_color=GRAY_TEXT, font=("", 11)
+        )
+
+        for widget in (self.container, self.status, self.text_frame, self.title, self.detail):
+            widget.bind("<Button-1>", self._clicked)
+
+    def _clicked(self, _event=None) -> None:
+        if self.item_id:
+            self._on_click(self.item_id)
+
+    def update(self, row, selected: bool) -> None:
+        """Point this row at ``row``. Only touches what actually changed."""
+        self.item_id = row.id
+        self.container.configure(fg_color=ROW_HOVER if selected else "transparent")
+        self.status.configure(
+            text=row.symbol, text_color=STATUS_COLORS.get(row.status, SECONDARY_TEXT)
+        )
+        self.title.configure(text=row.title)
+
+        detail_text = row.detail
+        if row.error:
+            detail_text = f"{detail_text} · {row.error}" if detail_text else row.error
+        if detail_text:
+            self.detail.configure(
+                text=detail_text, text_color=ERROR if row.error else GRAY_TEXT
+            )
+            if not self.detail.winfo_ismapped():
+                self.detail.pack(fill="x")
+        elif self.detail.winfo_ismapped():
+            self.detail.pack_forget()
+
+        if row.quality:
+            self.quality.configure(text=row.quality)
+            if not self.quality.winfo_ismapped():
+                self.quality.pack(side="right", padx=8)
+        elif self.quality.winfo_ismapped():
+            self.quality.pack_forget()
+
+    def show(self) -> None:
+        if not self.container.winfo_ismapped():
+            self.container.pack(fill="x", padx=4, pady=1)
+
+    def destroy(self) -> None:
+        self.container.destroy()
+
+
 class QueueTab:
     """Shows the persistent download queue and lets the user reorder it."""
 
@@ -95,7 +196,11 @@ class QueueTab:
         # thread-safe -- everything has to go through the dispatcher.
         self.dispatch = dispatch or UiDispatcher(parent.winfo_toplevel())
         self.selected_id: Optional[str] = None
-        self._row_widgets: Dict[str, Any] = {}
+        #: Reusable row widgets, one per visible line. Never rebuilt.
+        self._rows: List[_QueueRowWidgets] = []
+        #: Set while a refresh is already on its way to the UI thread. A batch
+        #: of queue mutations otherwise queues one full redraw per item.
+        self._refresh_pending = False
 
         self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
         self.frame.pack(fill="both", expand=True, padx=9, pady=10)
@@ -124,13 +229,34 @@ class QueueTab:
         )
         self.list_frame.pack(fill="both", expand=True)
 
+        # Both live for the lifetime of the tab and are packed/unpacked rather
+        # than created and destroyed -- see _QueueRowWidgets for why.
+        self.empty_label = customtkinter.CTkLabel(
+            self.list_frame, text="", text_color=GRAY_TEXT, justify="center"
+        )
+        self.overflow_label = customtkinter.CTkLabel(
+            self.list_frame, text="", text_color=SECONDARY_TEXT, justify="center"
+        )
+
         self._unsubscribe = controller.subscribe(self._on_queue_changed)
         self.refresh()
 
     # -- events -------------------------------------------------------------
     def _on_queue_changed(self) -> None:
-        """Queue mutated, possibly from a worker thread -> hop to the UI thread."""
-        self.dispatch(self.refresh)
+        """Queue mutated, possibly from a worker thread -> hop to the UI thread.
+
+        Queueing a folder fires this once per track. Collapsing everything that
+        arrives before the UI thread gets round to it turns a thousand redraws
+        into one.
+        """
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        self.dispatch(self._refresh_from_queue)
+
+    def _refresh_from_queue(self) -> None:
+        self._refresh_pending = False
+        self.refresh()
 
     def _toggle_pause(self) -> None:
         paused = self.controller.toggle_pause()
@@ -163,6 +289,10 @@ class QueueTab:
         self.selected_id = item_id
         self.refresh()
 
+    def visible_row_count(self) -> int:
+        """How many queue lines are on screen -- at most ``MAX_RENDERED_ROWS``."""
+        return len(self._rows)
+
     # -- rendering ----------------------------------------------------------
     def refresh(self) -> None:
         try:
@@ -171,67 +301,46 @@ class QueueTab:
         except Exception:
             return
 
-        for child in self.list_frame.winfo_children():
-            child.destroy()
-        self._row_widgets.clear()
-
-        rows = self.controller.rows()
         self.summary_label.configure(text=self.controller.summary())
+        visible, hidden = self.controller.display_rows(MAX_RENDERED_ROWS)
 
-        if not rows:
-            customtkinter.CTkLabel(
-                self.list_frame,
-                text="Queue is empty.\n\nAdd playlists from the TIDAL or Spotify tab.",
-                text_color=GRAY_TEXT,
-                justify="center",
-            ).pack(pady=30)
-            return
+        # Grow or shrink the pool, then retarget every row we keep. Rows are
+        # only ever destroyed when the queue actually got shorter.
+        while len(self._rows) < len(visible):
+            self._rows.append(_QueueRowWidgets(self.list_frame, self._select))
+        while len(self._rows) > len(visible):
+            self._rows.pop().destroy()
 
-        for row in rows:
-            selected = row.id == self.selected_id
-            container = customtkinter.CTkFrame(
-                self.list_frame,
-                fg_color=ROW_HOVER if selected else "transparent",
-                corner_radius=4,
-            )
-            container.pack(fill="x", padx=4, pady=1)
-            container.bind("<Button-1>", lambda _e, i=row.id: self._select(i))
+        for widgets, row in zip(self._rows, visible):
+            widgets.update(row, selected=row.id == self.selected_id)
+            widgets.show()
 
-            status = customtkinter.CTkLabel(
-                container,
-                text=row.symbol,
-                width=24,
-                text_color=STATUS_COLORS.get(row.status, SECONDARY_TEXT),
-            )
-            status.pack(side="left", padx=(6, 2))
+        self.empty_label.configure(
+            text=""
+            if visible
+            else "Queue is empty.\n\nAdd playlists from the TIDAL or Spotify tab."
+        )
+        self._set_notice(self.empty_label, not visible, pady=30)
 
-            text_frame = customtkinter.CTkFrame(container, fg_color="transparent")
-            text_frame.pack(side="left", fill="x", expand=True, pady=3)
+        self.overflow_label.configure(
+            text=f"… and {hidden} more, mostly finished. "
+            "Use “Clear finished” to shorten the list."
+            if hidden > 0
+            else ""
+        )
+        self._set_notice(self.overflow_label, hidden > 0, pady=8)
 
-            title = customtkinter.CTkLabel(
-                text_frame, text=row.title, text_color=WHITE_TEXT, anchor="w"
-            )
-            title.pack(fill="x")
+    @staticmethod
+    def _set_notice(label, wanted: bool, *, pady: int) -> None:
+        """Show or hide one of the two standing notice labels.
 
-            detail_text = row.detail
-            if row.error:
-                detail_text = f"{detail_text} · {row.error}" if detail_text else row.error
-            if detail_text:
-                customtkinter.CTkLabel(
-                    text_frame,
-                    text=detail_text,
-                    text_color=ERROR if row.error else GRAY_TEXT,
-                    anchor="w",
-                    font=("", 11),
-                ).pack(fill="x")
-
-            if row.quality:
-                customtkinter.CTkLabel(
-                    container, text=row.quality, text_color=GRAY_TEXT, font=("", 11)
-                ).pack(side="right", padx=8)
-
-            for widget in (status, text_frame, title):
-                widget.bind("<Button-1>", lambda _e, i=row.id: self._select(i))
+        Always re-packed rather than left in place: rows added later in the same
+        refresh would otherwise end up *below* the notice.
+        """
+        if label.winfo_ismapped():
+            label.pack_forget()
+        if wanted:
+            label.pack(pady=pady)
 
     def destroy(self) -> None:
         try:
@@ -1129,15 +1238,23 @@ class ReviewDialog:
         ).pack(side="right")
 
         # Choice: the best match, any alternative, or skip.
-        options = [f"✓  {row.match_label}"]
-        mapping = {options[0]: True}
+        #
+        # The option label is the dict key, so two alternatives that read the
+        # same -- the same recording on two albums scores identically often
+        # enough -- would collapse into one entry and hand back the *other*
+        # track's id. _distinct_label keeps every option addressable.
+        options: List[str] = []
+        mapping: Dict[str, Any] = {}
+
+        def add(label: str, value: Any) -> None:
+            label = _distinct_label(label, mapping)
+            options.append(label)
+            mapping[label] = value
+
+        add(f"✓  {row.match_label}", True)
         for tidal_id, label, score in row.alternatives:
-            option = f"↳  {label}  ({score * 100:.0f}%)"
-            options.append(option)
-            mapping[option] = tidal_id
-        skip_option = "✗  Skip this track"
-        options.append(skip_option)
-        mapping[skip_option] = False
+            add(f"↳  {label}  ({score * 100:.0f}%)", tidal_id)
+        add("✗  Skip this track", False)
 
         var = tkinter.StringVar(value=options[0])
         self._option_vars[row.source_id] = (var, mapping)

@@ -33,6 +33,7 @@ from hires.controllers import (  # noqa: E402
     UiDispatcher,
 )
 from hires.gui_panel import (  # noqa: E402
+    MAX_RENDERED_ROWS,
     PlaylistList,
     QueueTab,
     ReviewDialog,
@@ -180,7 +181,7 @@ class TestQueueTab:
         tab = QueueTab(root, QueueController(queue))
         pump(root)
 
-        assert len(tab.list_frame.winfo_children()) == 2
+        assert tab.visible_row_count() == 2
 
     def test_shows_failed_state_and_error(self, root, queue):
         queue.add(QueueItem(url="u1", title="Broken"))
@@ -240,9 +241,9 @@ class TestQueueTab:
         assert len(tab.controller.rows()) == 0
 
         queue.add(QueueItem(url="u1", title="Added later"))
-        pump(root, times=5)  # subscription hops through after(0, ...)
-
-        assert len(tab.list_frame.winfo_children()) == 1
+        # The subscription hops onto the UI thread through the dispatcher's
+        # timer, so we have to let the loop actually run.
+        assert pump_until(root, lambda: tab.visible_row_count() == 1)
 
     def test_retry_failed_button(self, root, queue):
         queue.add(QueueItem(url="u1", title="X"))
@@ -273,6 +274,140 @@ class TestQueueTab:
 
         queue.add(QueueItem(url="u1"))  # must not raise into a dead widget
         pump(root)
+
+
+# ---------------------------------------------------------------------------
+# Queue tab under load
+#
+# Queueing folders puts one item per *track* in the queue, so a real queue is
+# thousands of entries. Building a row per item froze the app for tens of
+# seconds per redraw -- long enough for Windows to report AppHang and for Tcl
+# to abort the process (tcl86t.dll, 0x80000003).
+# ---------------------------------------------------------------------------
+
+def _big_queue(store, count):
+    store.add_many(
+        [
+            QueueItem(
+                url=f"https://tidal.com/browse/track/{i}",
+                title=f"Artist {i % 97} - Track {i}",
+                subtitle=f"Album {i % 53}",
+                quality="hifi",
+                group_label=f"Playlist {i // 60}",
+            )
+            for i in range(count)
+        ]
+    )
+    return store
+
+
+class TestQueueTabUnderLoad:
+    #: Comfortably above MAX_RENDERED_ROWS, comfortably below a real queue.
+    ITEMS = 1200
+
+    def test_widget_count_does_not_scale_with_the_queue(self, root, queue):
+        """The invariant that matters: rows on screen stay bounded.
+
+        Timings differ per machine, but "one row per item" is what actually
+        broke -- and it is exactly measurable.
+        """
+        _big_queue(queue, self.ITEMS)
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+
+        assert tab.visible_row_count() == MAX_RENDERED_ROWS
+        assert tab.visible_row_count() < self.ITEMS
+
+    def test_tells_the_user_what_is_hidden(self, root, queue):
+        _big_queue(queue, self.ITEMS)
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+
+        notice = tab.overflow_label.cget("text")
+        assert str(self.ITEMS - MAX_RENDERED_ROWS) in notice
+        assert tab.overflow_label.winfo_ismapped()
+
+        # ... and the notice goes away again once the queue is short.
+        queue.clear_all()
+        tab.refresh()
+        pump(root)
+        assert not tab.overflow_label.winfo_ismapped()
+
+    def test_refresh_stays_responsive(self, root, queue):
+        """A redraw must not block the UI thread long enough to look hung.
+
+        Windows starts reporting "not responding" at 5s. Before the row pool
+        existed a single refresh of this queue took well over a minute.
+        """
+        _big_queue(queue, self.ITEMS)
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+
+        start = time.time()
+        for _ in range(3):
+            tab.refresh()
+        elapsed = time.time() - start
+
+        assert elapsed < 2.0, f"three redraws took {elapsed:.1f}s"
+
+    def test_rows_are_reused_not_rebuilt(self, root, queue):
+        """A redraw must not churn widgets -- that is what cost the seconds."""
+        _big_queue(queue, self.ITEMS)
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+
+        before = [id(r) for r in tab._rows]
+        tab.refresh()
+        pump(root)
+
+        assert [id(r) for r in tab._rows] == before
+
+    def test_a_burst_of_changes_causes_one_redraw(self, root, queue):
+        """Queueing a folder fires the subscription once per track."""
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+
+        redraws = []
+        original = tab.refresh
+        tab.refresh = lambda: (redraws.append(1), original())[1]
+
+        for i in range(50):
+            queue.add(QueueItem(url=f"u{i}", title=f"T{i}"))
+        assert pump_until(root, lambda: tab.visible_row_count() == 50)
+
+        assert len(redraws) <= 2, f"{len(redraws)} redraws for 50 additions"
+
+    def test_row_content_follows_the_queue(self, root, queue):
+        """Reuse must not leave a stale row pointing at the wrong item."""
+        queue.add_many(
+            [
+                QueueItem(url="u1", title="First", quality="hifi"),
+                QueueItem(url="u2", title="Second", quality="hifi"),
+            ]
+        )
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+        assert tab._rows[0].title.cget("text") == "First"
+
+        queue.remove(queue.list()[0].id)
+        assert pump_until(root, lambda: tab.visible_row_count() == 1)
+
+        assert tab._rows[0].title.cget("text") == "Second"
+        assert tab._rows[0].item_id == queue.list()[0].id
+
+    def test_error_and_quality_labels_clear_on_reuse(self, root, queue):
+        """A recycled row must not keep the previous item's error text."""
+        queue.add(QueueItem(url="u1", title="Broken"))
+        queue.mark_failed(queue.list()[0].id, "network unreachable")
+        tab = QueueTab(root, QueueController(queue))
+        pump(root)
+        assert "network unreachable" in tab._rows[0].detail.cget("text")
+
+        queue.clear_all()
+        queue.add(QueueItem(url="u2", title="Clean"))
+        assert pump_until(root, lambda: tab._rows[0].title.cget("text") == "Clean")
+
+        assert not tab._rows[0].detail.winfo_ismapped()
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +674,60 @@ class TestReviewDialog:
         assert all(v is True for v in dialog.choices.values())  # default: accept
         dialog.window.destroy()
 
+    def test_alternatives_that_read_alike_stay_separate(self, root):
+        """The same recording on two albums scores identically often enough.
+
+        Option labels are dictionary keys, so identical ones used to collapse --
+        picking the first entry then queued the second track's id.
+        """
+        rows = [
+            ReviewRow(
+                source_id="s1",
+                source_label="Artist - Song",
+                match_label="Artist - Song",
+                score=0.70,
+                reasons="",
+                alternatives=[
+                    ("alt1", "Artist - Song", 0.68),
+                    ("alt2", "Artist - Song", 0.68),  # same text, different track
+                ],
+            )
+        ]
+        dialog = ReviewDialog(root, rows, lambda d: None)
+        pump(root)
+
+        _var, mapping = dialog._option_vars["s1"]
+        assert len(mapping) == 4, "an option was swallowed by an identical label"
+        assert sorted(v for v in mapping.values() if isinstance(v, str)) == ["alt1", "alt2"]
+        dialog.window.destroy()
+
+    def test_picking_a_duplicate_label_queues_that_exact_track(self, root):
+        rows = [
+            ReviewRow(
+                source_id="s1",
+                source_label="Artist - Song",
+                match_label="Artist - Song",
+                score=0.70,
+                reasons="",
+                alternatives=[
+                    ("alt1", "Artist - Song", 0.68),
+                    ("alt2", "Artist - Song", 0.68),
+                ],
+            )
+        ]
+        applied = []
+        dialog = ReviewDialog(root, rows, applied.append)
+        pump(root)
+
+        var, mapping = dialog._option_vars["s1"]
+        second_alternative = [k for k, v in mapping.items() if v == "alt2"][0]
+        var.set(second_alternative)
+        dialog._on_choice("s1")
+        dialog._apply()
+        pump(root)
+
+        assert applied == [{"s1": "alt2"}]
+
     def test_skip_all_then_apply(self, root):
         applied = []
         dialog = ReviewDialog(root, self._rows(), applied.append)
@@ -641,9 +830,10 @@ class TestBuildTabs:
         tabs["tidal"].list.set_playlists([playlist])
         tabs["tidal"].list.selected = playlist
         tabs["tidal"].enqueue_selected()
-        pump(root, times=5)
 
-        assert len(tabs["queue"].list_frame.winfo_children()) == 1
+        # The queue tab repaints through the dispatcher's timer, so the loop
+        # has to actually run -- pumping a fixed number of times races it.
+        assert pump_until(root, lambda: tabs["queue"].visible_row_count() == 1)
 
 
 # ---------------------------------------------------------------------------

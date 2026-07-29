@@ -47,27 +47,40 @@ DEFAULT_POLL_MS = 800
 DISPATCH_GRACE_SEC = 3.0
 
 
-def _walk_audio_files(root: str) -> List[str]:
-    """All audio files under ``root``. Empty list when the folder is absent."""
-    found: List[str] = []
-    if not root or not os.path.isdir(root):
-        return found
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for name in filenames:
-            if os.path.splitext(name)[1].lower() in AUDIO_EXTENSIONS:
-                found.append(os.path.join(dirpath, name))
-    return found
+def audio_snapshot(root: str) -> tuple:
+    """``(number of audio files, newest mtime)`` under ``root``.
 
+    One traversal for both numbers, and ``scandir`` rather than ``os.walk`` so
+    the modification time comes from the directory entry the OS already handed
+    us instead of a second ``stat`` per file. This runs on the tkinter main
+    thread once per queue item, so its cost is felt directly as UI latency.
 
-def _newest_audio_mtime(root: str) -> float:
-    """Most recent modification time among audio files under ``root``."""
+    Returns ``(0, 0.0)`` when the folder is absent.
+    """
+    count = 0
     newest = 0.0
-    for path in _walk_audio_files(root):
+    if not root or not os.path.isdir(root):
+        return count, newest
+
+    pending = [root]
+    while pending:
+        current = pending.pop()
         try:
-            newest = max(newest, os.path.getmtime(path))
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                            continue
+                        if os.path.splitext(entry.name)[1].lower() not in AUDIO_EXTENSIONS:
+                            continue
+                        count += 1
+                        newest = max(newest, entry.stat().st_mtime)
+                    except OSError:
+                        continue
         except OSError:
             continue
-    return newest
+    return count, newest
 
 
 class HiresRuntime:
@@ -159,19 +172,41 @@ class HiresRuntime:
                 self._finish_active()
                 return
 
-            if self.queue.is_paused or self._gui_is_busy():
+            if self.queue.is_paused or self._gui_is_busy() or not self._gui_is_ready():
                 return
             item = self.queue.claim_next()
             if item is None:
                 return
             self._dispatch(item)
 
+    def _gui_is_ready(self) -> bool:
+        """True once the GUI can actually run a download.
+
+        A restored queue starts pumping while the app is still coming up. Handed
+        an item too early, ``_start_single_download`` does not just return False:
+        it pops up a modal "Orpheus library not initialized" box (gui.py) -- once
+        per attempt, for every item, until each one has burned through its
+        retries. Waiting a few polls costs nothing.
+        """
+        return getattr(self.gui, "orpheus_instance", None) is not None
+
     def _gui_is_busy(self) -> bool:
-        """True while the stock GUI is downloading or has a batch pending."""
+        """True while the stock GUI is downloading or has a batch pending.
+
+        The third check is the subtle one. Between batch items gui.py's
+        ``final_ui_update`` clears ``download_process_active``, pops the next URL
+        off ``file_download_queue`` and only *then* schedules the start via
+        ``app.after(pause_ms, ...)`` -- up to 30 seconds later for Spotify. In
+        that window both of the first two say "idle" while a download is very
+        much still owed, so we would claim the slot and the delayed batch start
+        would be refused and its URL silently dropped.
+        ``current_batch_output_path`` stays set for exactly that window.
+        """
         if bool(getattr(self.gui, "download_process_active", False)):
             return True
-        batch = getattr(self.gui, "file_download_queue", None)
-        return bool(batch)
+        if bool(getattr(self.gui, "file_download_queue", None)):
+            return True
+        return getattr(self.gui, "current_batch_output_path", None) is not None
 
     def is_busy(self) -> bool:
         """True while anything is downloading -- the GUI's work or ours.
@@ -200,8 +235,9 @@ class HiresRuntime:
         self._active_id = item.id
         self._active_path = output_path
         self._active_since = time.time()
-        self._baseline_count = len(_walk_audio_files(output_path)) if output_path else 0
-        self._baseline_mtime = _newest_audio_mtime(output_path) if output_path else 0.0
+        self._baseline_count, self._baseline_mtime = (
+            audio_snapshot(output_path) if output_path else (0, 0.0)
+        )
 
         search_result_data = build_search_result_data(
             quality=item.quality, media_type=item.media_kind
@@ -273,9 +309,10 @@ class HiresRuntime:
         if not path:
             return True, ""
         baseline_count, baseline_mtime = baseline
-        if len(_walk_audio_files(path)) > baseline_count:
+        count, newest = audio_snapshot(path)
+        if count > baseline_count:
             return True, ""
-        if _newest_audio_mtime(path) > baseline_mtime:
+        if newest > baseline_mtime:
             return True, ""  # existing file was overwritten
         return False, "No audio file appeared in the target folder"
 

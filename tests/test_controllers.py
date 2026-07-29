@@ -776,3 +776,195 @@ def test_source_without_auth_reporting_is_listed_anyway(queue):
     assert errors == []
     assert opened == [], "must not open a browser for a source that never asked"
     assert [p.name for p in done[0].all_playlists()] == ["Mine"]
+
+
+# ---------------------------------------------------------------------------
+# Overlapping conversions
+#
+# Clicking a second playlist while the first is still matching used to leave
+# both workers running against one shared cancel event. The slower one then
+# overwrote `report`, so "Queue matches" queued the tracks of the playlist the
+# user had already clicked away from.
+# ---------------------------------------------------------------------------
+
+class GatedMatcher:
+    """A matcher that blocks until it is released, so a run can be held open."""
+
+    def __init__(self, results):
+        self._results = results
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.progress_error = None
+
+    def match_many(self, sources, progress_callback=None):
+        self.entered.set()
+        self.release.wait(timeout=5)
+        if progress_callback:
+            try:
+                for i, r in enumerate(self._results, 1):
+                    progress_callback(i, len(self._results), r)
+            except Exception as exc:  # the controller cancels through this
+                self.progress_error = exc
+                raise
+        return list(self._results)
+
+
+class TestOverlappingConversions:
+    def _two_run_controller(self, queue, first, second):
+        """A controller whose matcher provider hands out `first`, then `second`."""
+        matchers = iter([first, second])
+
+        return SpotifyImportController(
+            lambda: FakeSpotifySource(tracks=[sp_track("s1")]),
+            lambda: next(matchers),
+            queue,
+            dispatch=SyncDispatcher(),
+        )
+
+    def test_a_superseded_run_does_not_overwrite_the_report(self, queue):
+        slow = GatedMatcher([accepted(sp_track("s1"), td_track("slow"))])
+        fast = GatedMatcher([accepted(sp_track("s1"), td_track("fast"))])
+        fast.release.set()
+        ctrl = self._two_run_controller(queue, slow, fast)
+
+        done_a, done_b = [], []
+        thread_a = ctrl.convert(
+            PlaylistRef(id="A", name="Playlist A"),
+            lambda *a: None, done_a.append, lambda e: None,
+        )
+        assert slow.entered.wait(timeout=5), "first run never started"
+
+        # The user clicks playlist B while A is still matching.
+        thread_b = ctrl.convert(
+            PlaylistRef(id="B", name="Playlist B"),
+            lambda *a: None, done_b.append, lambda e: None,
+        )
+        wait(thread_b)
+        assert len(done_b) == 1
+        assert ctrl.report is done_b[0]
+
+        slow.release.set()
+        wait(thread_a)
+
+        assert done_a == [], "the superseded run must not report a result"
+        assert ctrl.report is done_b[0], "stale run overwrote the current report"
+
+    def test_a_superseded_run_is_actually_cancelled(self, queue):
+        """Not just ignored -- it has to stop doing work."""
+        slow = GatedMatcher([accepted(sp_track("s1"), td_track("slow"))])
+        fast = GatedMatcher([accepted(sp_track("s1"), td_track("fast"))])
+        fast.release.set()
+        ctrl = self._two_run_controller(queue, slow, fast)
+
+        thread_a = ctrl.convert(
+            PlaylistRef(id="A"), lambda *a: None, lambda r: None, lambda e: None
+        )
+        assert slow.entered.wait(timeout=5)
+        wait(ctrl.convert(PlaylistRef(id="B"), lambda *a: None, lambda r: None, lambda e: None))
+
+        slow.release.set()
+        wait(thread_a)
+
+        assert slow.progress_error is not None, "the old run kept matching"
+
+    def test_a_superseded_run_reports_no_error_either(self, queue):
+        """Its cancellation is not the user's problem -- and must not paint red."""
+        slow = GatedMatcher([accepted(sp_track("s1"), td_track("slow"))])
+        fast = GatedMatcher([accepted(sp_track("s1"), td_track("fast"))])
+        fast.release.set()
+        ctrl = self._two_run_controller(queue, slow, fast)
+
+        errors_a = []
+        thread_a = ctrl.convert(
+            PlaylistRef(id="A"), lambda *a: None, lambda r: None, errors_a.append
+        )
+        assert slow.entered.wait(timeout=5)
+        wait(ctrl.convert(PlaylistRef(id="B"), lambda *a: None, lambda r: None, lambda e: None))
+
+        slow.release.set()
+        wait(thread_a)
+
+        assert errors_a == []
+
+    def test_explicit_cancel_still_reports_back(self, queue):
+        """Unlike being superseded, an explicit cancel is the user's own doing."""
+        slow = GatedMatcher([accepted(sp_track("s1"), td_track("slow"))])
+        ctrl = self._two_run_controller(queue, slow, slow)
+
+        done, errors = [], []
+        thread = ctrl.convert(PlaylistRef(id="A"), lambda *a: None, done.append, errors.append)
+        assert slow.entered.wait(timeout=5)
+
+        ctrl.cancel()
+        slow.release.set()
+        wait(thread)
+
+        assert done == []
+        assert ctrl.report is None
+        assert errors and "cancelled" in errors[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# What a capped queue list actually shows
+#
+# The queue keeps items in the order they were added and never reorders them,
+# so after a few hundred downloads the finished ones sit at the front. Cutting
+# the list from the top would show a screen full of ticks while the download
+# that is actually running had scrolled off the end.
+# ---------------------------------------------------------------------------
+
+class TestDisplayRows:
+    def _queue_with_history(self, queue, done=200, pending=50):
+        queue.add_many(
+            [QueueItem(url=f"old{i}", title=f"Finished {i}") for i in range(done)]
+            + [QueueItem(url=f"new{i}", title=f"Waiting {i}") for i in range(pending)]
+        )
+        for item in queue.list()[:done]:
+            queue.mark_done(item.id)
+        return QueueController(queue)
+
+    def test_short_queues_keep_their_own_order(self, queue):
+        """Below the limit nothing is rearranged -- the reorder buttons rely on it."""
+        queue.add_many([QueueItem(url=f"u{i}", title=f"T{i}") for i in range(5)])
+        queue.mark_done(queue.list()[0].id)
+        ctrl = QueueController(queue)
+
+        rows, hidden = ctrl.display_rows(150)
+
+        assert hidden == 0
+        assert [r.title for r in rows] == [f"T{i}" for i in range(5)]
+
+    def test_running_and_waiting_items_survive_the_cut(self, queue):
+        ctrl = self._queue_with_history(queue, done=200, pending=50)
+        rows, hidden = ctrl.display_rows(150)
+
+        assert len(rows) == 150
+        assert hidden == 100
+        waiting = [r for r in rows if r.status == QueueStatus.PENDING.value]
+        assert len(waiting) == 50, "the waiting items were cut off by finished ones"
+
+    def test_the_active_item_is_always_visible(self, queue):
+        ctrl = self._queue_with_history(queue, done=200, pending=50)
+        active = queue.claim_next()
+
+        rows, _ = ctrl.display_rows(150)
+
+        assert rows[0].id == active.id
+        assert rows[0].status == QueueStatus.ACTIVE.value
+
+    def test_failures_are_shown_before_successes(self, queue):
+        """A failed download is the one thing the user has to act on."""
+        ctrl = self._queue_with_history(queue, done=200, pending=0)
+        broken = queue.list()[5]
+        queue.mark_failed(broken.id, "network unreachable")
+
+        rows, _ = ctrl.display_rows(10)
+
+        assert rows[0].id == broken.id
+
+    def test_queue_order_is_kept_within_a_status(self, queue):
+        ctrl = self._queue_with_history(queue, done=200, pending=50)
+        rows, _ = ctrl.display_rows(150)
+
+        waiting = [r.title for r in rows if r.status == QueueStatus.PENDING.value]
+        assert waiting == [f"Waiting {i}" for i in range(50)]

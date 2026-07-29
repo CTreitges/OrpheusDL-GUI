@@ -168,6 +168,20 @@ class QueueRow:
         return "  —  ".join(parts)
 
 
+#: Which rows earn a place on screen when the queue is too long to draw whole.
+#: Finished items are kept last on purpose: the queue keeps them in the order
+#: they were added, so after a couple of hundred downloads they sit at the very
+#: front -- and a list capped from the top would show nothing but ticks while
+#: the download actually running scrolled off the end.
+_DISPLAY_PRIORITY = {
+    QueueStatus.ACTIVE.value: 0,
+    QueueStatus.PENDING.value: 1,
+    QueueStatus.FAILED.value: 2,
+    QueueStatus.CANCELLED.value: 3,
+    QueueStatus.DONE.value: 4,
+}
+
+
 class QueueController:
     """Drives the queue tab."""
 
@@ -177,6 +191,21 @@ class QueueController:
     # -- display ------------------------------------------------------------
     def rows(self, status: Optional[str] = None) -> List[QueueRow]:
         return [self._row(item) for item in self.queue.list(status=status)]
+
+    def display_rows(self, limit: int) -> tuple:
+        """``(rows to draw, how many were left out)``.
+
+        Below ``limit`` this is simply the queue in its own order -- which is
+        what the reorder buttons act on, so it must not be rearranged for no
+        reason. Only once the list has to be cut short do we choose *what* to
+        cut: running and waiting items stay, finished ones go. The sort is
+        stable, so queue order survives within each group.
+        """
+        rows = self.rows()
+        if limit <= 0 or len(rows) <= limit:
+            return rows, 0
+        ordered = sorted(rows, key=lambda r: _DISPLAY_PRIORITY.get(r.status, 9))
+        return ordered[:limit], len(rows) - limit
 
     @staticmethod
     def _row(item: QueueItem) -> QueueRow:
@@ -456,6 +485,30 @@ class SpotifyImportController:
         #: Results of the last multi-playlist run.
         self.reports: List[ConversionReport] = []
         self._cancel = threading.Event()
+        #: Bumped by every new run. A worker whose generation is no longer the
+        #: current one has been superseded and must not touch shared state:
+        #: clicking playlist B while A was still matching used to let the slower
+        #: run overwrite ``self.report``, so "Queue matches" queued A's tracks
+        #: under B's name.
+        self._generation = 0
+        self._run_lock = threading.Lock()
+
+    def _begin_run(self) -> tuple:
+        """Supersede whatever is running. Returns ``(generation, cancel)``.
+
+        The new run gets its own event rather than clearing the shared one --
+        clearing it told the *previous* worker to carry on, which is exactly how
+        two conversions ended up racing.
+        """
+        with self._run_lock:
+            self._cancel.set()
+            self._cancel = threading.Event()
+            self._generation += 1
+            return self._generation, self._cancel
+
+    def _is_current(self, generation: int) -> bool:
+        """False once a newer run has taken over."""
+        return generation == self._generation
 
     # -- sign-in ------------------------------------------------------------
     def _authorize_blocking(self, source: Any, on_status: Optional[Callable[[str], None]]) -> None:
@@ -535,7 +588,15 @@ class SpotifyImportController:
 
     # -- conversion ---------------------------------------------------------
     def cancel(self) -> None:
-        self._cancel.set()
+        """Stop the running conversion.
+
+        Deliberately leaves the generation alone: the user asked for this, so
+        the run stays "current" long enough to report back that it stopped.
+        Being *superseded* by a new selection is the silent case -- see
+        :meth:`_begin_run`.
+        """
+        with self._run_lock:
+            self._cancel.set()
 
     def convert_many(
         self,
@@ -555,7 +616,7 @@ class SpotifyImportController:
 
         ``on_playlist(done, total, playlist)`` fires as each one begins.
         """
-        self._cancel.clear()
+        generation, cancel = self._begin_run()
         wanted = list(playlists)
 
         def work():
@@ -564,16 +625,17 @@ class SpotifyImportController:
             try:
                 converter = self._build_converter()
             except Exception as exc:
-                self.dispatch(on_error, _describe(exc))
+                if self._is_current(generation):
+                    self.dispatch(on_error, _describe(exc))
                 return
 
             for index, playlist in enumerate(wanted):
-                if self._cancel.is_set():
+                if cancel.is_set() or not self._is_current(generation):
                     break
                 self.dispatch(on_playlist, index, len(wanted), playlist)
 
                 def progress(done, total, result, _i=index):
-                    if self._cancel.is_set():
+                    if cancel.is_set() or not self._is_current(generation):
                         raise HiresError("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
@@ -582,7 +644,7 @@ class SpotifyImportController:
                     if enqueue:
                         converter.enqueue(report, include_review=False)
                 except HiresError as exc:
-                    if self._cancel.is_set():
+                    if cancel.is_set():
                         break
                     failures.append(_describe(exc))
                     continue
@@ -591,6 +653,8 @@ class SpotifyImportController:
                     continue
                 reports.append(report)
 
+            if not self._is_current(generation):
+                return  # a newer run owns the tab now
             self.reports = reports
             if not reports and failures:
                 self.dispatch(on_error, failures[0])
@@ -611,22 +675,28 @@ class SpotifyImportController:
         on_done: Callable[[ConversionReport], None],
         on_error: Callable[[str], None],
     ) -> threading.Thread:
-        """Match a Spotify playlist against TIDAL. Queues nothing yet."""
-        self._cancel.clear()
+        """Match a Spotify playlist against TIDAL. Queues nothing yet.
+
+        Starting this supersedes any conversion already in flight.
+        """
+        generation, cancel = self._begin_run()
 
         def work():
             try:
                 converter = self._build_converter()
 
                 def progress(done, total, result):
-                    if self._cancel.is_set():
+                    if cancel.is_set() or not self._is_current(generation):
                         raise HiresError("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
                 report = converter.convert(playlist, progress_callback=progress)
             except Exception as exc:
-                self.dispatch(on_error, _describe(exc))
+                if self._is_current(generation):
+                    self.dispatch(on_error, _describe(exc))
                 return
+            if not self._is_current(generation):
+                return  # a newer selection owns the tab now
             self.report = report
             self.dispatch(on_done, report)
 

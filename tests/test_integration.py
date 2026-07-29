@@ -19,7 +19,7 @@ from hires import integration  # noqa: E402
 from hires.integration import (  # noqa: E402
     DISPATCH_GRACE_SEC,
     HiresRuntime,
-    _walk_audio_files,
+    audio_snapshot,
     default_queue_path,
     install,
 )
@@ -49,6 +49,12 @@ class FakeGui:
         self.app = FakeApp()
         self.download_process_active = False
         self.file_download_queue = []
+        #: Non-None from the moment a batch starts until it is fully finished --
+        #: including the pause between two batch items.
+        self.current_batch_output_path = None
+        #: gui.py sets this once the library is up. Downloads refuse to start
+        #: (with a modal error box) while it is None.
+        self.orpheus_instance = object()
         self.stop_event = threading.Event()
         self.application_path = "/tmp/fake-app"
         self.current_settings = {
@@ -101,26 +107,42 @@ def finish_download(runtime, gui):
 # Helpers
 # ---------------------------------------------------------------------------
 
-class TestWalkAudioFiles:
+class TestAudioSnapshot:
     def test_finds_audio_recursively(self, tmp_path):
         write_audio(str(tmp_path), "a.flac")
         write_audio(str(tmp_path / "sub"), "b.mp3")
-        assert len(_walk_audio_files(str(tmp_path))) == 2
+        assert audio_snapshot(str(tmp_path))[0] == 2
 
     def test_ignores_non_audio(self, tmp_path):
         write_audio(str(tmp_path), "cover.jpg")
         write_audio(str(tmp_path), "playlist.m3u")
-        assert _walk_audio_files(str(tmp_path)) == []
+        assert audio_snapshot(str(tmp_path)) == (0, 0.0)
 
     def test_missing_folder_is_empty(self, tmp_path):
-        assert _walk_audio_files(str(tmp_path / "nope")) == []
+        assert audio_snapshot(str(tmp_path / "nope")) == (0, 0.0)
 
     def test_empty_path_is_empty(self):
-        assert _walk_audio_files("") == []
+        assert audio_snapshot("") == (0, 0.0)
 
     def test_extension_matching_is_case_insensitive(self, tmp_path):
         write_audio(str(tmp_path), "TRACK.FLAC")
-        assert len(_walk_audio_files(str(tmp_path))) == 1
+        assert audio_snapshot(str(tmp_path))[0] == 1
+
+    def test_reports_the_newest_mtime(self, tmp_path):
+        write_audio(str(tmp_path), "old.flac")
+        os.utime(str(tmp_path / "old.flac"), (1_000_000, 1_000_000))
+        write_audio(str(tmp_path / "sub"), "new.flac")
+        os.utime(str(tmp_path / "sub" / "new.flac"), (2_000_000, 2_000_000))
+
+        count, newest = audio_snapshot(str(tmp_path))
+        assert count == 2
+        assert newest == pytest.approx(2_000_000, abs=1)
+
+    def test_a_non_audio_file_does_not_set_the_mtime(self, tmp_path):
+        """Otherwise a cover.jpg written by the tagger reads as 'audio appeared'."""
+        write_audio(str(tmp_path), "cover.jpg")
+        os.utime(str(tmp_path / "cover.jpg"), (9_000_000, 9_000_000))
+        assert audio_snapshot(str(tmp_path)) == (0, 0.0)
 
 
 class TestDefaultQueuePath:
@@ -701,3 +723,76 @@ class TestSpotifyStatusProvider:
             "client_secret": "secret",
         }
         assert provider().state is AccountState.SIGNED_OUT
+
+
+# ---------------------------------------------------------------------------
+# Sharing the download slot with the stock batch engine
+#
+# gui.py's final_ui_update clears download_process_active and pops the next
+# batch URL *before* scheduling it through app.after(pause_ms, ...). During
+# that pause both of the flags the runtime used to watch say "idle" -- so it
+# claimed the slot, and the delayed batch start was refused and its URL lost.
+# ---------------------------------------------------------------------------
+
+class TestBatchSlotIsNotStolen:
+    def test_stays_off_the_slot_during_the_inter_batch_pause(self, queue):
+        gui = FakeGui(output_path="/out")
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="https://tidal.com/browse/track/1", title="Ours"))
+
+        # Mid-batch pause: flag cleared, last URL already popped, restart pending.
+        gui.download_process_active = False
+        gui.file_download_queue = []
+        gui.current_batch_output_path = "/out"
+
+        runtime._pump()
+
+        assert gui.calls == [], "claimed the slot the batch engine still owned"
+        assert queue.list()[0].status == QueueStatus.PENDING.value
+        assert queue.list()[0].attempts == 0, "burned an attempt while waiting"
+
+    def test_takes_the_slot_once_the_batch_is_really_done(self, queue):
+        gui = FakeGui(output_path="/out")
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="https://tidal.com/browse/track/1", title="Ours"))
+
+        gui.current_batch_output_path = None  # batch finished
+        runtime._pump()
+
+        assert len(gui.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Starting up with a restored queue
+# ---------------------------------------------------------------------------
+
+class TestWaitsForTheLibrary:
+    def test_does_not_dispatch_before_orpheus_exists(self, queue):
+        """Otherwise every item pops a modal error box and burns its retries."""
+        gui = FakeGui(output_path="/out")
+        gui.orpheus_instance = None
+        runtime = make_runtime(gui, queue)
+        queue.add_many(
+            [QueueItem(url=f"https://tidal.com/browse/track/{i}") for i in range(3)]
+        )
+
+        for _ in range(5):
+            runtime._pump()
+
+        assert gui.calls == []
+        assert [i.status for i in queue.list()] == [QueueStatus.PENDING.value] * 3
+        assert [i.attempts for i in queue.list()] == [0, 0, 0]
+
+    def test_dispatches_as_soon_as_the_library_is_up(self, queue):
+        gui = FakeGui(output_path="/out")
+        gui.orpheus_instance = None
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="https://tidal.com/browse/track/1"))
+
+        runtime._pump()
+        assert gui.calls == []
+
+        gui.orpheus_instance = object()
+        runtime._pump()
+
+        assert len(gui.calls) == 1
