@@ -371,3 +371,63 @@ class TestSignInGuards:
 
         assert ctrl.sign_in("Deezer", lambda: None, errors.append) is None
         assert errors == ["Unknown service: Deezer"]
+
+
+class TestSpotifySignInIsFinishedWhenItSaysSo:
+    """The thread sign_in hands back has to cover the whole flow.
+
+    It used to be only the precheck: the PKCE flow ran on a second worker whose
+    handle was dropped, so joining the returned thread proved nothing and the
+    result was read before it existed. Green on fast runners, red on macOS.
+    """
+
+    def _controller(self, queue, entered, release):
+        """A sign-in that parks inside the flow until `release` is set."""
+        source = AuthAwareSource(web=FakeWebBackend(), authorized=False)
+
+        def slow_code(_uri, _state):
+            entered.set()
+            release.wait(timeout=5)
+            return "CODE"
+
+        spotify = SpotifyImportController(
+            lambda: source,
+            lambda: None,
+            queue,
+            dispatch=SyncDispatcher(),
+            open_url=lambda _u: None,
+            wait_for_code=slow_code,
+        )
+        return make_accounts(spotify_controller=spotify), source
+
+    def test_the_result_is_there_once_the_thread_ends(self, queue):
+        entered, release = threading.Event(), threading.Event()
+        ctrl, source = self._controller(queue, entered, release)
+        done, errors = [], []
+
+        thread = ctrl.sign_in("Spotify", lambda: done.append(True), errors.append)
+        assert thread is not None
+        assert entered.wait(timeout=5), "the flow never started"
+        assert done == [], "cannot be finished while the code is still pending"
+
+        # Released from the side, so joining the thread is what has to wait.
+        # A thread that only covered the precheck returns here immediately.
+        threading.Timer(0.3, release.set).start()
+        wait(thread)
+
+        assert errors == []
+        assert done == [True], "the thread ended before the sign-in had finished"
+        assert [code for code, _v in source.web.exchanged] == ["CODE"]
+
+    def test_the_guard_is_free_once_the_thread_ends(self, queue):
+        entered, release = threading.Event(), threading.Event()
+        ctrl, _source = self._controller(queue, entered, release)
+
+        thread = ctrl.sign_in("Spotify", lambda: None, lambda _m: None)
+        assert entered.wait(timeout=5)
+        assert ctrl.is_busy("Spotify"), "the button must stay locked while it runs"
+
+        threading.Timer(0.3, release.set).start()
+        wait(thread)
+
+        assert not ctrl.is_busy("Spotify"), "the button was still locked afterwards"

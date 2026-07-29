@@ -1026,6 +1026,12 @@ class AccountsController:
         The "is a client id configured?" check reads settings and can touch the
         network, so it runs inside the worker rather than in the click handler.
         Doing it here froze the window before the browser even opened.
+
+        The returned thread covers the whole sign-in, not just the precheck --
+        the flow runs on a worker of its own, and this one waits for it. Without
+        that, joining the returned thread proved nothing: it was finished the
+        moment the browser opened, so the caller could look at the result before
+        there was one.
         """
         controller = self.spotify_controller
         if controller is None:
@@ -1052,8 +1058,11 @@ class AccountsController:
                 # is worse than saying what is missing.
                 failed(status.hint or status.detail)
                 return
-            # sign_in() spawns its own worker; this one has done its job.
-            controller.sign_in(done, failed, on_status)
+            # sign_in() runs on a worker of its own; stay alive until it is
+            # done so the thread we handed back means what it says.
+            inner = controller.sign_in(done, failed, on_status)
+            if inner is not None:
+                inner.join()
 
         return run_in_background(work, name="hires-spotify-signin-precheck")
 
