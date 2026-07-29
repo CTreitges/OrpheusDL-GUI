@@ -400,10 +400,33 @@ def make_spotify_source_provider(gui: Any) -> Callable[[], Any]:
         # Without credentials this still works: the embed backend handles
         # public playlist links anonymously.
         return SpotifySource.from_config(
-            client_id, client_secret, token_path=token_path
+            client_id,
+            client_secret,
+            token_path=token_path,
+            redirect_uri=spotify_redirect_uri(gui),
         )
 
     return provider
+
+
+def spotify_redirect_uri(gui: Any) -> str:
+    """Where the sign-in listens for Spotify's callback.
+
+    Defaults to the URI the GUI's own Spotify setup panel hands out for
+    registering, so anyone who followed that panel can sign in without
+    configuring anything else. Overridable for people whose Spotify app is
+    registered against a different one -- Spotify only redirects to URIs the
+    app actually lists, so this has to be able to follow.
+    """
+    from .spotify_source import DEFAULT_REDIRECT_URI
+
+    settings = getattr(gui, "current_settings", None)
+    if isinstance(settings, dict):
+        creds = (settings.get("credentials") or {}).get("Spotify") or {}
+        configured = (creds.get("redirect_uri") or "").strip()
+        if configured:
+            return configured
+    return DEFAULT_REDIRECT_URI
 
 
 def _tidal_module(gui: Any) -> Any:
@@ -542,9 +565,16 @@ def make_spotify_status_provider(gui: Any) -> Callable[[], Any]:
             )
 
         if not source.is_user_authorized():
+            # Naming the redirect URI here is the difference between a sign-in
+            # that hangs for five minutes and one the user can fix: Spotify
+            # only redirects back to URIs their app actually lists.
             return status(
                 AccountState.SIGNED_OUT,
                 "Sign in to reach your own playlists and Liked Songs.",
+                hint=(
+                    "Your Spotify app must list this redirect URI: "
+                    f"{spotify_redirect_uri(gui)}"
+                ),
             )
 
         account = ""

@@ -63,7 +63,21 @@ DEFAULT_SCOPES: Tuple[str, ...] = (
     "user-library-read",
 )
 
-DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"
+#: Where Spotify sends the user back after they approve.
+#:
+#: This has to be one of the redirect URIs registered on the Spotify app, or
+#: Spotify simply refuses to redirect after login -- the browser stops on an
+#: error page and the app waits for a callback that will never arrive.
+#:
+#: It matches the URI the GUI's own *Settings > Spotify* panel offers for
+#: copying into the Spotify dashboard, so following that panel is enough to
+#: make signing in work. It used to be ``:8888/callback``, which nothing ever
+#: told anyone to register -- so the sign-in could only ever hang.
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:4381/login"
+
+#: The URI the GUI's setup panel tells people to register. Kept as its own name
+#: so the two cannot drift apart silently again.
+SETUP_PANEL_REDIRECT_URI = "http://127.0.0.1:4381/login"
 
 #: Id of the synthetic "Liked Songs" playlist (Spotify has no real id for it).
 LIKED_ID = "liked"
@@ -404,7 +418,8 @@ def wait_for_authorization_code(
     except OSError as exc:
         raise AuthRequiredError(
             f"Cannot listen on {host}:{port} for the Spotify redirect ({exc}). "
-            "Close whatever is using that port and try again."
+            "Another sign-in may still be waiting - give it a minute, or close "
+            "whatever else is using that port."
         ) from exc
 
     deadline = time.monotonic() + max(1.0, float(timeout))
@@ -420,8 +435,16 @@ def wait_for_authorization_code(
 
     if outcome.get("code"):
         return str(outcome["code"])
+    if outcome.get("error"):
+        raise AuthRequiredError(outcome["error"])
+
+    # Nothing arrived at all. By far the most common cause is that this exact
+    # URI is not registered on the Spotify app, in which case Spotify shows an
+    # error after login and never redirects -- so name the URI rather than
+    # reporting a bare timeout the user cannot act on.
     raise AuthRequiredError(
-        outcome.get("error") or "Timed out waiting for Spotify to redirect back"
+        "Spotify never redirected back. Open your app on developer.spotify.com "
+        f"and make sure its Redirect URIs contain exactly:  {redirect_uri or DEFAULT_REDIRECT_URI}"
     )
 
 

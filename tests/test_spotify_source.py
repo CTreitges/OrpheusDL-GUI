@@ -1255,9 +1255,18 @@ def test_callback_server_reports_a_denial():
 
 
 def test_callback_server_times_out_without_a_request():
+    """Nothing arriving is almost always an unregistered redirect URI.
+
+    A bare "timed out" left the user with nothing to act on, which is how the
+    sign-in appeared simply broken; the message now names the URI to register.
+    """
     uri = f"http://127.0.0.1:{_free_port()}/callback"
-    with pytest.raises(AuthRequiredError, match="Timed out"):
+    with pytest.raises(AuthRequiredError) as excinfo:
         ss.wait_for_authorization_code(uri, expected_state="S", timeout=1.0)
+
+    message = str(excinfo.value)
+    assert uri in message
+    assert "developer.spotify.com" in message
 
 
 def test_callback_server_reports_an_unusable_port():
@@ -1280,3 +1289,81 @@ def test_callback_server_reports_an_unusable_port():
         )
     assert "8888" in str(excinfo.value)
     assert "Address already in use" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# The redirect URI
+#
+# Spotify only redirects back to URIs the app itself lists. When the one we
+# listen on is not among them, Spotify stops on an error page after login and
+# nothing ever arrives -- so the app waited five minutes and then reported a
+# bare timeout. That was the whole of "the Spotify login doesn't work".
+# ---------------------------------------------------------------------------
+
+class TestRedirectUri:
+    def test_the_default_matches_what_the_setup_panel_hands_out(self):
+        """These two drifting apart is exactly what broke sign-in.
+
+        gui.py's Spotify panel offers a redirect URI to copy into the Spotify
+        dashboard. If we listen somewhere else, following that panel produces
+        an app that can never complete a sign-in.
+        """
+        import re
+
+        assert ss.DEFAULT_REDIRECT_URI == ss.SETUP_PANEL_REDIRECT_URI
+
+        gui_py = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gui.py"
+        )
+        with open(gui_py, encoding="utf-8") as handle:
+            source = handle.read()
+        offered = set(re.findall(r'_sp_redirect_uri\s*=\s*"([^"]+)"', source))
+
+        assert offered, "gui.py no longer offers a redirect URI to copy"
+        assert ss.DEFAULT_REDIRECT_URI in offered, (
+            f"we listen on {ss.DEFAULT_REDIRECT_URI} but the setup panel tells "
+            f"people to register {offered} -- sign-in cannot work"
+        )
+
+    def test_it_is_a_loopback_address(self):
+        """Spotify dropped plain-HTTP redirects except on loopback IPs."""
+        assert ss.DEFAULT_REDIRECT_URI.startswith("http://127.0.0.1")
+        assert "localhost" not in ss.DEFAULT_REDIRECT_URI
+
+    def test_a_silent_timeout_names_the_uri_to_register(self):
+        """The failure has to explain itself; the old one could not be acted on."""
+
+        class NeverCalled:
+            def __init__(self, *_a, **_k):
+                self.timeout = 1.0
+
+            def handle_request(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        with pytest.raises(ss.AuthRequiredError) as excinfo:
+            ss.wait_for_authorization_code(
+                "http://127.0.0.1:4381/login",
+                expected_state="s",
+                timeout=1.0,
+                server_factory=lambda *_a, **_k: NeverCalled(),
+            )
+
+        message = str(excinfo.value)
+        assert "http://127.0.0.1:4381/login" in message, "the URI is the actionable part"
+        assert "developer.spotify.com" in message
+
+    def test_a_real_denial_still_reports_itself(self):
+        """A refusal from Spotify must not be relabelled as a URI problem.
+
+        Driven through a real request, the same way ``_run_callback`` does it
+        further up -- a fake server cannot reach the handler's outcome dict, so
+        faking this would only test the fake.
+        """
+        uri = f"http://127.0.0.1:{_free_port()}/login"
+        out = _run_callback(uri, "STATE123", "error=access_denied&state=STATE123")
+
+        assert "access_denied" in str(out["error"])
+        assert "developer.spotify.com" not in str(out["error"])
