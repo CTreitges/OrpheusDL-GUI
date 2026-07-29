@@ -16,13 +16,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .models import (
     AuthRequiredError,
+    FolderRef,
     HiresError,
     PlaylistRef,
     SourceUnavailableError,
     TrackRef,
+    flat_root,
 )
 
 PLATFORM = "TIDAL"
+
+#: Where playlist folders live. This is the web player's own API, *not* the
+#: documented one at api.tidal.com -- TIDAL exposes no folder endpoint
+#: publicly. Treat every call to it as optional: it may reject the module's TV
+#: client token, change shape, or vanish, and the app has to keep working.
+FOLDERS_URL = "https://listen.tidal.com/v2/my-collection/playlists/folders"
+
+#: Page size for the collection endpoint.
+_FOLDER_PAGE_SIZE = 50
+
+#: Hard stop on paging, so a misbehaving response cannot loop forever.
+_FOLDER_ITEM_CAP = 2000
+
+#: Folders are a nicety; never let them hold the UI up for long.
+_FOLDER_TIMEOUT = 10
 
 #: Service name of the TIDAL module inside an Orpheus instance.
 MODULE_NAME = "tidal"
@@ -292,6 +309,140 @@ class TidalLibrary:
         if not user_id:
             raise AuthRequiredError("TIDAL login required to browse personal playlists")
         return user_id
+
+    # -- folders ------------------------------------------------------------
+    def list_folders(self, include_favorites: bool = True) -> FolderRef:
+        """The user's playlists arranged in their TIDAL folders.
+
+        Falls back to a flat, unnamed root whenever the folder view cannot be
+        obtained -- which is the expected outcome often enough to be the
+        designed behaviour, not an error path: folders live on the web
+        player's private ``/v2/`` API (see :data:`FOLDERS_URL`), which is not
+        part of the documented TIDAL API and may refuse a TV client token,
+        change shape, or disappear.
+
+        The playlists themselves always come from the supported v1 endpoint, so
+        the worst case is losing the grouping, never losing playlists.
+        """
+        playlists = self.list_playlists(include_favorites=include_favorites)
+        try:
+            layout = self._fetch_folder_layout()
+        except Exception:
+            layout = {}
+        if not layout:
+            return flat_root(playlists, platform=PLATFORM)
+        return self._arrange(playlists, layout)
+
+    def _fetch_folder_layout(self) -> Dict[str, Any]:
+        """``{playlist_id: (folder_id, folder_name)}`` from the v2 collection.
+
+        Returns ``{}`` for anything unexpected. Every caller treats that as
+        "no folder information", so no failure here needs to reach the user.
+        """
+        session = self._authenticated_session()
+        if session is None:
+            return {}
+        headers = getattr(session, "auth_headers", None)
+        if not callable(headers):
+            return {}
+
+        http = getattr(self.api, "s", None)
+        if http is None:
+            import requests  # imported lazily; only this path needs it
+
+            http = requests
+
+        layout: Dict[str, Any] = {}
+        for folder in self._iter_folders(http, headers(), session):
+            folder_id = _id_str(folder.get("id"))
+            name = _text(folder.get("name"))
+            if not name:
+                continue
+            for playlist_id in self._folder_playlist_ids(http, headers(), session, folder_id):
+                layout[playlist_id] = (folder_id, name)
+        return layout
+
+    def _iter_folders(self, http, headers, session) -> List[Dict[str, Any]]:
+        """Folders at the root of the collection."""
+        items = self._collection_items(http, headers, session, folder_id="root")
+        out = []
+        for item in items:
+            if _text(item.get("itemType")).upper() != "FOLDER":
+                continue
+            data = _as_dict(item.get("data")) or item
+            if _id_str(data.get("id")):
+                out.append(data)
+        return out
+
+    def _folder_playlist_ids(self, http, headers, session, folder_id: str) -> List[str]:
+        """Ids of the playlists directly inside one folder."""
+        out = []
+        for item in self._collection_items(http, headers, session, folder_id=folder_id):
+            if _text(item.get("itemType")).upper() != "PLAYLIST":
+                continue
+            data = _as_dict(item.get("data")) or item
+            pid = _id_str(data.get("uuid")) or _id_str(data.get("id"))
+            if pid:
+                out.append(pid)
+        return out
+
+    def _collection_items(self, http, headers, session, folder_id: str) -> List[Dict[str, Any]]:
+        """One page-walk over the private collection endpoint."""
+        out: List[Dict[str, Any]] = []
+        offset = 0
+        while len(out) < _FOLDER_ITEM_CAP:
+            response = http.get(
+                FOLDERS_URL,
+                headers=headers,
+                params={
+                    "folderId": folder_id,
+                    "offset": offset,
+                    "limit": _FOLDER_PAGE_SIZE,
+                    "order": "NAME",
+                    "orderDirection": "ASC",
+                    "countryCode": getattr(session, "country_code", "") or "US",
+                    "locale": "en_US",
+                    "deviceType": "BROWSER",
+                },
+                timeout=_FOLDER_TIMEOUT,
+            )
+            if getattr(response, "status_code", 0) != 200:
+                break
+            payload = _as_dict(response.json())
+            items = _as_list(payload.get("items"))
+            if not items:
+                break
+            out.extend(i for i in items if isinstance(i, dict))
+            total = _int_or_none(payload.get("totalNumberOfItems"))
+            offset += len(items)
+            if total is not None and offset >= total:
+                break
+        return out
+
+    @staticmethod
+    def _arrange(playlists: List[PlaylistRef], layout: Dict[str, Any]) -> FolderRef:
+        """Group a flat playlist list by the folder layout.
+
+        Playlists the layout does not mention stay at the root, so a partially
+        readable layout still shows everything.
+        """
+        root = FolderRef(platform=PLATFORM)
+        folders: Dict[str, FolderRef] = {}
+
+        for playlist in playlists:
+            entry = layout.get(playlist.id)
+            if not entry:
+                root.playlists.append(playlist)
+                continue
+            folder_id, name = entry
+            folder = folders.get(folder_id)
+            if folder is None:
+                folder = FolderRef(id=folder_id, name=name, platform=PLATFORM)
+                folders[folder_id] = folder
+                root.folders.append(folder)
+            folder.playlists.append(playlist)
+
+        return root
 
     # -- playlists ----------------------------------------------------------
     def list_playlists(self, include_favorites: bool = True) -> List[PlaylistRef]:

@@ -26,6 +26,7 @@ from .models import (
     AccountStatus,
     AuthRequiredError,
     ConversionReport,
+    FolderRef,
     HiresError,
     MatchDecision,
     MatchResult,
@@ -33,6 +34,7 @@ from .models import (
     QueueItem,
     QueueStatus,
     TrackRef,
+    flat_root,
 )
 from .quality import HIRES, label_for, normalize_tier
 
@@ -270,15 +272,23 @@ class TidalBrowserController:
         self.output_provider = output_provider or (lambda: None)
         self.folder_per_playlist = folder_per_playlist
         self.playlists: List[PlaylistRef] = []
+        self.root: Optional[FolderRef] = None
 
     # -- loading ------------------------------------------------------------
     def load_playlists(
         self,
-        on_done: Callable[[List[PlaylistRef]], None],
+        on_done: Callable[[FolderRef], None],
         on_error: Callable[[str], None],
         *,
         include_favorites: bool = True,
     ) -> threading.Thread:
+        """Load the library, arranged in folders where TIDAL exposes them.
+
+        ``on_done`` always receives a :class:`FolderRef`: an unnamed root when
+        there are no folders, or the folder view when there are. That keeps the
+        widget code from having to know which happened.
+        """
+
         def work():
             try:
                 library = self.library_provider()
@@ -286,12 +296,21 @@ class TidalBrowserController:
                     raise HiresError(
                         "TIDAL module not available. Install it and log in under Settings > TIDAL."
                     )
-                playlists = library.list_playlists(include_favorites=include_favorites)
+                lister = getattr(library, "list_folders", None)
+                if callable(lister):
+                    root = lister(include_favorites=include_favorites)
+                else:
+                    # A library that predates folders is still perfectly usable.
+                    root = flat_root(
+                        library.list_playlists(include_favorites=include_favorites),
+                        platform="TIDAL",
+                    )
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
-            self.playlists = list(playlists)
-            self.dispatch(on_done, self.playlists)
+            self.root = root
+            self.playlists = root.all_playlists()
+            self.dispatch(on_done, root)
 
         return run_in_background(work, name="hires-tidal-playlists")
 
@@ -315,7 +334,31 @@ class TidalBrowserController:
         return run_in_background(work, name="hires-tidal-tracks")
 
     # -- queueing -----------------------------------------------------------
-    def enqueue_playlist_as_one(self, playlist: PlaylistRef) -> QueueItem:
+    def enqueue_many(
+        self, playlists: Sequence[PlaylistRef], group_label: str = ""
+    ) -> List[QueueItem]:
+        """Queue several playlists at once -- a whole folder, or a selection.
+
+        Each playlist stays its own queue item, so one that fails can be
+        retried without touching the others. ``group_label`` ties them together
+        in the queue display; it is the folder name when a folder was picked.
+        """
+        items = []
+        for playlist in playlists:
+            try:
+                items.append(self.enqueue_playlist_as_one(playlist, group_label=group_label))
+            except Exception:
+                # One bad playlist must not cost the user the rest of the folder.
+                continue
+        return items
+
+    def enqueue_folder(self, folder: FolderRef) -> List[QueueItem]:
+        """Queue every playlist in a folder, including its sub-folders."""
+        return self.enqueue_many(folder.all_playlists(), group_label=folder.name)
+
+    def enqueue_playlist_as_one(
+        self, playlist: PlaylistRef, group_label: str = ""
+    ) -> QueueItem:
         """Queue the playlist URL itself and let OrpheusDL expand it.
 
         Cheaper than resolving every track, and it keeps OrpheusDL's own
@@ -331,7 +374,9 @@ class TidalBrowserController:
             media_kind="playlist",
             output_path=self.output_provider(),
             quality=normalize_tier(self.quality_provider()),
-            group_label=playlist.name or playlist.id,
+            # The folder name when one was queued, so the queue shows what the
+            # item belonged to rather than repeating its own title.
+            group_label=group_label or playlist.name or playlist.id,
             source={"kind": "tidal_playlist", "tidal_playlist_id": playlist.id},
         )
         return self.queue.add(item)
@@ -408,6 +453,8 @@ class SpotifyImportController:
 
         self.playlists: List[PlaylistRef] = []
         self.report: Optional[ConversionReport] = None
+        #: Results of the last multi-playlist run.
+        self.reports: List[ConversionReport] = []
         self._cancel = threading.Event()
 
     # -- sign-in ------------------------------------------------------------
@@ -479,13 +526,83 @@ class SpotifyImportController:
                 self.dispatch(on_error, _describe(exc))
                 return
             self.playlists = list(playlists)
-            self.dispatch(on_done, self.playlists)
+            # Same contract as the TIDAL tab, so one widget renders both.
+            # Spotify's Web API does not expose folders at all, so this root is
+            # always unnamed -- see HIRES.md.
+            self.dispatch(on_done, flat_root(self.playlists, platform="Spotify"))
 
         return run_in_background(work, name="hires-spotify-playlists")
 
     # -- conversion ---------------------------------------------------------
     def cancel(self) -> None:
         self._cancel.set()
+
+    def convert_many(
+        self,
+        playlists: Sequence[Any],
+        on_playlist: Callable[[int, int, Any], None],
+        on_progress: Callable[[int, int, Optional[MatchResult]], None],
+        on_done: Callable[[List[ConversionReport]], None],
+        on_error: Callable[[str], None],
+        *,
+        enqueue: bool = True,
+    ) -> threading.Thread:
+        """Convert several playlists back to back, queueing as it goes.
+
+        Queueing per playlist rather than at the end means a long run is useful
+        even if a later playlist fails -- the downloads for the earlier ones
+        have already started.
+
+        ``on_playlist(done, total, playlist)`` fires as each one begins.
+        """
+        self._cancel.clear()
+        wanted = list(playlists)
+
+        def work():
+            reports: List[ConversionReport] = []
+            failures: List[str] = []
+            try:
+                converter = self._build_converter()
+            except Exception as exc:
+                self.dispatch(on_error, _describe(exc))
+                return
+
+            for index, playlist in enumerate(wanted):
+                if self._cancel.is_set():
+                    break
+                self.dispatch(on_playlist, index, len(wanted), playlist)
+
+                def progress(done, total, result, _i=index):
+                    if self._cancel.is_set():
+                        raise HiresError("Conversion cancelled")
+                    self.dispatch(on_progress, done, total, result)
+
+                try:
+                    report = converter.convert(playlist, progress_callback=progress)
+                    if enqueue:
+                        converter.enqueue(report, include_review=False)
+                except HiresError as exc:
+                    if self._cancel.is_set():
+                        break
+                    failures.append(_describe(exc))
+                    continue
+                except Exception as exc:
+                    failures.append(_describe(exc))
+                    continue
+                reports.append(report)
+
+            self.reports = reports
+            if not reports and failures:
+                self.dispatch(on_error, failures[0])
+                return
+            if failures:
+                self.dispatch(
+                    on_error,
+                    f"{len(failures)} of {len(wanted)} playlists failed: {failures[0]}",
+                )
+            self.dispatch(on_done, reports)
+
+        return run_in_background(work, name="hires-spotify-convert-many")
 
     def convert(
         self,

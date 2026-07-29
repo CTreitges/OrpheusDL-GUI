@@ -272,7 +272,7 @@ class TestTidalBrowserController:
         wait(ctrl.load_playlists(done.append, errors.append))
 
         assert errors == []
-        assert [p.name for p in done[0]] == ["Mine"]
+        assert [p.name for p in done[0].all_playlists()] == ["Mine"]
         assert ctrl.playlists == pls
 
     def test_load_playlists_can_exclude_favorites(self, queue):
@@ -285,7 +285,7 @@ class TestTidalBrowserController:
 
         wait(ctrl.load_playlists(done.append, lambda e: None, include_favorites=False))
 
-        assert [p.name for p in done[0]] == ["Mine"]
+        assert [p.name for p in done[0].all_playlists()] == ["Mine"]
 
     def test_missing_module_reports_a_helpful_error(self, queue):
         ctrl = TidalBrowserController(lambda: None, queue, dispatch=SyncDispatcher())
@@ -436,7 +436,7 @@ class TestSpotifyImportController:
 
         wait(ctrl.load_playlists(done.append, lambda e: None))
 
-        assert [p.name for p in done[0]] == ["Liked Songs"]
+        assert [p.name for p in done[0].all_playlists()] == ["Liked Songs"]
 
     def test_unconfigured_spotify_reports_an_error(self, queue):
         ctrl = SpotifyImportController(
@@ -685,7 +685,7 @@ class TestSpotifySignIn:
         assert errors == []
         assert opened and "accounts.spotify.com" in opened[0]
         assert source.web.exchanged == [("THECODE", "VERIFIER")]
-        assert [p.name for p in done[0]] == ["Liked Songs"]
+        assert [p.name for p in done[0].all_playlists()] == ["Liked Songs"]
         assert any("browser" in s.lower() for s in status)
 
     def test_already_authorized_skips_the_browser(self, queue):
@@ -699,7 +699,7 @@ class TestSpotifySignIn:
 
         assert opened == []
         assert source.web.exchanged == []
-        assert [p.name for p in done[0]] == ["Mine"]
+        assert [p.name for p in done[0].all_playlists()] == ["Mine"]
 
     def test_state_is_random_per_attempt(self, queue):
         source = AuthAwareSource(authorized=False)
@@ -775,4 +775,4 @@ def test_source_without_auth_reporting_is_listed_anyway(queue):
 
     assert errors == []
     assert opened == [], "must not open a browser for a source that never asked"
-    assert [p.name for p in done[0]] == ["Mine"]
+    assert [p.name for p in done[0].all_playlists()] == ["Mine"]

@@ -21,7 +21,15 @@ from .controllers import (
     TidalBrowserController,
     UiDispatcher,
 )
-from .models import AccountState, ConversionReport, PlaylistRef, QueueStatus
+from .models import (
+    AccountState,
+    ConversionReport,
+    FolderRef,
+    MatchDecision,
+    PlaylistRef,
+    QueueStatus,
+    flat_root,
+)
 from .quality import HIRES, label_for
 
 # Mirrors the palette in gui.py. Duplicated rather than imported because gui.py
@@ -47,6 +55,18 @@ STATUS_COLORS = {
     QueueStatus.FAILED.value: ERROR,
     QueueStatus.CANCELLED.value: GRAY_TEXT,
 }
+
+
+def _count_label(count: int, noun: str) -> str:
+    """``3 playlists`` / ``1 playlist`` -- these strings are read constantly."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _selection_label(playlists) -> str:
+    """What is ticked, and how much music that is."""
+    tracks = sum(p.track_count or 0 for p in playlists)
+    label = _count_label(len(playlists), "playlist")
+    return f"{label} · {_count_label(tracks, 'track')}" if tracks else label
 
 
 def _button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):
@@ -225,12 +245,30 @@ class QueueTab:
 # ---------------------------------------------------------------------------
 
 class PlaylistList:
-    """A scrollable, single-select list of playlists."""
+    """A scrollable list of playlists, optionally grouped into folders.
 
-    def __init__(self, parent, on_select: Callable[[PlaylistRef], None]):
+    Two selections coexist on purpose. Clicking a row *highlights* it, which is
+    what drives the existing single-playlist actions. The checkboxes are a
+    separate, additive selection used for queueing several at once -- ticking a
+    folder ticks everything in it. Neither disturbs the other.
+    """
+
+    def __init__(
+        self,
+        parent,
+        on_select: Callable[[PlaylistRef], None],
+        on_check: Optional[Callable[[], None]] = None,
+    ):
         self.on_select = on_select
+        self.on_check = on_check or (lambda: None)
         self.selected: Optional[PlaylistRef] = None
         self.playlists: List[PlaylistRef] = []
+        self.root: Optional[FolderRef] = None
+
+        self._checked: Dict[str, PlaylistRef] = {}
+        self._rows: Dict[str, Any] = {}
+        self._vars: Dict[str, Any] = {}
+        self._folder_vars: List[tuple] = []
 
         self.frame = customtkinter.CTkScrollableFrame(
             parent, fg_color=SURFACE, border_color=BORDER, border_width=1
@@ -239,48 +277,168 @@ class PlaylistList:
     def pack(self, **kwargs):
         self.frame.pack(**kwargs)
 
-    def set_message(self, text: str, color: str = GRAY_TEXT) -> None:
+    # -- state --------------------------------------------------------------
+    @property
+    def checked(self) -> List[PlaylistRef]:
+        """Ticked playlists, in the order they are shown."""
+        order = {p.id: i for i, p in enumerate(self.playlists)}
+        return sorted(self._checked.values(), key=lambda p: order.get(p.id, 0))
+
+    @property
+    def has_folders(self) -> bool:
+        return bool(self.root and self.root.folders)
+
+    def _clear(self) -> None:
         for child in self.frame.winfo_children():
             child.destroy()
+        self._rows.clear()
+        self._vars.clear()
+        self._folder_vars.clear()
+        self._checked.clear()
+
+    def _sync_folder_boxes(self) -> None:
+        """A folder reads as ticked exactly when everything in it is."""
+        for folder, var in self._folder_vars:
+            playlists = folder.all_playlists()
+            try:
+                var.set(bool(playlists) and all(p.id in self._checked for p in playlists))
+            except Exception:
+                pass  # widget already gone
+
+    def set_message(self, text: str, color: str = GRAY_TEXT) -> None:
+        self._clear()
+        self.playlists = []
+        self.root = None
         customtkinter.CTkLabel(
             self.frame, text=text, text_color=color, justify="center", wraplength=520
         ).pack(pady=30)
 
+    # -- building -----------------------------------------------------------
     def set_playlists(self, playlists: List[PlaylistRef]) -> None:
-        self.playlists = list(playlists)
-        self.selected = None
-        for child in self.frame.winfo_children():
-            child.destroy()
+        """Show a flat list. Kept so callers without folders stay unchanged."""
+        self.set_root(flat_root(playlists))
 
-        if not playlists:
+    def set_root(self, root: FolderRef) -> None:
+        self._clear()
+        self.root = root
+        self.playlists = root.all_playlists()
+        self.selected = None
+
+        if not self.playlists:
             self.set_message("No playlists found.")
             return
 
+        for folder in root.folders:
+            self._build_folder(folder, depth=0)
+        for playlist in root.playlists:
+            self._build_playlist(playlist, depth=0)
+
+        self.on_check()
+
+    def _build_folder(self, folder: FolderRef, depth: int) -> None:
+        header = customtkinter.CTkFrame(self.frame, fg_color="transparent")
+        header.pack(fill="x", padx=(4 + depth * 16, 4), pady=(6, 1))
+
+        var = tkinter.BooleanVar(value=False)
+        customtkinter.CTkCheckBox(
+            header,
+            text="",
+            variable=var,
+            width=18,
+            checkbox_width=17,
+            checkbox_height=17,
+            command=lambda f=folder, v=var: self._toggle_folder(f, v),
+        ).pack(side="left")
+        # Kept so ticking the last playlist inside a folder also ticks the
+        # folder itself, rather than leaving the two disagreeing on screen.
+        self._folder_vars.append((folder, var))
+
+        customtkinter.CTkLabel(
+            header,
+            text=f"📁  {folder.name}",
+            text_color=WHITE_TEXT,
+            anchor="w",
+        ).pack(side="left", padx=(4, 8))
+
+        customtkinter.CTkLabel(
+            header,
+            text=_count_label(folder.total_playlists, "playlist"),
+            text_color=GRAY_TEXT,
+            font=("", 11),
+        ).pack(side="right", padx=8)
+
+        for child in folder.folders:
+            self._build_folder(child, depth + 1)
+        for playlist in folder.playlists:
+            self._build_playlist(playlist, depth + 1)
+
+    def _build_playlist(self, playlist: PlaylistRef, depth: int) -> None:
+        row = customtkinter.CTkFrame(self.frame, fg_color="transparent", corner_radius=4)
+        row.pack(fill="x", padx=(4 + depth * 16, 4), pady=1)
+
+        var = tkinter.BooleanVar(value=playlist.id in self._checked)
+        customtkinter.CTkCheckBox(
+            row,
+            text="",
+            variable=var,
+            width=18,
+            checkbox_width=17,
+            checkbox_height=17,
+            command=lambda p=playlist, v=var: self._toggle_playlist(p, v.get()),
+        ).pack(side="left", padx=(6, 0))
+
+        name = customtkinter.CTkLabel(
+            row, text=playlist.name or playlist.id, text_color=WHITE_TEXT, anchor="w"
+        )
+        name.pack(side="left", padx=8, pady=4, fill="x", expand=True)
+
+        meta = f"{playlist.track_count} tracks" if playlist.track_count else ""
+        if playlist.owner:
+            meta = f"{meta} · {playlist.owner}" if meta else playlist.owner
+        if meta:
+            customtkinter.CTkLabel(
+                row, text=meta, text_color=GRAY_TEXT, font=("", 11)
+            ).pack(side="right", padx=8)
+
+        self._rows[playlist.id] = row
+        self._vars[playlist.id] = var
+
+        for widget in (row, name):
+            widget.bind("<Button-1>", lambda _e, p=playlist, r=row: self._select(p, r))
+
+    # -- checking -----------------------------------------------------------
+    def _apply(self, playlists, checked: bool) -> None:
         for playlist in playlists:
-            row = customtkinter.CTkFrame(self.frame, fg_color="transparent", corner_radius=4)
-            row.pack(fill="x", padx=4, pady=1)
+            if checked:
+                self._checked[playlist.id] = playlist
+            else:
+                self._checked.pop(playlist.id, None)
+            box = self._vars.get(playlist.id)
+            if box is not None:
+                box.set(checked)
 
-            name = customtkinter.CTkLabel(
-                row, text=playlist.name or playlist.id, text_color=WHITE_TEXT, anchor="w"
-            )
-            name.pack(side="left", padx=8, pady=4, fill="x", expand=True)
+    def _toggle_playlist(self, playlist: PlaylistRef, checked: bool) -> None:
+        self._apply([playlist], checked)
+        self._sync_folder_boxes()
+        self.on_check()
 
-            meta = f"{playlist.track_count} tracks" if playlist.track_count else ""
-            if playlist.owner:
-                meta = f"{meta} · {playlist.owner}" if meta else playlist.owner
-            if meta:
-                customtkinter.CTkLabel(
-                    row, text=meta, text_color=GRAY_TEXT, font=("", 11)
-                ).pack(side="right", padx=8)
+    def _toggle_folder(self, folder: FolderRef, var) -> None:
+        """A folder's box drives every playlist under it."""
+        self._apply(folder.all_playlists(), bool(var.get()))
+        self._sync_folder_boxes()
+        self.on_check()
 
-            for widget in (row, name):
-                widget.bind("<Button-1>", lambda _e, p=playlist, r=row: self._select(p, r))
+    def check_all(self, checked: bool = True) -> None:
+        self._apply(self.playlists, checked)
+        self._sync_folder_boxes()
+        self.on_check()
 
+    # -- highlighting -------------------------------------------------------
     def _select(self, playlist: PlaylistRef, row) -> None:
         self.selected = playlist
-        for child in self.frame.winfo_children():
+        for other in self._rows.values():
             try:
-                child.configure(fg_color="transparent")
+                other.configure(fg_color="transparent")
             except Exception:
                 pass
         try:
@@ -320,25 +478,56 @@ class TidalPlaylistTab:
             checkbox_height=18,
         ).pack(side="left", padx=(0, 12))
 
+        self.select_all_button = _button(
+            bar, "Select all", self._toggle_all, width=90, state="disabled"
+        )
+        self.select_all_button.pack(side="left", padx=(0, 6))
+
         self.download_button = _button(
-            bar, "⬇  Add to queue", self.enqueue_selected, width=130, state="disabled"
+            bar, "⬇  Add to queue", self.enqueue_selected, width=140, state="disabled"
         )
         self.download_button.pack(side="left")
 
         self.status_label = customtkinter.CTkLabel(bar, text="", text_color=SECONDARY_TEXT)
         self.status_label.pack(side="right")
 
-        self.list = PlaylistList(self.frame, self._on_select)
+        self.list = PlaylistList(self.frame, self._on_select, on_check=self._on_check)
         self.list.pack(fill="both", expand=True)
         self.list.set_message(
             "Click “Load playlists” to show your TIDAL playlists.\n"
             "Not signed in yet? The Accounts tab does that first."
         )
 
+    # -- selection ----------------------------------------------------------
     def _on_select(self, playlist: PlaylistRef) -> None:
-        self.download_button.configure(state="normal")
-        self.status_label.configure(text=f"Selected: {playlist.name}", text_color=SECONDARY_TEXT)
+        """A row was highlighted. Ticked boxes take precedence over this."""
+        if not self.list.checked:
+            self.download_button.configure(state="normal")
+            self.status_label.configure(
+                text=f"Selected: {playlist.name}", text_color=SECONDARY_TEXT
+            )
 
+    def _on_check(self) -> None:
+        checked = self.list.checked
+        if checked:
+            self.download_button.configure(text=f"⬇  Queue {len(checked)}", state="normal")
+            self.status_label.configure(
+                text=_selection_label(checked), text_color=SECONDARY_TEXT
+            )
+        else:
+            self.download_button.configure(
+                text="⬇  Add to queue",
+                state="normal" if self.list.selected else "disabled",
+            )
+        self.select_all_button.configure(
+            text="Select none" if checked else "Select all",
+            state="normal" if self.list.playlists else "disabled",
+        )
+
+    def _toggle_all(self) -> None:
+        self.list.check_all(not self.list.checked)
+
+    # -- loading ------------------------------------------------------------
     def load(self) -> None:
         self.status_label.configure(text="Loading…", text_color=SECONDARY_TEXT)
         self.list.set_message("Loading your TIDAL playlists…")
@@ -347,17 +536,33 @@ class TidalPlaylistTab:
             self._on_loaded, self._on_error, include_favorites=self.favorites_var.get()
         )
 
-    def _on_loaded(self, playlists: List[PlaylistRef]) -> None:
-        self.list.set_playlists(playlists)
-        self.status_label.configure(
-            text=f"{len(playlists)} playlists", text_color=SECONDARY_TEXT
-        )
+    def _on_loaded(self, root: FolderRef) -> None:
+        self.list.set_root(root)
+        summary = _count_label(root.total_playlists, "playlist")
+        if root.folders:
+            summary = f"{_count_label(len(root.folders), 'folder')} · {summary}"
+        self.status_label.configure(text=summary, text_color=SECONDARY_TEXT)
 
     def _on_error(self, message: str) -> None:
         self.list.set_message(message, color=ERROR)
         self.status_label.configure(text="Failed", text_color=ERROR)
 
+    # -- queueing -----------------------------------------------------------
     def enqueue_selected(self) -> None:
+        """Queue the ticked playlists, or the highlighted one if none are ticked."""
+        checked = self.list.checked
+        if checked:
+            try:
+                items = self.controller.enqueue_many(checked)
+            except Exception as exc:
+                self.status_label.configure(text=str(exc), text_color=ERROR)
+                return
+            self.list.check_all(False)
+            self.status_label.configure(
+                text=f"Queued {len(items)} playlists.", text_color=SUCCESS
+            )
+            return
+
         playlist = self.list.selected
         if playlist is None:
             return
@@ -403,11 +608,12 @@ class SpotifyConvertTab:
         _button(top, "⟳  My playlists", self.load_playlists, width=130).pack(side="left")
 
         # -- playlist list --------------------------------------------------
-        self.list = PlaylistList(self.frame, self._on_select)
+        self.list = PlaylistList(self.frame, self._on_select, on_check=self._on_check)
         self.list.pack(fill="both", expand=True, pady=(0, 8))
         self.list.set_message(
             "Paste a public Spotify playlist link above, or click “My playlists”\n"
             "to list your own playlists and Liked Songs.\n"
+            "Tick several to convert and queue them in one go.\n"
             "Signing in ahead of time is done on the Accounts tab."
         )
 
@@ -433,7 +639,12 @@ class SpotifyConvertTab:
         self.review_button = _button(
             actions, "Review uncertain…", self.open_review, width=150, state="disabled"
         )
-        self.review_button.pack(side="left")
+        self.review_button.pack(side="left", padx=(0, 6))
+
+        self.select_all_button = _button(
+            actions, "Select all", self._toggle_all, width=90, state="disabled"
+        )
+        self.select_all_button.pack(side="left")
 
         customtkinter.CTkLabel(
             actions,
@@ -456,17 +667,47 @@ class SpotifyConvertTab:
         self.list.set_message(message)
         self.status_label.configure(text=message, text_color=SECONDARY_TEXT)
 
-    def _on_playlists(self, playlists: List[PlaylistRef]) -> None:
-        self.list.set_playlists(playlists)
+    def _on_playlists(self, root: FolderRef) -> None:
+        self.list.set_root(root)
         self.status_label.configure(
-            text=f"{len(playlists)} playlists", text_color=SECONDARY_TEXT
+            text=f"{root.total_playlists} playlists", text_color=SECONDARY_TEXT
         )
 
     def _on_select(self, playlist: PlaylistRef) -> None:
+        # With boxes ticked the click is being used to browse, not to start a
+        # conversion the user did not ask for.
+        if self.list.checked:
+            return
         self.status_label.configure(
             text=f"Selected: {playlist.name}", text_color=SECONDARY_TEXT
         )
         self.start_conversion(playlist)
+
+    def _on_check(self) -> None:
+        checked = self.list.checked
+        self.select_all_button.configure(
+            text="Select none" if checked else "Select all",
+            state="normal" if self.list.playlists else "disabled",
+        )
+        if checked:
+            self.queue_button.configure(
+                text=f"⬇  Convert & queue {len(checked)}", state="normal"
+            )
+            self.review_button.configure(state="disabled")
+            self.status_label.configure(
+                text=_selection_label(checked), text_color=SECONDARY_TEXT
+            )
+        else:
+            self.queue_button.configure(
+                text="⬇  Queue matches",
+                state="normal" if self.report else "disabled",
+            )
+            self.review_button.configure(
+                state="normal" if (self.report and self.report.needs_review) else "disabled"
+            )
+
+    def _toggle_all(self) -> None:
+        self.list.check_all(not self.list.checked)
 
     # -- conversion ---------------------------------------------------------
     def convert_from_url(self) -> None:
@@ -509,6 +750,12 @@ class SpotifyConvertTab:
 
     # -- queueing -----------------------------------------------------------
     def queue_confident(self) -> None:
+        """Queue the current report, or convert every ticked playlist in turn."""
+        checked = self.list.checked
+        if checked:
+            self.convert_checked(checked)
+            return
+
         if self.report is None:
             return
         try:
@@ -519,6 +766,43 @@ class SpotifyConvertTab:
         self.status_label.configure(
             text=f"Queued {len(items)} tracks in hi-res.", text_color=SUCCESS
         )
+
+    def convert_checked(self, playlists) -> None:
+        """Convert several playlists back to back, queueing each as it finishes."""
+        self.report = None
+        self.progress.set(0)
+        self.queue_button.configure(state="disabled")
+        self.review_button.configure(state="disabled")
+        self._batch_total = len(playlists)
+        self.status_label.configure(
+            text=f"Converting {self._batch_total} playlists…", text_color=SECONDARY_TEXT
+        )
+        self.controller.convert_many(
+            playlists,
+            self._on_batch_playlist,
+            self._on_progress,
+            self._on_batch_done,
+            self._on_error,
+        )
+
+    def _on_batch_playlist(self, index: int, total: int, playlist) -> None:
+        name = getattr(playlist, "name", "") or getattr(playlist, "id", "")
+        self.progress.set(index / total if total else 0)
+        self.status_label.configure(
+            text=f"[{index + 1}/{total}] {name}", text_color=SECONDARY_TEXT
+        )
+
+    def _on_batch_done(self, reports) -> None:
+        self.progress.set(1)
+        queued = sum(
+            len([r for r in report.results if r.decision == MatchDecision.AUTO_ACCEPT.value])
+            for report in reports
+        )
+        self.status_label.configure(
+            text=f"Queued {queued} tracks from {len(reports)} playlists in hi-res.",
+            text_color=SUCCESS,
+        )
+        self.list.check_all(False)
 
     def open_review(self) -> None:
         if self.report is None:

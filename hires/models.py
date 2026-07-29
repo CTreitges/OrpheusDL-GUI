@@ -326,6 +326,83 @@ class ConversionReport:
 
 
 # ---------------------------------------------------------------------------
+# Playlist folders
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FolderRef:
+    """A folder of playlists, as the services model it.
+
+    Deliberately shallow-ish and simple: a name, the playlists directly inside
+    it, and any sub-folders. Services that have no folder concept produce a
+    single unnamed root, so callers never need to branch on "does this platform
+    have folders" -- they walk the same structure either way.
+    """
+
+    id: str = ""
+    name: str = ""
+    playlists: List["PlaylistRef"] = field(default_factory=list)
+    folders: List["FolderRef"] = field(default_factory=list)
+    platform: str = ""
+
+    @property
+    def is_root(self) -> bool:
+        """A container the user never named -- rendered as a plain list."""
+        return not self.name
+
+    def all_playlists(self) -> List["PlaylistRef"]:
+        """Every playlist in this folder and below it, depth first."""
+        out = list(self.playlists)
+        for child in self.folders:
+            out.extend(child.all_playlists())
+        return out
+
+    @property
+    def total_playlists(self) -> int:
+        return len(self.all_playlists())
+
+    @property
+    def total_tracks(self) -> int:
+        """Sum of the track counts, for the "download this folder" label."""
+        return sum(p.track_count or 0 for p in self.all_playlists())
+
+    def walk(self, depth: int = 0):
+        """Yield ``(folder, depth)`` for this folder and every sub-folder."""
+        yield self, depth
+        for child in self.folders:
+            yield from child.walk(depth + 1)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "platform": self.platform,
+            "playlists": [p.to_dict() for p in self.playlists],
+            "folders": [f.to_dict() for f in self.folders],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FolderRef":
+        data = data or {}
+        return cls(
+            id=str(data.get("id") or ""),
+            name=data.get("name") or "",
+            platform=data.get("platform") or "",
+            playlists=[PlaylistRef.from_dict(p) for p in (data.get("playlists") or [])],
+            folders=[cls.from_dict(f) for f in (data.get("folders") or [])],
+        )
+
+
+def flat_root(playlists: List["PlaylistRef"], platform: str = "") -> FolderRef:
+    """Wrap a plain playlist list as an unnamed root folder.
+
+    What every service falls back to: TIDAL when the folder endpoint is not
+    reachable, Spotify always -- its Web API does not expose folders at all.
+    """
+    return FolderRef(playlists=list(playlists), platform=platform)
+
+
+# ---------------------------------------------------------------------------
 # Accounts
 # ---------------------------------------------------------------------------
 

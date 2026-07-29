@@ -800,6 +800,58 @@ class TestSetupTabsWiring:
         # session stays in guest mode by design.
         assert calls == [True]
 
+    def test_the_real_assembly_reaches_the_folder_aware_path(self, root, tmp_path):
+        """setup_tabs must give the TIDAL tab something that can list folders.
+
+        The tab asks the library for list_folders and silently falls back when
+        it is absent -- so a wiring mistake would degrade to a flat list
+        forever without anything failing.
+        """
+        gui, result = self._build(root, tmp_path, "hifi")
+        tab = result["tabs"]["tidal"]
+
+        seen = {}
+
+        class FolderLibrary:
+            def list_folders(self, include_favorites=True):
+                seen["called"] = include_favorites
+                return FolderRef(
+                    folders=[FolderRef(name="Sets", playlists=[
+                        PlaylistRef(id="a", name="Mine", platform="TIDAL")
+                    ])]
+                )
+
+            def list_playlists(self, include_favorites=True):
+                seen["flat"] = True
+                return []
+
+        tab.controller.library_provider = lambda: FolderLibrary()
+        tab.load()
+        pump_until(root, lambda: tab.list.has_folders)
+
+        assert seen.get("called") is True, "the tab never asked for folders"
+        assert "flat" not in seen, "it fell back to the flat list unnecessarily"
+        assert [f.name for f in tab.list.root.folders] == ["Sets"]
+
+    def test_batch_queueing_through_the_real_assembly_stays_hi_res(self, root, tmp_path):
+        """Same guarantee as the single-playlist path, on the new batch path."""
+        gui, result = self._build(root, tmp_path, "high")
+        tab, queue = result["tabs"]["tidal"], result["queue"]
+
+        playlists = [
+            PlaylistRef(id="a", name="One", platform="TIDAL"),
+            PlaylistRef(id="b", name="Two", platform="TIDAL"),
+        ]
+        tab.list.set_root(FolderRef(folders=[FolderRef(name="Sets", playlists=playlists)]))
+        tab.list.check_all(True)
+        pump(root)
+        tab.enqueue_selected()
+        pump(root, times=5)
+
+        items = queue.list()
+        assert len(items) == 2
+        assert {i.quality for i in items} == {"hifi"}, "batch queueing lost hi-res"
+
     def test_sign_in_is_refused_while_a_download_runs(self, root, tmp_path):
         """Re-authenticating mid-transfer swaps the session out from under it."""
         gui, result = self._build(root, tmp_path, "hifi")
@@ -952,3 +1004,250 @@ class TestAccountsTabStaysResponsive:
         assert pump_until(
             root, lambda: "guest" in tab._cards["TIDAL"]["detail"].cget("text")
         ), "Refresh did not drop the old outcome"
+
+
+# ---------------------------------------------------------------------------
+# Folders and multi-select
+# ---------------------------------------------------------------------------
+
+from hires.models import FolderRef  # noqa: E402
+
+
+def pl(pid, name=None, tracks=0):
+    return PlaylistRef(
+        id=pid,
+        name=name or f"Playlist {pid}",
+        track_count=tracks,
+        url=f"https://tidal.com/browse/playlist/{pid}",
+        platform="TIDAL",
+    )
+
+
+class FoldersLibrary(FakeTidalLibrary):
+    def __init__(self, root):
+        super().__init__(playlists=root.all_playlists())
+        self.root = root
+
+    def list_folders(self, include_favorites=True):
+        return self.root
+
+
+class TestPlaylistListSelection:
+    def _list(self, root, root_widget):
+        self.checks = []
+        widget = PlaylistList(
+            root_widget, lambda _p: None, on_check=lambda: self.checks.append(1)
+        )
+        widget.pack(fill="both", expand=True)
+        widget.set_root(root)
+        pump(root_widget)
+        return widget
+
+    def test_ticking_a_folder_ticks_everything_inside_it(self, root):
+        folder = FolderRef(name="Sets", playlists=[pl("a"), pl("b")])
+        widget = self._list(FolderRef(folders=[folder], playlists=[pl("c")]), root)
+
+        var = tkinter.BooleanVar(value=True)
+        widget._toggle_folder(folder, var)
+        pump(root)
+
+        assert {p.id for p in widget.checked} == {"a", "b"}, "the loose playlist was swept in"
+
+    def test_unticking_a_folder_releases_only_its_own(self, root):
+        first = FolderRef(name="A", playlists=[pl("a")])
+        second = FolderRef(name="B", playlists=[pl("b")])
+        widget = self._list(FolderRef(folders=[first, second]), root)
+
+        widget._toggle_folder(first, tkinter.BooleanVar(value=True))
+        widget._toggle_folder(second, tkinter.BooleanVar(value=True))
+        pump(root)
+        assert len(widget.checked) == 2
+
+        widget._toggle_folder(first, tkinter.BooleanVar(value=False))
+        pump(root)
+        assert {p.id for p in widget.checked} == {"b"}
+
+    def test_check_all_and_none(self, root):
+        widget = self._list(FolderRef(playlists=[pl("a"), pl("b"), pl("c")]), root)
+
+        widget.check_all(True)
+        pump(root)
+        assert len(widget.checked) == 3
+
+        widget.check_all(False)
+        pump(root)
+        assert widget.checked == []
+
+    def test_checked_order_follows_the_display(self, root):
+        widget = self._list(FolderRef(playlists=[pl("a"), pl("b"), pl("c")]), root)
+
+        widget._toggle_playlist(pl("c"), True)
+        widget._toggle_playlist(pl("a"), True)
+        pump(root)
+
+        assert [p.id for p in widget.checked] == ["a", "c"]
+
+    def test_a_flat_root_renders_without_folder_headers(self, root):
+        widget = self._list(FolderRef(playlists=[pl("a"), pl("b")]), root)
+        assert not widget.has_folders
+        assert len(widget.playlists) == 2
+
+    def test_highlighting_and_ticking_are_independent(self, root):
+        """Clicking a row selects it; the boxes are a separate, additive choice."""
+        widget = self._list(FolderRef(playlists=[pl("a"), pl("b")]), root)
+
+        widget._toggle_playlist(pl("a"), True)
+        widget._select(pl("b"), widget._rows["b"])
+        pump(root)
+
+        assert widget.selected.id == "b"
+        assert [p.id for p in widget.checked] == ["a"]
+
+    def test_a_folder_box_ticks_itself_when_its_last_playlist_is_ticked(self, root):
+        """Otherwise the folder and its contents disagree on screen."""
+        folder = FolderRef(name="Sets", playlists=[pl("a"), pl("b")])
+        widget = self._list(FolderRef(folders=[folder]), root)
+        folder_var = widget._folder_vars[0][1]
+
+        widget._toggle_playlist(pl("a"), True)
+        pump(root)
+        assert folder_var.get() is False, "half a folder is not a ticked folder"
+
+        widget._toggle_playlist(pl("b"), True)
+        pump(root)
+        assert folder_var.get() is True
+
+        widget._toggle_playlist(pl("a"), False)
+        pump(root)
+        assert folder_var.get() is False
+
+    def test_reloading_clears_stale_ticks(self, root):
+        widget = self._list(FolderRef(playlists=[pl("a")]), root)
+        widget.check_all(True)
+        pump(root)
+
+        widget.set_root(FolderRef(playlists=[pl("x")]))
+        pump(root)
+
+        assert widget.checked == [], "ticks from the previous library survived a reload"
+
+
+class TestTidalTabBatch:
+    def _tab(self, root, tabview, queue, library, tmp_path):
+        controller = TidalBrowserController(
+            lambda: library,
+            queue,
+            dispatch=UiDispatcher(root),
+            output_provider=lambda: str(tmp_path),
+        )
+        tab = TidalPlaylistTab(tabview.add("TIDAL"), controller)
+        pump(root)
+        return tab
+
+    def test_loading_shows_folders_in_the_status_line(self, root, tabview, queue, tmp_path):
+        library = FoldersLibrary(
+            FolderRef(
+                folders=[
+                    FolderRef(name="Sets", playlists=[pl("a"), pl("b")]),
+                    FolderRef(name="Warm Up", playlists=[pl("c")]),
+                ]
+            )
+        )
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        assert pump_until(root, lambda: "folder" in tab.status_label.cget("text"))
+        assert tab.status_label.cget("text") == "2 folders · 3 playlists"
+
+    def test_a_single_folder_is_not_called_folders(self, root, tabview, queue, tmp_path):
+        library = FoldersLibrary(
+            FolderRef(folders=[FolderRef(name="Sets", playlists=[pl("a")])])
+        )
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        assert pump_until(root, lambda: "folder" in tab.status_label.cget("text"))
+        assert tab.status_label.cget("text") == "1 folder · 1 playlist"
+
+    def test_a_flat_library_says_nothing_about_folders(self, root, tabview, queue, tmp_path):
+        library = FoldersLibrary(FolderRef(playlists=[pl("a"), pl("b")]))
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        assert pump_until(root, lambda: tab.status_label.cget("text") == "2 playlists")
+
+    def test_queueing_ticked_playlists_creates_one_item_each(
+        self, root, tabview, queue, tmp_path
+    ):
+        library = FoldersLibrary(FolderRef(playlists=[pl("a"), pl("b"), pl("c")]))
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        pump_until(root, lambda: len(tab.list.playlists) == 3)
+
+        tab.list.check_all(True)
+        pump(root)
+        assert "Queue 3" in tab.download_button.cget("text")
+
+        tab.enqueue_selected()
+        pump(root, times=5)
+
+        assert len(queue.list()) == 3
+        assert tab.list.checked == [], "ticks must clear once queued"
+
+    def test_without_ticks_it_queues_the_highlighted_one(
+        self, root, tabview, queue, tmp_path
+    ):
+        library = FoldersLibrary(FolderRef(playlists=[pl("a", "Only")]))
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        pump_until(root, lambda: len(tab.list.playlists) == 1)
+
+        tab.list._select(tab.list.playlists[0], tab.list._rows["a"])
+        pump(root)
+        tab.enqueue_selected()
+        pump(root, times=5)
+
+        assert [i.title for i in queue.list()] == ["Only"]
+
+    def test_select_all_button_flips_its_label(self, root, tabview, queue, tmp_path):
+        library = FoldersLibrary(FolderRef(playlists=[pl("a")]))
+        tab = self._tab(root, tabview, queue, library, tmp_path)
+
+        tab.load()
+        pump_until(root, lambda: len(tab.list.playlists) == 1)
+        assert tab.select_all_button.cget("text") == "Select all"
+
+        tab._toggle_all()
+        pump(root)
+        assert tab.select_all_button.cget("text") == "Select none"
+
+        tab._toggle_all()
+        pump(root)
+        assert tab.select_all_button.cget("text") == "Select all"
+
+
+class TestCountLabels:
+    """These strings sit in the status line and get read on every action."""
+
+    def test_singular_and_plural(self):
+        from hires.gui_panel import _count_label
+
+        assert _count_label(1, "playlist") == "1 playlist"
+        assert _count_label(2, "playlist") == "2 playlists"
+        assert _count_label(0, "playlist") == "0 playlists"
+
+    def test_selection_label_includes_tracks_when_known(self):
+        from hires.gui_panel import _selection_label
+
+        assert _selection_label([pl("a", tracks=1)]) == "1 playlist · 1 track"
+        assert (
+            _selection_label([pl("a", tracks=3), pl("b", tracks=4)])
+            == "2 playlists · 7 tracks"
+        )
+
+    def test_selection_label_omits_an_unknown_track_count(self):
+        from hires.gui_panel import _selection_label
+
+        assert _selection_label([pl("a")]) == "1 playlist"

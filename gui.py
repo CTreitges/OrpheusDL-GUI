@@ -8219,6 +8219,40 @@ def deep_merge(dict1, dict2, keys_to_overwrite_if_dicts=None):
             dict1[key] = value2
     return dict1
 
+# Track filename formats that number by *album* position. Inside a playlist
+# drawn from many albums those prefixes duplicate and run out of order
+# ("03. …", "01. …", "03. …"), because OrpheusDL uses one format string for
+# both album and playlist downloads. Only these exact former defaults are
+# migrated -- a format the user typed themselves is left alone.
+LEGACY_NUMBERED_TRACK_FORMATS = frozenset({
+    "{track_number}. {artist} - {name}",
+    "{track_number}. {name}",
+    "{track_number} - {artist} - {name}",
+})
+
+#: What those are replaced with.
+UNNUMBERED_TRACK_FORMAT = "{artist} - {name}"
+
+
+def migrate_track_filename_format(file_settings):
+    """Drop album-position numbering from an existing settings dict.
+
+    Returns True when something changed, so the caller knows to write the file
+    back. Anything that is not one of the known old defaults is untouched --
+    including a user's own format that happens to contain {track_number}.
+    """
+    if not isinstance(file_settings, dict):
+        return False
+    formatting = (file_settings.get("global") or {}).get("formatting")
+    if not isinstance(formatting, dict):
+        return False
+    current = formatting.get("track_filename_format")
+    if current not in LEGACY_NUMBERED_TRACK_FORMATS:
+        return False
+    formatting["track_filename_format"] = UNNUMBERED_TRACK_FORMAT
+    return True
+
+
 def load_settings():
     """Loads settings directly from ./config/settings.json."""
     global current_settings, CONFIG_FILE_PATH, DEFAULT_SETTINGS
@@ -8389,6 +8423,23 @@ def load_settings():
             file_settings = json.load(f)
         if current_settings.get("globals", {}).get("advanced", {}).get("debug_mode", False):
             print("File read successfully.")
+
+        # One-off: existing installs still carry the old numbered default, and
+        # changing the default alone would never reach them.
+        if migrate_track_filename_format(file_settings):
+            try:
+                with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(file_settings, f, indent=4)
+                print(
+                    "|GRAY|[Settings] Track filenames no longer start with the album "
+                    "track number - it duplicates inside playlists. Change it back "
+                    "under Settings > Formatting if you want it.|RESET|"
+                )
+            except (IOError, OSError) as exc:
+                # Not being able to persist it is not worth failing startup for;
+                # the in-memory value below is still the corrected one.
+                print(f"[Settings] Could not save the track filename fix: {exc}")
+
         if "global" in file_settings:
             orpheus_global_from_file = file_settings["global"]
             if "general" in orpheus_global_from_file:

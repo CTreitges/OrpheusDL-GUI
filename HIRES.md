@@ -126,6 +126,34 @@ read through the TIDAL module you already have installed and logged in.
 Requires the TIDAL module installed under `modules/tidal` and a logged-in
 account. Without it the tab explains what is missing instead of failing silently.
 
+### Folders
+
+Playlists appear inside your TIDAL folders where TIDAL will tell us about them.
+
+That is a real caveat: **TIDAL has no public folder API.** Folders live on
+`listen.tidal.com/v2/my-collection/playlists/folders` — the web player's own
+internal endpoint, which is undocumented and may reject the module's TV client
+token outright. So the folder view is treated as a bonus, never as a
+requirement: any failure at all — refused, timed out, unrecognisable response —
+falls back to the flat list you had before, plus nothing worse than losing the
+grouping. The playlists themselves always come from the supported v1 endpoint,
+so no playlist can go missing because of a folder problem.
+
+A playlist that no folder claims stays at the top level, which means a
+partially readable layout still shows everything.
+
+### Downloading more than one at a time
+
+Every row has a checkbox, and so does every folder — ticking a folder ticks
+everything inside it, sub-folders included. **Queue N** then queues each
+playlist as its own item, grouped under the folder name.
+
+Separate items rather than one big one, so a playlist that fails can be retried
+without touching the ones that already worked.
+
+Ticking and clicking are independent: clicking a row still highlights it for
+the single-playlist actions, and with boxes ticked the button acts on the ticks.
+
 ---
 
 ## Spotify → TIDAL
@@ -145,6 +173,23 @@ Two backends, chosen automatically:
 If the Web API is configured it is used first; on any failure the embed backend
 takes over. Paste a link and it just works; click **My playlists** to sign in and
 browse your own.
+
+### Folders: there are none to show
+
+Unlike TIDAL, this is not a limitation being worked around — Spotify's Web API
+[does not expose playlist folders at all][spotify-folders], and never has. The
+only way to read them is to parse the desktop client's local LevelDB cache,
+which needs the desktop app installed, mostly closed (it holds a write lock on
+the live log file), and differs per platform and per install type.
+
+That is not shipped here. The list is flat, and **the checkboxes cover what
+folders would have been used for**: tick several playlists — or hit *Select
+all* — and **Convert & queue N** works through them one after another, queueing
+each playlist's matches as soon as that playlist is done. A long run is
+therefore useful even if a later playlist fails: the earlier downloads have
+already started.
+
+[spotify-folders]: https://developer.spotify.com/documentation/web-api/concepts/playlists
 
 ### Signing in
 
