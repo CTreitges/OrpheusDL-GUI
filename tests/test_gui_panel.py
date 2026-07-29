@@ -12,6 +12,7 @@ Run under Xvfb on a headless box:
 
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -813,3 +814,141 @@ class TestSetupTabsWiring:
 
         assert thread is None
         assert errors and "download" in errors[0].lower()
+
+
+
+# ---------------------------------------------------------------------------
+# Accounts tab widgets
+#
+# The regression these guard: status reads do HTTP (Spotify's /me) and can load
+# the TIDAL module. Running them inline from a click handler froze the window
+# for the length of a round trip, which is what made Refresh feel broken and
+# the Spotify sign-in feel unresponsive. Only a test with a genuinely slow
+# provider and a live event loop can catch that -- a fast fake always passes.
+# ---------------------------------------------------------------------------
+
+from hires.controllers import AccountsController  # noqa: E402
+from hires.gui_panel import AccountsTab  # noqa: E402
+from hires.models import AccountStatus  # noqa: E402
+
+
+def status_of(service, state, **kwargs):
+    return AccountStatus(service=service, state=state, **kwargs)
+
+
+class TestAccountsTabStaysResponsive:
+    def _tab(self, root, tidal_provider, **kwargs):
+        kwargs.setdefault(
+            "spotify_status_provider",
+            lambda: status_of("Spotify", AccountState.SIGNED_OUT),
+        )
+        controller = AccountsController(
+            tidal_status_provider=tidal_provider,
+            dispatch=UiDispatcher(root),
+            **kwargs,
+        )
+        return AccountsTab(root, controller)
+
+    def test_building_the_tab_does_not_wait_for_the_network(self, root):
+        """Measured, not inferred.
+
+        A provider that blocks for 5 s used to block the *constructor* for 5 s,
+        because the first paint read statuses inline. Asserting on end state
+        cannot see that -- the blocked version eventually finishes and passes.
+        Only the clock distinguishes them.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+
+        def slow():
+            entered.set()
+            release.wait(timeout=5)
+            return status_of("TIDAL", AccountState.SIGNED_IN, account="User 7")
+
+        started = time.time()
+        tab = self._tab(root, slow)
+        elapsed = time.time() - started
+
+        try:
+            assert elapsed < 1.0, (
+                f"building the tab blocked for {elapsed:.1f}s -- "
+                "the status read is running on the UI thread"
+            )
+            assert pump_until(root, entered.is_set), "the provider never started"
+
+            # And the loop keeps turning while the read is still in flight.
+            ticks = []
+            root.after(1, lambda: ticks.append(1))
+            assert pump_until(root, lambda: ticks, timeout=2.0), "event loop was blocked"
+            assert tab.controller.is_reading, "the read finished too early to prove anything"
+        finally:
+            release.set()
+
+        assert pump_until(
+            root, lambda: "User 7" in tab._cards["TIDAL"]["state"].cget("text")
+        ), "the finished read never repainted"
+
+    def test_the_button_reports_while_a_read_runs(self, root):
+        release = threading.Event()
+        tab = self._tab(
+            root,
+            lambda: (release.wait(timeout=5), status_of("TIDAL", AccountState.SIGNED_OUT))[1],
+        )
+
+        assert pump_until(root, lambda: tab.refresh_button.cget("state") == "disabled")
+
+        release.set()
+        assert pump_until(
+            root, lambda: tab.refresh_button.cget("state") == "normal"
+        ), "Refresh stayed disabled after the read finished"
+
+    def test_placeholders_are_shown_before_the_first_read_lands(self, root):
+        release = threading.Event()
+        tab = self._tab(
+            root,
+            lambda: (release.wait(timeout=5), status_of("TIDAL", AccountState.SIGNED_IN))[1],
+        )
+        pump(root)
+
+        # Painted immediately, without waiting for the network.
+        assert tab._cards["TIDAL"]["detail"].cget("text") == AccountsController.UNKNOWN_DETAIL
+
+        release.set()
+        pump_until(root, lambda: not tab.controller.is_reading)
+
+    def test_an_error_message_survives_the_refresh_it_triggers(self, root):
+        """_on_error kicks off a re-read; the message must not be wiped by it."""
+        tab = self._tab(
+            root,
+            lambda: status_of("TIDAL", AccountState.SIGNED_OUT),
+            tidal_sign_in=lambda: (_ for _ in ()).throw(RuntimeError("device flow refused")),
+        )
+        pump_until(root, lambda: not tab.controller.is_reading)
+
+        tab.sign_in("TIDAL")
+        assert pump_until(
+            root, lambda: "refused" in tab._cards["TIDAL"]["detail"].cget("text")
+        ), "the error never appeared"
+
+        # Let the refresh it triggered finish, then check the message is still there.
+        pump_until(root, lambda: not tab.controller.is_reading)
+        pump(root, times=5)
+        assert "refused" in tab._cards["TIDAL"]["detail"].cget("text"), (
+            "the refresh overwrote the error the user needed to read"
+        )
+
+    def test_manual_refresh_clears_a_stale_message(self, root):
+        tab = self._tab(
+            root,
+            lambda: status_of("TIDAL", AccountState.SIGNED_OUT, detail="Browsing as guest."),
+            tidal_sign_in=lambda: (_ for _ in ()).throw(RuntimeError("nope")),
+        )
+        pump_until(root, lambda: not tab.controller.is_reading)
+
+        tab.sign_in("TIDAL")
+        pump_until(root, lambda: "nope" in tab._cards["TIDAL"]["detail"].cget("text"))
+
+        tab.manual_refresh()
+        assert pump_until(
+            root, lambda: "guest" in tab._cards["TIDAL"]["detail"].cget("text")
+        ), "Refresh did not drop the old outcome"

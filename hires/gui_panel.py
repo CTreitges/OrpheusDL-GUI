@@ -575,6 +575,9 @@ class AccountsTab:
     def __init__(self, parent, controller: AccountsController):
         self.controller = controller
         self._cards: Dict[str, Dict[str, Any]] = {}
+        # Sign-in outcomes, shown instead of the generic description until the
+        # user asks for a fresh read.
+        self._notes: Dict[str, tuple] = {}
 
         self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
         self.frame.pack(fill="both", expand=True, padx=9, pady=10)
@@ -599,7 +602,8 @@ class AccountsTab:
 
         bar = customtkinter.CTkFrame(self.frame, fg_color="transparent")
         bar.pack(fill="x", pady=(10, 0))
-        _button(bar, "⟳  Refresh", self.refresh, width=100).pack(side="left")
+        self.refresh_button = _button(bar, "⟳  Refresh", self.manual_refresh, width=110)
+        self.refresh_button.pack(side="left")
 
         self.summary_label = customtkinter.CTkLabel(
             bar, text="", text_color=SECONDARY_TEXT, anchor="e"
@@ -650,17 +654,57 @@ class AccountsTab:
         }
 
     # -- rendering ----------------------------------------------------------
+    def manual_refresh(self) -> None:
+        """The Refresh button: drop stale sign-in outcomes, then re-read."""
+        self._notes.clear()
+        self.refresh()
+
     def refresh(self) -> None:
-        """Re-read every service's state. Cheap; safe to call after any change."""
-        try:
-            if not self.frame.winfo_exists():
-                return
-        except Exception:
+        """Re-read every service's state on a worker, then repaint.
+
+        Reading a status does HTTP (Spotify's ``/me``) and can load the TIDAL
+        module, so it must not happen here -- doing it inline froze the window
+        for the length of a round trip and made this button look broken.
+        """
+        if not self._alive():
             return
 
-        for status in self.controller.statuses():
+        self.repaint()  # show what we know while the read runs
+        started = self.controller.refresh(self._on_statuses, self._on_read_failed)
+        if started is not None:
+            self._set_reading(True)
+
+    def repaint(self) -> None:
+        """Draw the last known state. Never touches the network."""
+        if not self._alive():
+            return
+        for status in self.controller.known_statuses():
             self._render(status)
         self.summary_label.configure(text=self.controller.summary())
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.frame.winfo_exists())
+        except Exception:
+            return False
+
+    def _set_reading(self, reading: bool) -> None:
+        try:
+            self.refresh_button.configure(
+                text="Checking…" if reading else "⟳  Refresh",
+                state="disabled" if reading else "normal",
+            )
+        except Exception:
+            pass
+
+    def _on_statuses(self, _statuses) -> None:
+        self._set_reading(False)
+        self.repaint()
+
+    def _on_read_failed(self, message: str) -> None:
+        self._set_reading(False)
+        self.repaint()
+        self.summary_label.configure(text=message)
 
     def _render(self, status) -> None:
         card = self._cards.get(status.service)
@@ -675,10 +719,16 @@ class AccountsTab:
             label = f"{label} as {status.account}"
         card["state"].configure(text=label)
 
-        detail = status.detail
-        if status.hint:
-            detail = f"{detail}  {status.hint}" if detail else status.hint
-        card["detail"].configure(text=detail, text_color=GRAY_TEXT)
+        note = self._notes.get(status.service)
+        if note is not None:
+            # A sign-in outcome outranks the generic description until the user
+            # starts something new.
+            card["detail"].configure(text=note[0], text_color=note[1])
+        else:
+            detail = status.detail
+            if status.hint:
+                detail = f"{detail}  {status.hint}" if detail else status.hint
+            card["detail"].configure(text=detail, text_color=GRAY_TEXT)
 
         busy = self.controller.is_busy(status.service)
         if busy:
@@ -706,27 +756,33 @@ class AccountsTab:
             on_error=lambda message, s=service: self._on_error(s, message),
             on_status=lambda message, s=service: self._on_status(s, message),
         )
-        # A refused click never reaches a callback, so repaint from live state.
+        # A refused click never reaches a callback, so restore the button from
+        # what we already know rather than leaving it stuck on "Waiting…".
         if not self.controller.is_busy(service):
-            self.refresh()
+            self.repaint()
+
+    def _note(self, service: str, message: str, color: str) -> None:
+        """Show a message on a card and keep it there across repaints.
+
+        Without this the refresh triggered by the same event would race in and
+        overwrite the outcome the user needs to read -- an error message that
+        vanishes half a second later is worse than none.
+        """
+        self._notes[service] = (message, color)
+        card = self._cards.get(service)
+        if card is not None:
+            card["detail"].configure(text=message, text_color=color)
 
     def _on_status(self, service: str, message: str) -> None:
-        card = self._cards.get(service)
-        if card is None:
-            return
-        card["detail"].configure(text=message, text_color=SECONDARY_TEXT)
+        self._note(service, message, SECONDARY_TEXT)
 
     def _on_done(self, service: str) -> None:
+        self._note(service, f"Signed in to {service}.", SUCCESS)
         self.refresh()
-        card = self._cards.get(service)
-        if card is not None:
-            card["detail"].configure(text=f"Signed in to {service}.", text_color=SUCCESS)
 
     def _on_error(self, service: str, message: str) -> None:
+        self._note(service, message, ERROR)
         self.refresh()
-        card = self._cards.get(service)
-        if card is not None:
-            card["detail"].configure(text=message, text_color=ERROR)
 
 
 # ---------------------------------------------------------------------------

@@ -8271,7 +8271,13 @@ def load_settings():
                         "discography_format": "{name} {quality}",
                         "album_format": "{artist}/{name}",
                         "playlist_format": "{name}",
-                        "track_filename_format": "{track_number}. {artist} - {name}",
+                        # No {track_number} by default. It reads as the position
+                        # in the download, but it is the track's position on its
+                        # *album* -- so a playlist of 30 tracks from 30 albums
+                        # comes out as "03. …", "01. …", "03. …": duplicated and
+                        # out of order. Anyone who wants numbering can add it
+                        # back under Settings, or turn on Use playlist position.
+                        "track_filename_format": "{artist} - {name}",
                         "single_full_path_format": "{artist} - {name}",
                         "metadata_separator": ";",
                         "filename_separator": "",
@@ -19946,7 +19952,10 @@ if __name__ == "__main__":
                     "prefer_highest_quality_edition": True,
                     "explicit_content": "prefer_explicit",
                 },
-                "formatting": { "discography_format": "{name} {quality}", "album_format": "{artist}/{name}", "playlist_format": "{name}", "track_filename_format": "{track_number}. {artist} - {name}", "single_full_path_format": "{artist} - {name}", "metadata_separator": ";", "filename_separator": "", "split_metadata": True, "enable_zfill": True, "force_album_format": False, "use_playlist_position": False, "use_album_position": False },
+                # track_filename_format carries no {track_number}: see the note
+                # on the defaults above -- it numbers by album position, which
+                # duplicates and misorders inside a playlist.
+                "formatting": { "discography_format": "{name} {quality}", "album_format": "{artist}/{name}", "playlist_format": "{name}", "track_filename_format": "{artist} - {name}", "single_full_path_format": "{artist} - {name}", "metadata_separator": ";", "filename_separator": "", "split_metadata": True, "enable_zfill": True, "force_album_format": False, "use_playlist_position": False, "use_album_position": False },
                 "codecs": {
                     "proprietary_codecs": False,
                     "spatial_codecs": True,

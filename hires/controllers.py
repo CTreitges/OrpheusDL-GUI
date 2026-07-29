@@ -614,13 +614,23 @@ class AccountsController:
     controller only makes that step visible and movable to the front, so the
     first download is not the thing that suddenly opens a browser window.
 
-    Status is *never* cached. Every provider is called on demand, because the
-    TIDAL module may not be loaded yet when the tabs are built and would
-    otherwise be remembered as "unavailable" for the rest of the session.
+    Reading a status hits the network -- Spotify asks ``/me`` for the account
+    name, TIDAL may have to load its module first -- so it happens on a worker
+    thread and the result is pushed back through ``dispatch``. Calling the
+    providers straight from a click handler froze the window for the length of
+    an HTTP round trip, which is what made the Refresh button feel broken.
+
+    The last result is kept only so the tab has something to paint while the
+    next read is in flight; it is never used *instead* of reading. The TIDAL
+    module is usually not loaded when the tabs are built, so a status decided
+    once at startup would say "unavailable" for the rest of the session.
     """
 
     #: Services in the order they are shown.
     SERVICES = ("TIDAL", "Spotify")
+
+    #: What to show before the first read comes back.
+    UNKNOWN_DETAIL = "Checking…"
 
     def __init__(
         self,
@@ -651,32 +661,94 @@ class AccountsController:
         # Guards against a second click while a browser flow is still open.
         self._in_flight: Dict[str, bool] = {}
 
+        # Last known status per service, for painting while a read is running.
+        self._last: Dict[str, AccountStatus] = {}
+        self._reading = False
+
     # -- status -------------------------------------------------------------
     def statuses(self) -> List[AccountStatus]:
-        """Current state of every service. Cheap enough to call on every paint."""
+        """Read every service's state. **Blocking** -- call from a worker.
+
+        Kept public because tests and the sign-in worker use it directly. UI
+        code wants :meth:`refresh` instead.
+        """
         return [self.status_for(service) for service in self.SERVICES]
 
     def status_for(self, service: str) -> AccountStatus:
+        """Read one service's state. **Blocking** -- this can do HTTP."""
         provider = (
             self.tidal_status_provider
             if service == "TIDAL"
             else self.spotify_status_provider
         )
         try:
-            return provider()
+            status = provider()
         except Exception as exc:
             # A broken provider must not blank the whole tab.
-            return AccountStatus(
+            status = AccountStatus(
                 service=service,
                 state=AccountState.UNAVAILABLE,
                 detail=_describe(exc),
             )
+        self._last[service] = status
+        return status
+
+    def known_statuses(self) -> List[AccountStatus]:
+        """What was last read, without touching the network.
+
+        Safe from the UI thread; that is the whole point of it.
+        """
+        return [
+            self._last.get(service) or self._placeholder(service)
+            for service in self.SERVICES
+        ]
+
+    def _placeholder(self, service: str) -> AccountStatus:
+        return AccountStatus(
+            service=service,
+            state=AccountState.UNAVAILABLE,
+            detail=self.UNKNOWN_DETAIL,
+        )
+
+    @property
+    def is_reading(self) -> bool:
+        return self._reading
+
+    def refresh(
+        self,
+        on_done: Callable[[List[AccountStatus]], None],
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> Optional[threading.Thread]:
+        """Re-read every status off the UI thread.
+
+        Returns ``None`` when a read is already running -- the answer would be
+        the same, and two concurrent reads would just race to repaint.
+        """
+        if self._reading:
+            return None
+        self._reading = True
+
+        def work():
+            try:
+                statuses = self.statuses()
+            except Exception as exc:
+                self._reading = False
+                if on_error is not None:
+                    self.dispatch(on_error, _describe(exc))
+                return
+            self._reading = False
+            self.dispatch(on_done, statuses)
+
+        return run_in_background(work, name="hires-accounts-status")
 
     def is_busy(self, service: str) -> bool:
         return bool(self._in_flight.get(service))
 
     def summary(self) -> str:
-        signed_in = [s.service for s in self.statuses() if s.is_signed_in]
+        """One line about what is signed in. Uses the last read, never the network."""
+        if self._reading and not self._last:
+            return self.UNKNOWN_DETAIL
+        signed_in = [s.service for s in self.known_statuses() if s.is_signed_in]
         if not signed_in:
             return "Not signed in to any service."
         return "Signed in: " + ", ".join(signed_in)
@@ -762,17 +834,15 @@ class AccountsController:
         on_error: Callable[[str], None],
         on_status: Optional[Callable[[str], None]],
     ) -> Optional[threading.Thread]:
-        """Reuse the PKCE flow the Spotify tab already owns."""
+        """Reuse the PKCE flow the Spotify tab already owns.
+
+        The "is a client id configured?" check reads settings and can touch the
+        network, so it runs inside the worker rather than in the click handler.
+        Doing it here froze the window before the browser even opened.
+        """
         controller = self.spotify_controller
         if controller is None:
             self.dispatch(on_error, "Spotify is not configured.")
-            return None
-
-        status = self.status_for("Spotify")
-        if status.state is AccountState.NEEDS_SETUP:
-            # Sending the user to a browser that will reject the request is
-            # worse than saying what is missing.
-            self.dispatch(on_error, status.hint or status.detail)
             return None
 
         self._in_flight["Spotify"] = True
@@ -784,7 +854,21 @@ class AccountsController:
         def failed(message: str):
             self._finish("Spotify", on_error, message)
 
-        return controller.sign_in(done, failed, on_status)
+        def work():
+            try:
+                status = self.status_for("Spotify")
+            except Exception as exc:
+                failed(_describe(exc))
+                return
+            if status.state is AccountState.NEEDS_SETUP:
+                # Sending the user to a consent page that can only be rejected
+                # is worse than saying what is missing.
+                failed(status.hint or status.detail)
+                return
+            # sign_in() spawns its own worker; this one has done its job.
+            controller.sign_in(done, failed, on_status)
+
+        return run_in_background(work, name="hires-spotify-signin-precheck")
 
     def _finish(
         self,

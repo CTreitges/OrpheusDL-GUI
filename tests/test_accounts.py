@@ -91,8 +91,85 @@ class TestAccountStatus:
         assert ctrl.status_for("TIDAL").state is AccountState.SIGNED_IN
 
     def test_summary_names_the_signed_in_services(self):
-        assert make_accounts(tidal_status_provider=signed_in()).summary() == "Signed in: TIDAL"
-        assert make_accounts().summary() == "Not signed in to any service."
+        ctrl = make_accounts(tidal_status_provider=signed_in())
+        ctrl.statuses()  # summary reports what was read, it does not read itself
+        assert ctrl.summary() == "Signed in: TIDAL"
+
+        ctrl = make_accounts()
+        ctrl.statuses()
+        assert ctrl.summary() == "Not signed in to any service."
+
+    def test_summary_does_not_hit_the_network(self):
+        """It is painted on every repaint, so it must never call a provider."""
+        calls = []
+
+        def provider():
+            calls.append(True)
+            return account("TIDAL", AccountState.SIGNED_IN)
+
+        ctrl = make_accounts(tidal_status_provider=provider)
+        ctrl.summary()
+        ctrl.summary()
+
+        assert calls == [], "summary() called a status provider"
+
+
+class TestAsyncStatusReads:
+    """Reading a status does HTTP, so it may never run on the UI thread."""
+
+    def test_refresh_reads_on_a_worker_and_reports_back(self):
+        ctrl = make_accounts(tidal_status_provider=signed_in())
+        got = []
+
+        wait(ctrl.refresh(got.append))
+
+        assert len(got) == 1
+        assert [s.service for s in got[0]] == ["TIDAL", "Spotify"]
+        assert ctrl.summary() == "Signed in: TIDAL"
+
+    def test_known_statuses_are_placeholders_until_the_first_read(self):
+        calls = []
+
+        def provider():
+            calls.append(True)
+            return account("TIDAL", AccountState.SIGNED_IN)
+
+        ctrl = make_accounts(tidal_status_provider=provider)
+        before = ctrl.known_statuses()
+
+        assert calls == [], "known_statuses() must not call a provider"
+        assert [s.service for s in before] == ["TIDAL", "Spotify"]
+        assert all(s.detail == ctrl.UNKNOWN_DETAIL for s in before)
+
+        wait(ctrl.refresh(lambda _s: None))
+        assert ctrl.known_statuses()[0].state is AccountState.SIGNED_IN
+
+    def test_a_second_refresh_while_one_runs_is_dropped(self):
+        """Two concurrent reads would just race to repaint the same thing."""
+        release = threading.Event()
+
+        def slow():
+            release.wait(timeout=5)
+            return account("TIDAL", AccountState.SIGNED_IN)
+
+        ctrl = make_accounts(tidal_status_provider=slow)
+        first = ctrl.refresh(lambda _s: None)
+        second = ctrl.refresh(lambda _s: None)
+
+        assert second is None
+        assert ctrl.is_reading
+
+        release.set()
+        wait(first)
+        assert not ctrl.is_reading, "the flag must clear so Refresh works again"
+
+    def test_the_reading_flag_clears_after_a_failure(self):
+        ctrl = make_accounts(tidal_status_provider=raiser(RuntimeError("down")))
+
+        wait(ctrl.refresh(lambda _s: None))
+        assert not ctrl.is_reading
+        # A broken provider still yields a status, so this reports done, not error.
+        assert ctrl.known_statuses()[0].state is AccountState.UNAVAILABLE
 
     def test_needs_setup_is_not_offered_a_sign_in_button(self):
         status = account("Spotify", AccountState.NEEDS_SETUP)
@@ -223,7 +300,11 @@ class TestSpotifySignIn:
         assert [code for code, _verifier in source.web.exchanged] == ["CODE"]
 
     def test_missing_credentials_refuse_before_opening_a_browser(self, queue):
-        """A consent page built from an empty client id can only fail."""
+        """A consent page built from an empty client id can only fail.
+
+        The check itself reads settings, so it runs on the worker -- the click
+        handler must return immediately either way.
+        """
         opened = []
         source = AuthAwareSource(web=FakeWebBackend(client_id=""))
         ctrl = make_accounts(
@@ -237,9 +318,11 @@ class TestSpotifySignIn:
         )
         errors = []
 
-        assert ctrl.sign_in("Spotify", lambda: None, errors.append) is None
+        wait(ctrl.sign_in("Spotify", lambda: None, errors.append))
+
         assert opened == [], "no browser for a sign-in that cannot succeed"
         assert errors == ["Enter it under Settings > Spotify."]
+        assert not ctrl.is_busy("Spotify"), "a refused sign-in must not lock the button"
 
     def test_without_a_controller_it_refuses(self):
         ctrl = make_accounts(spotify_controller=None)
