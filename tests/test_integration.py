@@ -735,15 +735,15 @@ class TestSpotifyStatusProvider:
 # ---------------------------------------------------------------------------
 
 class TestBatchSlotIsNotStolen:
-    def test_stays_off_the_slot_during_the_inter_batch_pause(self, queue):
-        gui = FakeGui(output_path="/out")
+    def test_stays_off_the_slot_during_the_inter_batch_pause(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
         runtime = make_runtime(gui, queue)
         queue.add(QueueItem(url="https://tidal.com/browse/track/1", title="Ours"))
 
         # Mid-batch pause: flag cleared, last URL already popped, restart pending.
         gui.download_process_active = False
         gui.file_download_queue = []
-        gui.current_batch_output_path = "/out"
+        gui.current_batch_output_path = str(tmp_path)
 
         runtime._pump()
 
@@ -751,8 +751,8 @@ class TestBatchSlotIsNotStolen:
         assert queue.list()[0].status == QueueStatus.PENDING.value
         assert queue.list()[0].attempts == 0, "burned an attempt while waiting"
 
-    def test_takes_the_slot_once_the_batch_is_really_done(self, queue):
-        gui = FakeGui(output_path="/out")
+    def test_takes_the_slot_once_the_batch_is_really_done(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
         runtime = make_runtime(gui, queue)
         queue.add(QueueItem(url="https://tidal.com/browse/track/1", title="Ours"))
 
@@ -767,9 +767,9 @@ class TestBatchSlotIsNotStolen:
 # ---------------------------------------------------------------------------
 
 class TestWaitsForTheLibrary:
-    def test_does_not_dispatch_before_orpheus_exists(self, queue):
+    def test_does_not_dispatch_before_orpheus_exists(self, queue, tmp_path):
         """Otherwise every item pops a modal error box and burns its retries."""
-        gui = FakeGui(output_path="/out")
+        gui = FakeGui(output_path=str(tmp_path))
         gui.orpheus_instance = None
         runtime = make_runtime(gui, queue)
         queue.add_many(
@@ -783,8 +783,8 @@ class TestWaitsForTheLibrary:
         assert [i.status for i in queue.list()] == [QueueStatus.PENDING.value] * 3
         assert [i.attempts for i in queue.list()] == [0, 0, 0]
 
-    def test_dispatches_as_soon_as_the_library_is_up(self, queue):
-        gui = FakeGui(output_path="/out")
+    def test_dispatches_as_soon_as_the_library_is_up(self, queue, tmp_path):
+        gui = FakeGui(output_path=str(tmp_path))
         gui.orpheus_instance = None
         runtime = make_runtime(gui, queue)
         queue.add(QueueItem(url="https://tidal.com/browse/track/1"))
