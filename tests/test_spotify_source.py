@@ -1114,6 +1114,45 @@ def test_both_backends_failing_raises_with_both_reasons():
     assert "web api" in message and "embed" in message
 
 
+#: What Spotify's GraphQL API answers for a deleted or private playlist: no
+#: error, no HTTP failure, just a ``playlistV2`` of a different type.
+EMBED_PLAYLIST_NOT_FOUND = {
+    "data": {"playlistV2": {"__typename": "NotFound", "message": "Playlist not found"}}
+}
+
+
+def test_embed_backend_reports_a_deleted_or_private_playlist():
+    backend, _ = embed_backend(
+        {
+            ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+            ss._GRAPHQL_ENDPOINT: FakeResponse(payload=EMBED_PLAYLIST_NOT_FOUND),
+        }
+    )
+    # It used to come back as an empty playlist instead.
+    with pytest.raises(SourceUnavailableError, match="deleted or is private"):
+        backend.get_playlist_tracks(PLAYLIST_ID)
+    with pytest.raises(SourceUnavailableError, match="deleted or is private"):
+        backend.get_playlist(PLAYLIST_ID)
+
+
+def test_source_shows_the_not_found_message_as_is():
+    web, _ = make_backend({}, client_id="", client_secret="")
+    embed, _ = embed_backend(
+        {
+            ss._TOKEN_SEED_URL: FakeResponse(text=EMBED_PAGE),
+            ss._GRAPHQL_ENDPOINT: FakeResponse(payload=EMBED_PLAYLIST_NOT_FOUND),
+        }
+    )
+    source = ss.SpotifySource(web, embed)
+
+    with pytest.raises(SourceUnavailableError) as excinfo:
+        source.get_playlist_tracks(PLAYLIST_ID)
+    # The user sees this text in the status line, so no backend jargon.
+    message = str(excinfo.value)
+    assert "deleted or is private" in message
+    assert "web api" not in message and "embed" not in message
+
+
 def test_source_accepts_playlist_ref_url_and_uri():
     routes = {
         ss.TOKEN_URL: token_response("BQapp"),

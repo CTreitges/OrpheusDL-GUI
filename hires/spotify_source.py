@@ -42,6 +42,7 @@ from urllib.parse import urlencode
 from .models import (
     AuthRequiredError,
     HiresError,
+    PlaylistNotFoundError,
     PlaylistRef,
     SourceUnavailableError,
     TrackRef,
@@ -1164,6 +1165,12 @@ class EmbedBackend:
             playlist = _as_dict(data.get("playlistV2"))
             if not playlist:
                 raise SourceUnavailableError(f"Spotify playlist {playlist_id} not found")
+            # A deleted or private playlist is not an error to GraphQL: it
+            # answers with a "NotFound" object, which used to read as empty.
+            if _text(playlist.get("__typename")) not in ("", "Playlist"):
+                raise PlaylistNotFoundError(
+                    "Spotify playlist not found: it has been deleted or is private."
+                )
             if first is None:
                 first = playlist
 
@@ -1315,6 +1322,8 @@ class SpotifySource:
         if self.embed is not None:
             try:
                 return call(self.embed)
+            except PlaylistNotFoundError:
+                raise  # already says what the user needs to know
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"embed: {exc}")
                 log.warning("Spotify embed %s for %s failed: %s", what, playlist_id, exc)
