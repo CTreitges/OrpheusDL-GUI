@@ -1116,8 +1116,15 @@ def test_both_backends_failing_raises_with_both_reasons():
 
 #: What Spotify's GraphQL API answers for a deleted or private playlist: no
 #: error, no HTTP failure, just a ``playlistV2`` of a different type.
+#: Verbatim shape of a live anonymous request for a non-existent id
+#: (HTTP 200, checked 2026-11-11); only the id differs.
 EMBED_PLAYLIST_NOT_FOUND = {
-    "data": {"playlistV2": {"__typename": "NotFound", "message": "Playlist not found"}}
+    "data": {
+        "playlistV2": {
+            "__typename": "NotFound",
+            "message": f"Object with uri 'spotify:playlist:{PLAYLIST_ID}' not found",
+        }
+    }
 }
 
 
