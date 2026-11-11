@@ -475,3 +475,7 @@ class AuthRequiredError(HiresError):
 
 class SourceUnavailableError(HiresError):
     """Raised when a playlist/track cannot be fetched from a service."""
+
+
+class PlaylistNotFoundError(SourceUnavailableError):
+    """Raised when a playlist is gone or private. Its text is meant for the user."""

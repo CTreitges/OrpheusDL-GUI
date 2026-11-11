@@ -117,6 +117,8 @@ class HiresRuntime:
         self._active_since: float = 0.0
         self._baseline_count: int = 0
         self._baseline_mtime: float = 0.0
+        #: gui.py's ``_active_download_thread`` right after our start.
+        self._active_thread: Any = None
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> bool:
@@ -165,6 +167,9 @@ class HiresRuntime:
     def _pump(self) -> None:
         with self._lock:
             if self._active_id is not None:
+                if self._gui_started_another_download():
+                    self._finish_active()
+                    return
                 if self._gui_is_busy():
                     return
                 if time.time() - self._active_since < DISPATCH_GRACE_SEC:
@@ -207,6 +212,19 @@ class HiresRuntime:
         if bool(getattr(self.gui, "file_download_queue", None)):
             return True
         return getattr(self.gui, "current_batch_output_path", None) is not None
+
+    def _gui_started_another_download(self) -> bool:
+        """True once the GUI runs a download thread that is not ours.
+
+        gui.py refuses a new start while a download is active, so a new thread
+        means our item is over. Without this check a download the user starts
+        between our item's end and our next poll keeps the GUI busy, and its
+        files would later be counted as our item's result (review finding 7).
+        """
+        if self._active_thread is None:
+            return False
+        current = getattr(self.gui, "_active_download_thread", None)
+        return current is not None and current is not self._active_thread
 
     def is_busy(self) -> bool:
         """True while anything is downloading -- the GUI's work or ours.
@@ -251,6 +269,8 @@ class HiresRuntime:
             self.queue.mark_failed(item.id, f"Download could not be started: {exc}")
             return
 
+        self._active_thread = getattr(self.gui, "_active_download_thread", None)
+
         if started is False:
             # GUI refused to start (missing credentials, invalid URL, busy).
             # Record it, then put it back in line if attempts remain -- claim_next
@@ -290,6 +310,7 @@ class HiresRuntime:
         self._active_since = 0.0
         self._baseline_count = 0
         self._baseline_mtime = 0.0
+        self._active_thread = None
 
     def _was_cancelled(self) -> bool:
         stop_event = getattr(self.gui, "stop_event", None)

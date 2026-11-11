@@ -64,6 +64,9 @@ class FakeGui:
         self.calls = []
         self._start_result = start_result
         self._start_raises = start_raises
+        #: gui.py stores the thread of the running download here; every
+        #: started download replaces it with a new thread object.
+        self._active_download_thread = None
 
     def _start_single_download(self, url, path, search_result_data=None):
         self.calls.append((url, path, search_result_data))
@@ -73,7 +76,14 @@ class FakeGui:
         # to True and only clears once it is done.
         if self._start_result is not False:
             self.download_process_active = True
+            self._active_download_thread = object()
         return self._start_result
+
+    def start_user_batch(self, urls, path):
+        """Mimic gui.py's ``start_download_thread`` for a .txt batch."""
+        self.file_download_queue = list(urls[1:])
+        self.current_batch_output_path = path
+        return self._start_single_download(urls[0], path, None)
 
 
 @pytest.fixture
@@ -434,6 +444,85 @@ class TestCompletion:
         runtime._pump()
 
         assert [c[0] for c in gui.calls] == ["u1", "u2"]
+
+
+class TestUserDownloadDuringHiresItem:
+    """Review finding 7: a download the user starts himself must not be
+    credited to the hi-res item that ran just before it.
+
+    The window: the hi-res download ends, the GUI re-enables its Download
+    button, and the user starts something before the runtime's next poll (or,
+    after a quick failure, inside the dispatch grace period). The GUI is busy
+    again, so the runtime used to keep waiting and later measured the folder
+    including the user's files.
+    """
+
+    def test_user_batch_files_do_not_rescue_a_failed_item(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="hires-url"))
+
+        runtime._pump()                       # hi-res item dispatched
+        gui.download_process_active = False   # ... and fails without a file
+        gui.start_user_batch(["user-1", "user-2"], target)
+        runtime._active_since = 0.0           # grace period over
+        runtime._pump()                       # poll while the user batch runs
+        write_audio(target, "user-1.flac")    # user batch writes its files
+        gui.download_process_active = False
+        gui.file_download_queue = []
+        gui.current_batch_output_path = None
+        runtime._pump()
+
+        item = queue.list()[0]
+        assert item.status == QueueStatus.FAILED.value
+        assert "No audio file" in item.error
+
+    def test_user_single_download_does_not_rescue_a_failed_item(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="hires-url"))
+
+        runtime._pump()
+        gui.download_process_active = False
+        gui._start_single_download("user-url", target)
+        runtime._active_since = 0.0
+        runtime._pump()
+        write_audio(target, "user.flac")
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.FAILED.value
+
+    def test_a_successful_item_stays_done_when_the_user_starts_next(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="hires-url"))
+
+        runtime._pump()
+        write_audio(target, "hires.flac")
+        gui.download_process_active = False
+        gui.start_user_batch(["user-1"], target)
+        runtime._active_since = 0.0
+        runtime._pump()
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+
+    def test_the_queue_waits_for_the_user_batch_before_the_next_item(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = FakeGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add_many([QueueItem(url="hires-1"), QueueItem(url="hires-2")])
+
+        runtime._pump()
+        gui.download_process_active = False
+        gui.start_user_batch(["user-1", "user-2"], target)
+        runtime._active_since = 0.0
+        runtime._pump()   # finishes hires-1, must not start hires-2
+        runtime._pump()
+
+        assert [c[0] for c in gui.calls] == ["hires-1", "user-1"]
 
 
 class TestReportResult:
