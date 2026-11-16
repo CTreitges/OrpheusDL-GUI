@@ -232,7 +232,7 @@ the single-playlist actions, and with boxes ticked the button acts on the ticks.
 
 The **Port** tab (it replaced "Spotify → TIDAL") reads a playlist on one
 service and finds every track on another: **From** and **To** take any two of
-Spotify, TIDAL, YouTube and SoundCloud — 12 directions. **⇄** swaps them;
+Spotify, TIDAL, YouTube and SoundCloud — 12 directions. **Swap** swaps them;
 picking the other side's service swaps them too. The matches become one group
 in the queue.
 

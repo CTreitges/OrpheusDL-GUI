@@ -73,7 +73,8 @@ class PortTab:
         self.source_menu.pack(side="left", padx=(0, 6))
         attach_tooltip(self.source_menu, "hires.port.source")
 
-        swap = _button(direction, "⇄", self.swap, width=36)
+        # Text, not "⇄": the UI font has no such glyph and drew "=".
+        self.swap_button = swap = _button(direction, "Swap", self.swap, width=60)
         swap.pack(side="left", padx=(0, 6))
         attach_tooltip(swap, "hires.port.swap")
 

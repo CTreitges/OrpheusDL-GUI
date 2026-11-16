@@ -281,3 +281,11 @@ class TestPortMatrixTab:
         tab._on_progress(500, 500, None)  # the last one always draws
         assert drawn == [1 / 500, 0.5, 1.0]
         assert "500/500" in tab.status_label.cget("text")
+
+    def test_port_matrix_tab_swap_button_says_swap(self, window, tmp_path):
+        """The "⇄" glyph is missing from the UI font and was drawn as "="."""
+        _view, result = assemble(window, tmp_path)
+        tab = result["tabs"]["port"]
+        assert tab.swap_button.cget("text") == "Swap"
+        tab.swap_button.invoke()
+        assert tab.controller.direction == ("TIDAL", "Spotify")
