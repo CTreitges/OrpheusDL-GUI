@@ -22,6 +22,11 @@ permissions:
 
 env:
   ORPHEUS_REPO: https://github.com/bascurtiz/OrpheusDL
+  # Pinned: OrpheusDL ced62b5 (2026-08-17, "gamdl helpers removed") dropped
+  # utils.vendor_bootstrap.insert_gamdl_sys_path, which gui.py imports at
+  # startup. Built against a newer core the app dies before its window opens.
+  # d8f339e is the last commit before that, the core the hires.12 build used.
+  ORPHEUS_REF: d8f339e497b414ed60080fff1cdd63a90f46b285
 
 jobs:
   test:
@@ -77,7 +82,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 "$ORPHEUS_REPO" app
+          git clone "$ORPHEUS_REPO" app
+          git -C app checkout --quiet "$ORPHEUS_REF"
+          # Fail the build, not the user's start: gui.py needs this helper.
+          grep -q "def insert_gamdl_sys_path" app/utils/vendor_bootstrap.py
           # GUI files sit alongside orpheus.py. Use cp rather than rsync:
           # Windows runners have Git Bash but no rsync. Drop the GUI checkout's
           # own .git so it cannot clobber app/.git, and any stray virtualenv --
