@@ -80,6 +80,32 @@ here immediately counts over there.
 Sign-in is refused with a message. Re-authenticating replaces the session the
 running transfer is using.
 
+### SoundCloud and YouTube
+
+Neither has a sign-in flow, so their cards report whether the credential the
+module runs on is there and usable, and their button opens the matching
+settings page instead of a browser.
+
+| Service | Reads | Shows |
+|---------|-------|-------|
+| SoundCloud | `web_access_token` from *Settings → SoundCloud*, checked through the SoundCloud module's own API client with the *current* token | Go+ or not (Go+ = full-length AAC 256 kbit/s), the account name, or "token rejected — probably expired" |
+| YouTube | the `cookies.txt` named under *Settings → YouTube* | whether it exists, holds a YouTube/Google login, when it was exported and when the login expires. Not checked online. |
+
+Secrets never leave `hires/account_providers.py`: the token only goes to the
+module's client, cookie values are dropped while the file is read, and an
+error from the API is replaced by a fixed message because it may quote the
+request.
+
+### Automatic re-checks
+
+A service that is not signed in when the tab opens is often just slow — the
+TIDAL module loads after the window. The tab therefore checks again by
+itself, at most five times, 2, 4, 8, 15 and 30 s apart ("Checking… (n/5)"),
+then stops: "Stopped after 5 checks — press Refresh to check again." Refresh
+cancels a running schedule and starts the count from zero. Everything runs on
+one worker thread (`hires/auto_refresh.py`); the window only hears about it
+through the dispatcher.
+
 ---
 
 ## Queue
@@ -94,6 +120,27 @@ handed to OrpheusDL one at a time.
 | Pause | Stops the *next* item from starting. A running download is not interrupted. |
 | Retries | A failed item can be retried until `max_attempts` (default 3). "Retry failed" re-queues everything retryable at once. |
 | Status | `•` waiting · `▶` running · `✓` done · `✗` failed · `–` cancelled |
+
+### Playlists as groups
+
+The queue is shown per playlist: a header with the name, progress ("12 of 60
+done · running") and two buttons, the tracks below it. Which group an entry
+belongs to is derived from fields every entry already has — `group_id` (one
+playlist run), else `group_label` (a playlist or folder queued as one), else
+the collective group "Single tracks" — so a queue file from an older version
+loads unchanged.
+
+- **⇧ To front** moves the whole playlist ahead of everything else. The track
+  that is downloading is never interrupted: it finishes, then the moved
+  playlist runs, then the interrupted playlist continues with its remaining
+  tracks in their old order.
+- **✕** removes a playlist's entries after asking; a running track of it
+  finishes.
+- Clicking a header folds the playlist away. Long queues show at most 150
+  track lines; a header whose tracks did not fit opens on click.
+- **Clear all…** empties the whole queue after a confirmation (Cancel is the
+  default button). A track the queue is downloading right now is stopped and
+  removed; a download you started by hand is left alone.
 
 The queue does not replace OrpheusDL's download logic — it feeds it. Every
 download still goes through the stock code path, so per-platform rate limits,
@@ -245,6 +292,30 @@ after the playlist.
 
 ---
 
+## Help markers and recommendations
+
+Every setting on *Settings → Global* and on the Spotify, TIDAL, YouTube and
+SoundCloud tabs has a **?** behind its label; hovering it explains the
+setting and recommends a value for DJ use. Buttons of the hi-res tabs carry
+the same kind of text as a tooltip. The texts live in `hires/help_texts.py`;
+`tests/test_help_coverage.py` reads the setting keys out of `gui.py` and fails
+for any setting without one.
+
+Where a bad value costs a block or a file the DJ software rejects, the
+recommendation is also shown next to the field:
+
+| Setting | Recommendation | Basis |
+|---------|----------------|-------|
+| Concurrent downloads | 3–4 for TIDAL and SoundCloud, 1–2 for Spotify and YouTube | streamrip defaults to 6 at once; YouTube's guest limit is about 300 videos/hour; Spotify: rule of thumb |
+| Spotify pause | 30–60 s, never below 15 s | librespot warns of account bans; no published limit (rule of thumb) |
+| YouTube pause | 10–20 s, 5 s minimum | yt-dlp's `-t sleep` preset (10–20 s); yt-dlp wiki limits |
+| TIDAL throttle | on (≈60 requests/min) | streamrip `requests_per_minute = 60`; Tidekeeper: raise the delay on repeated HTTP 429 |
+| Batch throttle | 50 tracks / 300 s for Spotify and YouTube, 200 / 600 s for TIDAL | derived from the hourly limits (rule of thumb) |
+| Quality | lossless (16/44.1 FLAC); hifi only for CDJ-3000/CDJ-2000NXS2-class players | rekordbox FAQ: no Pioneer player above 96 kHz, XDJ-RX3/XDJ-XZ up to 48 kHz |
+| AAC / MP3 / Opus | AAC ≥ 256k, MP3 320k CBR, avoid Opus | Digital DJ Tips; Engine DJ and Traktor format lists (no Opus) |
+
+The recommendations are hints only; no default value was changed.
+
 ## What this does not do
 
 - It does not create a playlist on TIDAL — it downloads the tracks. Nothing is
@@ -274,7 +345,13 @@ free of tkinter and can be tested headlessly:
 | `converter.py` | Playlist → matches → queue items |
 | `quality.py` | Quality tiers and the hi-res override |
 | `controllers.py` | All UI logic, no widgets |
-| `gui_panel.py` | Widgets only |
+| `queue_groups.py` | Which entries form a playlist group, group progress |
+| `auto_refresh.py` | Bounded automatic re-checks of the account states |
+| `account_providers.py` | SoundCloud/YouTube status, service explanations |
+| `help_texts.py` | Help text and recommendation per setting and control |
+| `gui_panel.py` | Widgets only (Accounts, TIDAL, Spotify tabs) |
+| `queue_panel.py` | Widgets of the grouped Queue tab |
+| `help_widget.py`, `dialogs.py`, `ui_style.py` | "?" marker and tooltip, confirmation dialog, palette |
 | `integration.py` | The bridge into `gui.py` |
 
 ```bash
