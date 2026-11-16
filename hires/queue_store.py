@@ -30,6 +30,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .models import QueueItem, QueueStats, QueueStatus
+from .queue_groups import group_key
 
 log = logging.getLogger(__name__)
 
@@ -466,6 +467,51 @@ class QueueStore:
         if moved:
             self._notify()
         return True
+
+    def move_group_to_front(self, key: str) -> int:
+        """Put every item of group ``key`` ahead of everything else.
+
+        Nothing else changes: a running item keeps running (its status is not
+        touched, only its place in line), and all other items keep their
+        relative order. So with playlist A downloading and B moved up, the
+        next claim hands out B, and once B is through, A carries on where it
+        left off. Returns how many items the group has (0 = unknown key).
+        """
+        with self._lock:
+            members = [i for i in self._items if group_key(i) == key]
+            if not members:
+                return 0
+            reordered = members + [i for i in self._items if group_key(i) != key]
+            changed = reordered != self._items
+            if changed:
+                self._items = reordered
+                self._maybe_save_locked()
+        if changed:
+            self._notify()
+        return len(members)
+
+    def remove_group(self, key: str) -> int:
+        """Drop the items of group ``key`` -- except one that is running.
+
+        Removing the running item would not stop its download, it would only
+        make the result land nowhere. It stays and finishes; everything else
+        of the group goes. Returns how many items were removed.
+        """
+        with self._lock:
+            doomed = [
+                i
+                for i in self._items
+                if group_key(i) == key and i.status != QueueStatus.ACTIVE.value
+            ]
+            if doomed:
+                gone = {i.id for i in doomed}
+                self._items = [i for i in self._items if i.id not in gone]
+                for item_id in gone:
+                    self._index.pop(item_id, None)
+                self._maybe_save_locked()
+        if doomed:
+            self._notify()
+        return len(doomed)
 
     def _move_to_locked(self, item: QueueItem, target: int) -> bool:
         """Reposition ``item``; returns True when the order actually changed."""

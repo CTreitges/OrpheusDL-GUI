@@ -32,39 +32,25 @@ from .models import (
 )
 from .quality import HIRES, label_for
 
-# Mirrors the palette in gui.py. Duplicated rather than imported because gui.py
-# is the __main__ module and importing it back would be circular.
-WHITE_TEXT = "#E4E5E6"
-SECONDARY_TEXT = "#A8A8AA"
-GRAY_TEXT = "#8A8C8F"
-SURFACE = "#1D1E1E"
-CONTAINER = "#2B2B2B"
-BORDER = "#565B5E"
-HOVER = "#474747"
-BUTTON_BG = "#35373b"
-PRIMARY_ACTION = "#2D5A88"
-SUCCESS = "#00C851"
-WARNING = "#F2C94C"
-ERROR = "#E53935"
-ROW_HOVER = "#272828"
-
-STATUS_COLORS = {
-    QueueStatus.PENDING.value: SECONDARY_TEXT,
-    QueueStatus.ACTIVE.value: WARNING,
-    QueueStatus.DONE.value: SUCCESS,
-    QueueStatus.FAILED.value: ERROR,
-    QueueStatus.CANCELLED.value: GRAY_TEXT,
-}
-
-#: How many queue rows we are willing to have on screen at once.
-#:
-#: Queueing whole folders puts one item per *track* in the queue, so a handful
-#: of playlists is easily two thousand entries. Building a row for each of them
-#: costs ~14 widgets and takes tens of seconds on the tkinter main thread --
-#: long enough for Windows to declare the app hung and for Tcl to abort. Nobody
-#: scrolls through two thousand rows anyway, so we draw the head of the queue
-#: and tell the user how much is behind it.
-MAX_RENDERED_ROWS = 150
+from .queue_panel import MAX_RENDERED_ROWS, STATUS_COLORS, QueueTab  # noqa: F401  (re-exported)
+from .ui_style import (  # noqa: F401  (re-exported for older imports)
+    BORDER,
+    BUTTON_BG,
+    CONTAINER,
+    ERROR,
+    GRAY_TEXT,
+    HOVER,
+    PRIMARY_ACTION,
+    ROW_HOVER,
+    SECONDARY_TEXT,
+    SUCCESS,
+    SURFACE,
+    WARNING,
+    WHITE_TEXT,
+)
+from .ui_style import button as _button  # noqa: E402
+from .account_providers import SERVICE_INFO, SETTINGS_ONLY_SERVICES
+from .help_widget import attach_tooltip
 
 
 def _count_label(count: int, noun: str) -> str:
@@ -91,262 +77,6 @@ def _distinct_label(label: str, taken) -> str:
     while f"{label}  ·  {suffix}" in taken:
         suffix += 1
     return f"{label}  ·  {suffix}"
-
-
-def _button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):
-    return customtkinter.CTkButton(
-        parent,
-        text=text,
-        command=command,
-        width=width,
-        height=28,
-        fg_color=fg,
-        hover_color=HOVER,
-        **kwargs,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Queue tab
-# ---------------------------------------------------------------------------
-
-class _QueueRowWidgets:
-    """The widgets of one queue line, kept alive so they can be reused.
-
-    Rebuilding rows from scratch on every refresh is what made a large queue
-    freeze the app: ``destroy()`` plus construction of ~14 CTk widgets per item,
-    on the main thread, for every single queue mutation. A row is cheap to
-    *retarget* -- only the texts and colours ever differ -- so we build the
-    widgets once and reconfigure them afterwards.
-    """
-
-    def __init__(self, parent, on_click: Callable[[str], None]):
-        self._on_click = on_click
-        self.item_id: str = ""
-
-        self.container = customtkinter.CTkFrame(parent, corner_radius=4)
-        self.status = customtkinter.CTkLabel(self.container, text="", width=24)
-        self.status.pack(side="left", padx=(6, 2))
-
-        self.text_frame = customtkinter.CTkFrame(self.container, fg_color="transparent")
-        self.text_frame.pack(side="left", fill="x", expand=True, pady=3)
-
-        self.title = customtkinter.CTkLabel(
-            self.text_frame, text="", text_color=WHITE_TEXT, anchor="w"
-        )
-        self.title.pack(fill="x")
-
-        self.detail = customtkinter.CTkLabel(
-            self.text_frame, text="", text_color=GRAY_TEXT, anchor="w", font=("", 11)
-        )
-
-        self.quality = customtkinter.CTkLabel(
-            self.container, text="", text_color=GRAY_TEXT, font=("", 11)
-        )
-
-        for widget in (self.container, self.status, self.text_frame, self.title, self.detail):
-            widget.bind("<Button-1>", self._clicked)
-
-    def _clicked(self, _event=None) -> None:
-        if self.item_id:
-            self._on_click(self.item_id)
-
-    def update(self, row, selected: bool) -> None:
-        """Point this row at ``row``. Only touches what actually changed."""
-        self.item_id = row.id
-        self.container.configure(fg_color=ROW_HOVER if selected else "transparent")
-        self.status.configure(
-            text=row.symbol, text_color=STATUS_COLORS.get(row.status, SECONDARY_TEXT)
-        )
-        self.title.configure(text=row.title)
-
-        detail_text = row.detail
-        if row.error:
-            detail_text = f"{detail_text} · {row.error}" if detail_text else row.error
-        if detail_text:
-            self.detail.configure(
-                text=detail_text, text_color=ERROR if row.error else GRAY_TEXT
-            )
-            if not self.detail.winfo_ismapped():
-                self.detail.pack(fill="x")
-        elif self.detail.winfo_ismapped():
-            self.detail.pack_forget()
-
-        if row.quality:
-            self.quality.configure(text=row.quality)
-            if not self.quality.winfo_ismapped():
-                self.quality.pack(side="right", padx=8)
-        elif self.quality.winfo_ismapped():
-            self.quality.pack_forget()
-
-    def show(self) -> None:
-        if not self.container.winfo_ismapped():
-            self.container.pack(fill="x", padx=4, pady=1)
-
-    def destroy(self) -> None:
-        self.container.destroy()
-
-
-class QueueTab:
-    """Shows the persistent download queue and lets the user reorder it."""
-
-    def __init__(self, parent, controller: QueueController, dispatch: Optional[UiDispatcher] = None):
-        self.controller = controller
-        # Queue mutations arrive from worker threads, and widget.after() is not
-        # thread-safe -- everything has to go through the dispatcher.
-        self.dispatch = dispatch or UiDispatcher(parent.winfo_toplevel())
-        self.selected_id: Optional[str] = None
-        #: Reusable row widgets, one per visible line. Never rebuilt.
-        self._rows: List[_QueueRowWidgets] = []
-        #: Set while a refresh is already on its way to the UI thread. A batch
-        #: of queue mutations otherwise queues one full redraw per item.
-        self._refresh_pending = False
-
-        self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.frame.pack(fill="both", expand=True, padx=9, pady=10)
-
-        # -- toolbar --------------------------------------------------------
-        bar = customtkinter.CTkFrame(self.frame, fg_color="transparent")
-        bar.pack(fill="x", pady=(0, 8))
-
-        self.pause_button = _button(bar, "⏸  Pause", self._toggle_pause, fg=PRIMARY_ACTION)
-        self.pause_button.pack(side="left", padx=(0, 6))
-
-        _button(bar, "↑", self._move_up, width=36).pack(side="left", padx=(0, 3))
-        _button(bar, "↓", self._move_down, width=36).pack(side="left", padx=(0, 6))
-        _button(bar, "Remove", self._remove, width=80).pack(side="left", padx=(0, 6))
-        _button(bar, "Retry failed", self._retry_failed, width=110).pack(side="left", padx=(0, 6))
-        _button(bar, "Clear finished", self._clear_finished, width=120).pack(side="left")
-
-        self.summary_label = customtkinter.CTkLabel(
-            bar, text="", text_color=SECONDARY_TEXT, anchor="e"
-        )
-        self.summary_label.pack(side="right")
-
-        # -- list -----------------------------------------------------------
-        self.list_frame = customtkinter.CTkScrollableFrame(
-            self.frame, fg_color=SURFACE, border_color=BORDER, border_width=1
-        )
-        self.list_frame.pack(fill="both", expand=True)
-
-        # Both live for the lifetime of the tab and are packed/unpacked rather
-        # than created and destroyed -- see _QueueRowWidgets for why.
-        self.empty_label = customtkinter.CTkLabel(
-            self.list_frame, text="", text_color=GRAY_TEXT, justify="center"
-        )
-        self.overflow_label = customtkinter.CTkLabel(
-            self.list_frame, text="", text_color=SECONDARY_TEXT, justify="center"
-        )
-
-        self._unsubscribe = controller.subscribe(self._on_queue_changed)
-        self.refresh()
-
-    # -- events -------------------------------------------------------------
-    def _on_queue_changed(self) -> None:
-        """Queue mutated, possibly from a worker thread -> hop to the UI thread.
-
-        Queueing a folder fires this once per track. Collapsing everything that
-        arrives before the UI thread gets round to it turns a thousand redraws
-        into one.
-        """
-        if self._refresh_pending:
-            return
-        self._refresh_pending = True
-        self.dispatch(self._refresh_from_queue)
-
-    def _refresh_from_queue(self) -> None:
-        self._refresh_pending = False
-        self.refresh()
-
-    def _toggle_pause(self) -> None:
-        paused = self.controller.toggle_pause()
-        self.pause_button.configure(
-            text="▶  Resume" if paused else "⏸  Pause",
-            fg_color=WARNING if paused else PRIMARY_ACTION,
-        )
-        self.refresh()
-
-    def _move_up(self) -> None:
-        if self.selected_id:
-            self.controller.move_up(self.selected_id)
-
-    def _move_down(self) -> None:
-        if self.selected_id:
-            self.controller.move_down(self.selected_id)
-
-    def _remove(self) -> None:
-        if self.selected_id:
-            self.controller.remove(self.selected_id)
-            self.selected_id = None
-
-    def _retry_failed(self) -> None:
-        self.controller.retry_all_failed()
-
-    def _clear_finished(self) -> None:
-        self.controller.clear_finished()
-
-    def _select(self, item_id: str) -> None:
-        self.selected_id = item_id
-        self.refresh()
-
-    def visible_row_count(self) -> int:
-        """How many queue lines are on screen -- at most ``MAX_RENDERED_ROWS``."""
-        return len(self._rows)
-
-    # -- rendering ----------------------------------------------------------
-    def refresh(self) -> None:
-        try:
-            if not self.frame.winfo_exists():
-                return
-        except Exception:
-            return
-
-        self.summary_label.configure(text=self.controller.summary())
-        visible, hidden = self.controller.display_rows(MAX_RENDERED_ROWS)
-
-        # Grow or shrink the pool, then retarget every row we keep. Rows are
-        # only ever destroyed when the queue actually got shorter.
-        while len(self._rows) < len(visible):
-            self._rows.append(_QueueRowWidgets(self.list_frame, self._select))
-        while len(self._rows) > len(visible):
-            self._rows.pop().destroy()
-
-        for widgets, row in zip(self._rows, visible):
-            widgets.update(row, selected=row.id == self.selected_id)
-            widgets.show()
-
-        self.empty_label.configure(
-            text=""
-            if visible
-            else "Queue is empty.\n\nAdd playlists from the TIDAL or Spotify tab."
-        )
-        self._set_notice(self.empty_label, not visible, pady=30)
-
-        self.overflow_label.configure(
-            text=f"… and {hidden} more, mostly finished. "
-            "Use “Clear finished” to shorten the list."
-            if hidden > 0
-            else ""
-        )
-        self._set_notice(self.overflow_label, hidden > 0, pady=8)
-
-    @staticmethod
-    def _set_notice(label, wanted: bool, *, pady: int) -> None:
-        """Show or hide one of the two standing notice labels.
-
-        Always re-packed rather than left in place: rows added later in the same
-        refresh would otherwise end up *below* the notice.
-        """
-        if label.winfo_ismapped():
-            label.pack_forget()
-        if wanted:
-            label.pack(pady=pady)
-
-    def destroy(self) -> None:
-        try:
-            self._unsubscribe()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -573,29 +303,33 @@ class TidalPlaylistTab:
         bar = customtkinter.CTkFrame(self.frame, fg_color="transparent")
         bar.pack(fill="x", pady=(0, 8))
 
-        _button(bar, "⟳  Load playlists", self.load, width=140, fg=PRIMARY_ACTION).pack(
-            side="left", padx=(0, 6)
-        )
+        load_button = _button(bar, "⟳  Load playlists", self.load, width=140, fg=PRIMARY_ACTION)
+        load_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(load_button, "hires.tidal.load")
 
         self.favorites_var = tkinter.BooleanVar(value=True)
-        customtkinter.CTkCheckBox(
+        favorites = customtkinter.CTkCheckBox(
             bar,
             text="Include favorites",
             variable=self.favorites_var,
             text_color=SECONDARY_TEXT,
             checkbox_width=18,
             checkbox_height=18,
-        ).pack(side="left", padx=(0, 12))
+        )
+        favorites.pack(side="left", padx=(0, 12))
+        attach_tooltip(favorites, "hires.tidal.include_favorites")
 
         self.select_all_button = _button(
             bar, "Select all", self._toggle_all, width=90, state="disabled"
         )
         self.select_all_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(self.select_all_button, "hires.tidal.select_all")
 
         self.download_button = _button(
             bar, "⬇  Add to queue", self.enqueue_selected, width=140, state="disabled"
         )
         self.download_button.pack(side="left")
+        attach_tooltip(self.download_button, "hires.tidal.add_to_queue")
 
         self.status_label = customtkinter.CTkLabel(bar, text="", text_color=SECONDARY_TEXT)
         self.status_label.pack(side="right")
@@ -710,11 +444,14 @@ class SpotifyConvertTab:
             height=30,
         )
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        attach_tooltip(self.url_entry, "hires.spotify.url")
 
-        _button(top, "Convert", self.convert_from_url, width=90, fg=PRIMARY_ACTION).pack(
-            side="left", padx=(0, 6)
-        )
-        _button(top, "⟳  My playlists", self.load_playlists, width=130).pack(side="left")
+        convert_button = _button(top, "Convert", self.convert_from_url, width=90, fg=PRIMARY_ACTION)
+        convert_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(convert_button, "hires.spotify.convert")
+        mine_button = _button(top, "⟳  My playlists", self.load_playlists, width=130)
+        mine_button.pack(side="left")
+        attach_tooltip(mine_button, "hires.spotify.my_playlists")
 
         # -- playlist list --------------------------------------------------
         self.list = PlaylistList(self.frame, self._on_select, on_check=self._on_check)
@@ -744,16 +481,19 @@ class SpotifyConvertTab:
             actions, "⬇  Queue matches", self.queue_confident, width=140, state="disabled"
         )
         self.queue_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(self.queue_button, "hires.spotify.queue_matches")
 
         self.review_button = _button(
             actions, "Review uncertain…", self.open_review, width=150, state="disabled"
         )
         self.review_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(self.review_button, "hires.spotify.review")
 
         self.select_all_button = _button(
             actions, "Select all", self._toggle_all, width=90, state="disabled"
         )
         self.select_all_button.pack(side="left")
+        attach_tooltip(self.select_all_button, "hires.spotify.select_all")
 
         customtkinter.CTkLabel(
             actions,
@@ -965,12 +705,26 @@ class AccountsTab:
     surprises them with a browser window.
     """
 
-    def __init__(self, parent, controller: AccountsController):
+    def __init__(
+        self,
+        parent,
+        controller: AccountsController,
+        open_settings: Optional[Callable[[str], Any]] = None,
+    ):
+        """
+        Args:
+            open_settings: switches the window to Settings > <service>. The
+                button of SoundCloud and YouTube uses it: neither has a sign-in
+                flow, both need something entered in their settings.
+        """
         self.controller = controller
+        self.open_settings = open_settings
         self._cards: Dict[str, Dict[str, Any]] = {}
         # Sign-in outcomes, shown instead of the generic description until the
         # user asks for a fresh read.
         self._notes: Dict[str, tuple] = {}
+        #: Line about the automatic re-checks, shown instead of the summary.
+        self._auto_note = ""
 
         self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
         self.frame.pack(fill="both", expand=True, padx=9, pady=10)
@@ -997,13 +751,16 @@ class AccountsTab:
         bar.pack(fill="x", pady=(10, 0))
         self.refresh_button = _button(bar, "⟳  Refresh", self.manual_refresh, width=110)
         self.refresh_button.pack(side="left")
+        attach_tooltip(self.refresh_button, "hires.accounts.refresh")
 
         self.summary_label = customtkinter.CTkLabel(
             bar, text="", text_color=SECONDARY_TEXT, anchor="e"
         )
         self.summary_label.pack(side="right")
 
-        self.refresh()
+        # The re-check thread must not outlive the tab.
+        self.frame.bind("<Destroy>", self._on_destroy, add="+")
+        self.start_auto_refresh()
 
     # -- construction -------------------------------------------------------
     def _build_card(self, service: str) -> None:
@@ -1025,7 +782,15 @@ class AccountsTab:
         )
         state_label.pack(side="left", fill="x", expand=True)
 
-        button = _button(header, "Sign in", lambda s=service: self.sign_in(s), width=110)
+        settings_only = service in SETTINGS_ONLY_SERVICES
+        if settings_only:
+            button = _button(
+                header, "Open settings", lambda s=service: self.go_to_settings(s), width=110
+            )
+            attach_tooltip(button, "hires.accounts.open_settings")
+        else:
+            button = _button(header, "Sign in", lambda s=service: self.sign_in(s), width=110)
+            attach_tooltip(button, "hires.accounts.sign_in")
         button.pack(side="right")
 
         detail = customtkinter.CTkLabel(
@@ -1037,20 +802,84 @@ class AccountsTab:
             justify="left",
             wraplength=700,
         )
-        detail.pack(fill="x", padx=12, pady=(0, 10))
+        detail.pack(fill="x", padx=12, pady=(0, 2))
+
+        # What the service needs and what it gives -- the part that does not
+        # change with the status, so it is set once.
+        info = customtkinter.CTkLabel(
+            card,
+            text=SERVICE_INFO.get(service, ""),
+            text_color=SECONDARY_TEXT,
+            font=("", 11),
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        )
+        info.pack(fill="x", padx=12, pady=(0, 10))
 
         self._cards[service] = {
             "dot": dot,
             "state": state_label,
             "button": button,
             "detail": detail,
+            "info": info,
+            "settings_only": settings_only,
         }
 
     # -- rendering ----------------------------------------------------------
     def manual_refresh(self) -> None:
-        """The Refresh button: drop stale sign-in outcomes, then re-read."""
+        """The Refresh button: drop stale outcomes, re-read, restart the count."""
         self._notes.clear()
-        self.refresh()
+        self.start_auto_refresh()
+
+    def start_auto_refresh(self) -> None:
+        """Read now and re-check what is not signed in, up to the limit.
+
+        Runs on the controller's worker; this tab only repaints from the
+        callbacks, which the dispatcher delivers on the UI thread.
+        """
+        if not self._alive():
+            return
+        self._auto_note = ""
+        self.repaint()
+        self._set_reading(True)
+        self.controller.start_auto_refresh(
+            self._on_statuses,
+            on_waiting=self._on_auto_waiting,
+            on_checking=self._on_auto_checking,
+            on_finished=self._on_auto_finished,
+        )
+
+    def _on_auto_waiting(self, attempt: int, limit: int, seconds: float) -> None:
+        self._set_reading(False)
+        self._show_auto_note(f"Not everything is signed in — checking again in {seconds:.0f} s ({attempt}/{limit})")
+
+    def _on_auto_checking(self, attempt: int, limit: int) -> None:
+        self._set_reading(True)
+        self._show_auto_note(f"Checking… ({attempt}/{limit})")
+
+    def _on_auto_finished(self, done: bool, rechecks: int) -> None:
+        self._set_reading(False)
+        if done or rechecks == 0:
+            self._show_auto_note("")
+        else:
+            self._show_auto_note(f"Stopped after {rechecks} checks — press Refresh to check again.")
+
+    def _show_auto_note(self, text: str) -> None:
+        self._auto_note = text
+        if self._alive():
+            self.summary_label.configure(text=text or self.controller.summary())
+
+    def go_to_settings(self, service: str) -> None:
+        """SoundCloud/YouTube button: their credential lives in the settings."""
+        opened = bool(self.open_settings and self.open_settings(service))
+        if not opened:
+            self._note(service, f"Open Settings > {service} to enter it.", SECONDARY_TEXT)
+
+    def _on_destroy(self, _event=None) -> None:
+        # Idempotent, so it does not matter which of the frame's inner
+        # widgets reported the destroy.
+        self.controller.stop_auto_refresh()
 
     def refresh(self) -> None:
         """Re-read every service's state on a worker, then repaint.
@@ -1073,7 +902,7 @@ class AccountsTab:
             return
         for status in self.controller.known_statuses():
             self._render(status)
-        self.summary_label.configure(text=self.controller.summary())
+        self.summary_label.configure(text=self._auto_note or self.controller.summary())
 
     def _alive(self) -> bool:
         try:
@@ -1124,7 +953,12 @@ class AccountsTab:
             card["detail"].configure(text=detail, text_color=GRAY_TEXT)
 
         busy = self.controller.is_busy(status.service)
-        if busy:
+        if card.get("settings_only"):
+            # Nothing to sign in to; the settings page is always the way.
+            card["button"].configure(
+                state="disabled" if status.state is AccountState.UNAVAILABLE else "normal"
+            )
+        elif busy:
             card["button"].configure(text="Waiting…", state="disabled")
         elif status.is_signed_in:
             # Re-authenticating is legitimate (expired session, wrong account),
@@ -1316,6 +1150,10 @@ def build_tabs(
     spotify_status_provider: Optional[Callable[[], Any]] = None,
     tidal_sign_in: Optional[Callable[[], Any]] = None,
     busy_provider: Optional[Callable[[], bool]] = None,
+    soundcloud_status_provider: Optional[Callable[[], Any]] = None,
+    youtube_status_provider: Optional[Callable[[], Any]] = None,
+    open_settings: Optional[Callable[[str], Any]] = None,
+    stop_active: Optional[Callable[[], Any]] = None,
 ) -> Dict[str, Any]:
     """Add the hi-res tabs to an existing CTkTabview.
 
@@ -1343,6 +1181,8 @@ def build_tabs(
             AccountsController(
                 tidal_status_provider=tidal_status_provider,
                 spotify_status_provider=spotify_status_provider,
+                soundcloud_status_provider=soundcloud_status_provider,
+                youtube_status_provider=youtube_status_provider,
                 tidal_sign_in=tidal_sign_in,
                 # Shared so a sign-in here is immediately visible over there:
                 # one source object, one set of tokens.
@@ -1350,10 +1190,13 @@ def build_tabs(
                 dispatch=dispatch,
                 busy_provider=busy_provider,
             ),
+            open_settings=open_settings,
         )
 
     tabs["queue"] = QueueTab(
-        tabview.add("Queue"), QueueController(queue), dispatch=dispatch
+        tabview.add("Queue"),
+        QueueController(queue, stop_active=stop_active),
+        dispatch=dispatch,
     )
 
     tabs["tidal"] = TidalPlaylistTab(

@@ -26,6 +26,11 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
+from .account_providers import (
+    make_open_settings,
+    make_soundcloud_status_provider,
+    make_youtube_status_provider,
+)
 from .models import AuthRequiredError, HiresError, QueueItem, QueueStatus
 from .queue_store import QueueStore
 from .quality import HIRES, build_search_result_data
@@ -233,6 +238,27 @@ class HiresRuntime:
         mid-transfer replaces the session the running download is using.
         """
         return self._active_id is not None or self._gui_is_busy()
+
+    def stop_active(self) -> bool:
+        """Stop the download this runtime started, if there is one.
+
+        Used by "Clear all": a cleared queue must not keep downloading the
+        item it just dropped. Goes through gui.py's own ``stop_download`` so
+        the stock cancellation path runs; a download the user started by hand
+        is never touched. Returns True when a stop was requested.
+        """
+        with self._lock:
+            if self._active_id is None:
+                return False
+        stopper = getattr(self.gui, "stop_download", None)
+        if callable(stopper):
+            stopper()
+            return True
+        stop_event = getattr(self.gui, "stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+            return True
+        return False
 
     # -- dispatch / completion ---------------------------------------------
     def _dispatch(self, item: QueueItem) -> None:
@@ -688,6 +714,11 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
             # Signing in mid-download would swap the TIDAL session out from
             # under the running transfer.
             busy_provider=runtime.is_busy,
+            soundcloud_status_provider=make_soundcloud_status_provider(gui),
+            youtube_status_provider=make_youtube_status_provider(gui),
+            open_settings=make_open_settings(gui),
+            # "Clear all" must stop the item the runner is downloading.
+            stop_active=runtime.stop_active,
         )
         runtime.start()
 

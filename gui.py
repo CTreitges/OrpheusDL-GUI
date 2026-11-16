@@ -17096,6 +17096,37 @@ def _update_settings_tab_widgets():
                                 print(f"Error updating credential widget for {platform_name}.{setting_key}: {e_cred}")
     except Exception as e: print(f"Error during Global/Credential settings UI refresh: {e}"); import traceback; traceback.print_exc()
 
+_hires_help_warned = False
+
+
+def _hires_help_call(fn_name, *args, **kwargs):
+    """Call a hires.help_widget helper; a broken hi-res suite never breaks Settings."""
+    global _hires_help_warned
+    try:
+        from hires import help_widget
+        return getattr(help_widget, fn_name)(*args, **kwargs)
+    except Exception as e:
+        if not _hires_help_warned:
+            _hires_help_warned = True
+            print(f"[Hi-Res] Help markers unavailable: {e}")
+        return None
+
+
+def _hires_help(label, key, base_text=""):
+    """Put the "?" help marker behind a settings label (hires/help_texts.py)."""
+    return _hires_help_call("attach_help", label, key, base_text or "")
+
+
+def _hires_help_pack(parent, key, base_text=""):
+    """A "?" packed into a row of checkboxes."""
+    return _hires_help_call("pack_help", parent, key, base_text or "")
+
+
+def _hires_hint(parent, key, row, column=1, **grid_kwargs):
+    """Grid the visible recommendation for key; True when a row was used."""
+    return bool(_hires_help_call("grid_recommendation", parent, key, row, column, **grid_kwargs))
+
+
 def _create_credential_tab_content(platform_name, tab_frame):
     """Creates the labels and entry fields for a given platform's credentials."""
     global settings_vars, current_settings, DEFAULT_SETTINGS
@@ -17199,7 +17230,9 @@ def _create_credential_tab_content(platform_name, tab_frame):
             # Slightly tighter than default platforms — pulls “How to set up” up (matches compact mockup)
             _lib_top = (10, 5)
             _lib_mid = (5, 5)
-            customtkinter.CTkLabel(lib_frame, text=label_mapping["username"]).grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_top)
+            lbl_sp_user = customtkinter.CTkLabel(lib_frame, text=label_mapping["username"])
+            lbl_sp_user.grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_top)
+            _hires_help(lbl_sp_user, "credentials.Spotify.username")
             ent_user = customtkinter.CTkEntry(lib_frame, textvariable=var_username)
             ent_user.grid(row=lr, column=1, sticky="ew", padx=10, pady=_lib_top)
             ent_user.bind("<Button-3>", show_context_menu)
@@ -17217,9 +17250,13 @@ def _create_credential_tab_content(platform_name, tab_frame):
             _sp_pause_tooltip_lib = "Delay in seconds between track downloads."
             CTkToolTip(lbl_lib_pause, message=_sp_pause_tooltip_lib, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
             CTkToolTip(ent_pause, message=_sp_pause_tooltip_lib, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+            _hires_help(lbl_lib_pause, "credentials.Spotify.download_pause_seconds", _sp_pause_tooltip_lib)
+            _hires_hint(lib_frame, "credentials.Spotify.download_pause_seconds", lr, column=2, padx=(5, 5), pady=_lib_mid, wraplength=230)
             lr += 1
 
-            customtkinter.CTkLabel(lib_frame, text=label_mapping["client_id"]).grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_mid)
+            lbl_sp_cid = customtkinter.CTkLabel(lib_frame, text=label_mapping["client_id"])
+            lbl_sp_cid.grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_mid)
+            _hires_help(lbl_sp_cid, "credentials.Spotify.client_id")
             ent_cid = customtkinter.CTkEntry(lib_frame, textvariable=var_client_id)
             ent_cid.grid(row=lr, column=1, sticky="ew", padx=10, pady=_lib_mid)
             ent_cid.bind("<Button-3>", show_context_menu)
@@ -17227,7 +17264,9 @@ def _create_credential_tab_content(platform_name, tab_frame):
             ent_cid.bind("<FocusOut>", lambda e, w=ent_cid: handle_focus_out(w))
             lr += 1
 
-            customtkinter.CTkLabel(lib_frame, text=label_mapping["client_secret"]).grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_mid)
+            lbl_sp_sec = customtkinter.CTkLabel(lib_frame, text=label_mapping["client_secret"])
+            lbl_sp_sec.grid(row=lr, column=0, sticky="w", padx=10, pady=_lib_mid)
+            _hires_help(lbl_sp_sec, "credentials.Spotify.client_secret")
             ent_sec = customtkinter.CTkEntry(lib_frame, textvariable=var_client_secret, show="*")
             ent_sec.grid(row=lr, column=1, sticky="ew", padx=10, pady=_lib_mid)
             ent_sec.bind("<Button-3>", show_context_menu)
@@ -17246,6 +17285,7 @@ def _create_credential_tab_content(platform_name, tab_frame):
             _sp_cookies_tooltip = "Path to cookies.txt in Netscape format (sp_dc). Optional — used for Spotify synced lyrics."
             CTkToolTip(lbl_sp_cookies, message=_sp_cookies_tooltip, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
             CTkToolTip(ent_ck, message=_sp_cookies_tooltip, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+            _hires_help(lbl_sp_cookies, "credentials.Spotify.cookies_path", _sp_cookies_tooltip)
             warn_ck = customtkinter.CTkLabel(cookie_container, text="", text_color=ERROR_COLOR, font=("Segoe UI", 10), anchor="w", height=12)
             warn_ck.grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -17625,6 +17665,8 @@ def _create_credential_tab_content(platform_name, tab_frame):
 
             label = customtkinter.CTkLabel(grid_parent, text=f"{label_text}")
             label.grid(row=i, column=0, sticky="w", padx=10, pady=pady_config)
+            # "?" for the services with hi-res help texts; a no-op for the rest.
+            _hires_help(label, f"credentials.{platform_name}.{key}")
 
             if platform_name == "TIDAL" and key == "enable_mobile":
                 # Create container for horizontal checkboxes
@@ -17635,7 +17677,8 @@ def _create_credential_tab_content(platform_name, tab_frame):
                 # Enable Mobile
                 var_mobile = tkinter.BooleanVar(value=current_value)
                 chk_mobile = customtkinter.CTkCheckBox(container, text="Enable Mobile", variable=var_mobile)
-                chk_mobile.pack(side="left", padx=(0, 18))
+                chk_mobile.pack(side="left", padx=(0, 4))
+                _hires_help_pack(container, "credentials.TIDAL.enable_mobile")
                 CTkToolTip(
                     chk_mobile,
                     message="Use TIDAL mobile client credentials when possible. Can improve compatibility for some Atmos/Hi-Res scenarios.",
@@ -17649,14 +17692,16 @@ def _create_credential_tab_content(platform_name, tab_frame):
                 val_ac4 = current_settings.get("credentials", {}).get(platform_name, {}).get("prefer_ac4", False)
                 var_ac4 = tkinter.BooleanVar(value=val_ac4)
                 chk_ac4 = customtkinter.CTkCheckBox(container, text="Prefer Ac4", variable=var_ac4)
-                chk_ac4.pack(side="left", padx=(0, 18))
+                chk_ac4.pack(side="left", padx=(0, 4))
+                _hires_help_pack(container, "credentials.TIDAL.prefer_ac4")
                 CTkToolTip(chk_ac4, message="Unchecked: E-AC-3 JOC (Dolby Atmos), plays in VLC and Audacity.\nChecked: AC-4, may require a player with AC-4 support.", bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                 
                 # Fix MQA
                 val_mqa = current_settings.get("credentials", {}).get(platform_name, {}).get("fix_mqa", True)
                 var_mqa = tkinter.BooleanVar(value=val_mqa)
                 chk_mqa = customtkinter.CTkCheckBox(container, text="Fix MQA", variable=var_mqa)
-                chk_mqa.pack(side="left", padx=(0, 18))
+                chk_mqa.pack(side="left", padx=(0, 4))
+                _hires_help_pack(container, "credentials.TIDAL.fix_mqa")
                 CTkToolTip(
                     chk_mqa,
                     message="Apply MQA metadata/header fixes after download to improve compatibility with players and tag readers.",
@@ -17671,7 +17716,11 @@ def _create_credential_tab_content(platform_name, tab_frame):
                 chk_throttle = customtkinter.CTkCheckBox(
                     container, text="Throttle (to prevent login issues)", variable=var_throttle
                 )
-                chk_throttle.pack(side="left", padx=(0, 0))
+                chk_throttle.pack(side="left", padx=(0, 4))
+                _hires_help_pack(container, "credentials.TIDAL.throttle", padx=(2, 0))
+                # The three option rows below this one are skipped in this loop,
+                # so the row under the checkboxes is free for the recommendation.
+                _hires_hint(grid_parent, "credentials.TIDAL.throttle", i + 1, column=1, padx=(10, 5))
                 CTkToolTip(
                     chk_throttle,
                     message=(
@@ -17755,7 +17804,8 @@ def _create_credential_tab_content(platform_name, tab_frame):
                 tooltip_dl_mode = "Sequential: Downloads one track at a time with pause between tracks (safer, shows pause messages)\nConcurrent: Downloads multiple tracks at once (faster, higher rate limiting risk)"
                 CTkToolTip(label, message=tooltip_dl_mode, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                 CTkToolTip(radio_frame, message=tooltip_dl_mode, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
-                
+                _hires_hint(grid_parent, "credentials.YouTube.download_mode", i, column=2, padx=(5, 5), pady=pady_config, wraplength=230)
+
                 if platform_name not in settings_vars['credentials']:
                     settings_vars['credentials'][platform_name] = {}
                 settings_vars['credentials'][platform_name]["download_mode"] = var
@@ -17944,6 +17994,7 @@ def _create_credential_tab_content(platform_name, tab_frame):
                     _yt_pause_tip = "Delay in seconds between YouTube track downloads to reduce rate limiting risk."
                     CTkToolTip(label, message=_yt_pause_tip, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                     CTkToolTip(widget, message=_yt_pause_tip, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+                    _hires_hint(grid_parent, "credentials.YouTube.download_pause_seconds", i, column=2, padx=(5, 5), pady=pady_config, wraplength=230)
             
             if platform_name not in settings_vars['credentials']:
                 settings_vars['credentials'][platform_name] = {}
@@ -21150,6 +21201,9 @@ Unnecessary Lossless-to-Lossless""",
                         tooltip_aac_text = tooltip_texts.get(aac_full_key, "")
                         CTkToolTip(aac_label, message=tooltip_aac_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                         CTkToolTip(aac_slider_frame, message=tooltip_aac_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+                        _hires_help(aac_label, aac_full_key, tooltip_aac_text)
+                        if _hires_hint(global_settings_frame, aac_full_key, row + 1, column=1, padx=(8, 5)):
+                            row += 1
                         row += 1
                         flac_label_text = "FLAC Compression Level"
                         flac_full_key = "advanced.conversion_flags.flac.compression_level"
@@ -21180,6 +21234,7 @@ Unnecessary Lossless-to-Lossless""",
                         tooltip_flac_text = tooltip_texts.get(flac_full_key, "")
                         CTkToolTip(flac_label, message=tooltip_flac_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                         CTkToolTip(flac_slider_frame, message=tooltip_flac_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+                        _hires_help(flac_label, flac_full_key, tooltip_flac_text)
                         row += 1
                         mp3_label_text = "MP3 Encoding"
                         mp3_setting_key = "advanced.conversion_flags.mp3.setting"
@@ -21222,6 +21277,9 @@ Unnecessary Lossless-to-Lossless""",
                         tooltip_mp3_text = tooltip_texts.get("advanced.conversion_flags.mp3.setting", "MP3 Encoding Settings:\n128k-320k are Constant Bitrate (CBR).\nVBR -V0 uses qscale:a 0 for highest variable bitrate quality.")
                         CTkToolTip(mp3_label, message=tooltip_mp3_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                         CTkToolTip(mp3_slider_frame, message=tooltip_mp3_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+                        _hires_help(mp3_label, mp3_setting_key, tooltip_mp3_text)
+                        if _hires_hint(global_settings_frame, mp3_setting_key, row + 1, column=1, padx=(8, 5)):
+                            row += 1
                         row += 1
                         
                         opus_label_text = "OPUS Audio Bitrate"
@@ -21257,6 +21315,9 @@ Unnecessary Lossless-to-Lossless""",
                         tooltip_opus_text = tooltip_texts.get(opus_full_key, "")
                         CTkToolTip(opus_label, message=tooltip_opus_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
                         CTkToolTip(opus_slider_frame, message=tooltip_opus_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
+                        _hires_help(opus_label, opus_full_key, tooltip_opus_text)
+                        if _hires_hint(global_settings_frame, opus_full_key, row + 1, column=1, padx=(8, 5)):
+                            row += 1
                         row += 1
                         continue
                     label_widget = customtkinter.CTkLabel(global_settings_frame, text=field.replace("_", " ").title())
@@ -21644,6 +21705,11 @@ Unnecessary Lossless-to-Lossless""",
                          if 'label_widget' in locals() and label_widget:
                               CTkToolTip(label_widget, message=tooltip_text, bg_color=TOOLTIP_MENU_BG, text_color=WHITE_TEXT_COLOR, padx=12, pady=12)
 
+                    # Hi-res "?" with recommendation, plus a visible hint row for
+                    # the settings where a bad value costs a block or a bad file.
+                    _hires_help(label_widget, full_key, tooltip_texts.get(full_key, ""))
+                    if _hires_hint(global_settings_frame, full_key, row + 1, column=1, padx=(8, 5)):
+                        row += 1
                     row += 1
         credential_keys_for_settings_tabs = [pk for pk in installed_platform_keys if pk not in ["Musixmatch", "LRCLIB"]]        
         

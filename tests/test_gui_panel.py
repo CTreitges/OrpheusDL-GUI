@@ -915,7 +915,12 @@ class TestSetupTabsWiring:
         accounts = result["tabs"]["accounts"]
 
         by_service = {s.service: s for s in accounts.controller.statuses()}
-        assert set(by_service) == {"TIDAL", "Spotify"}
+        # The DJ upgrade added SoundCloud and YouTube next to the two sign-in
+        # services; all four must come from setup_tabs' own providers.
+        assert set(by_service) == {"TIDAL", "Spotify", "SoundCloud", "YouTube"}
+        # FakeGui has no SoundCloud token and no YouTube cookie file.
+        assert by_service["SoundCloud"].state is AccountState.SIGNED_OUT
+        assert by_service["YouTube"].state is AccountState.SIGNED_OUT
 
         # FakeGui has no orpheus_instance, so TIDAL cannot be reached at all.
         assert by_service["TIDAL"].state is AccountState.UNAVAILABLE
