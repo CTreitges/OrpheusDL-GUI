@@ -74,6 +74,8 @@ class PlaylistConverter:
         quality: str = HIRES,
         output_root: Optional[str] = None,
         folder_per_playlist: bool = True,
+        source_name: str = "Spotify",
+        target_name: str = "TIDAL",
     ):
         """
         Args:
@@ -84,13 +86,19 @@ class PlaylistConverter:
             quality: tier every queued item is pinned to. Defaults to hi-res.
             output_root: base download folder. When set together with
                 ``folder_per_playlist``, each playlist gets its own subfolder.
+            source_name / target_name: services the Port tab reads from and
+                searches on. The defaults are the original Spotify -> TIDAL
+                conversion, whose queue entries stay exactly as they were.
+                ``quality=None`` leaves the tier to the GUI (non-TIDAL targets).
         """
         self.spotify = spotify
         self.matcher = matcher
         self.queue = queue
-        self.quality = normalize_tier(quality)
+        self.quality = normalize_tier(quality) if quality else None
         self.output_root = output_root
         self.folder_per_playlist = folder_per_playlist
+        self.source_name = source_name
+        self.target_name = target_name
 
     # -- step 1: match ------------------------------------------------------
     def convert(
@@ -109,7 +117,12 @@ class PlaylistConverter:
             raise SourceUnavailableError(f"Playlist '{ref.name or ref.id}' has no readable tracks")
 
         results = self.matcher.match_many(tracks, progress_callback=progress_callback)
-        report = ConversionReport(playlist=ref, results=list(results))
+        report = ConversionReport(
+            playlist=ref,
+            results=list(results),
+            source_service=self.source_name,
+            target_service=self.target_name,
+        )
         report.finished_at = time.time()
         return report
 
@@ -146,7 +159,8 @@ class PlaylistConverter:
         if not accepted:
             return []
 
-        group_id = group_id or f"spotify-{report.playlist.id}-{int(report.started_at)}"
+        prefix = self.source_name.lower()
+        group_id = group_id or f"{prefix}-{report.playlist.id}-{int(report.started_at)}"
         label = report.playlist.name or report.playlist.id
         target = output_path or self.target_folder(report.playlist)
 
@@ -167,25 +181,31 @@ class PlaylistConverter:
         candidate = result.best
         assert candidate is not None  # guarded by caller
         target: TrackRef = candidate.track
+        src, dst = self.source_name.lower(), self.target_name.lower()
+        legacy = (src, dst) == ("spotify", "tidal")
+        source = {
+            "kind": "spotify_convert" if legacy else "port",
+            f"{src}_track_id": result.source.id,
+            f"{src}_title": result.source.display_name,
+            f"{dst}_track_id": target.id,
+            "match_method": candidate.method,
+            "match_score": round(float(candidate.score), 4),
+            "match_reasons": list(candidate.reasons),
+        }
+        if not legacy:
+            source["source_service"] = self.source_name
+            source["target_service"] = self.target_name
         return QueueItem(
             url=target.url,
             title=target.title or result.source.title,
             subtitle=target.artist_string or result.source.artist_string,
-            platform="TIDAL",
+            platform=self.target_name,
             media_kind=MediaKind.TRACK.value,
             output_path=output_path,
             quality=self.quality,
             group_id=group_id,
             group_label=group_label,
-            source={
-                "kind": "spotify_convert",
-                "spotify_track_id": result.source.id,
-                "spotify_title": result.source.display_name,
-                "tidal_track_id": target.id,
-                "match_method": candidate.method,
-                "match_score": round(float(candidate.score), 4),
-                "match_reasons": list(candidate.reasons),
-            },
+            source=source,
         )
 
     def target_folder(self, playlist: PlaylistRef) -> Optional[str]:
@@ -194,7 +214,9 @@ class PlaylistConverter:
             return None
         if not self.folder_per_playlist:
             return self.output_root
-        folder = sanitize_folder_name(playlist.name or playlist.id, fallback="Spotify Playlist")
+        folder = sanitize_folder_name(
+            playlist.name or playlist.id, fallback=f"{self.source_name} Playlist"
+        )
         return os.path.join(self.output_root, folder)
 
     # -- convenience --------------------------------------------------------
@@ -300,12 +322,14 @@ def queue_items_for_tracks(
     group_label: str = "",
     platform: str = "TIDAL",
 ) -> List[QueueItem]:
-    """Build queue items straight from TIDAL tracks.
+    """Build queue items straight from a playlist's own tracks.
 
-    Used by the TIDAL playlist browser, which has no matching step -- the
-    tracks are already on the target service.
+    Used by the Playlists tab, which has no matching step -- the tracks are
+    already on the service they download from. ``quality=None`` leaves the
+    tier to the GUI.
     """
-    tier = normalize_tier(quality)
+    tier = normalize_tier(quality) if quality else None
+    svc = (platform or "").lower()
     return [
         QueueItem(
             url=track.url,
@@ -317,7 +341,7 @@ def queue_items_for_tracks(
             quality=tier,
             group_id=group_id,
             group_label=group_label,
-            source={"kind": "tidal_playlist", "tidal_track_id": track.id},
+            source={"kind": f"{svc}_playlist", f"{svc}_track_id": track.id},
         )
         for track in tracks
         if track.url

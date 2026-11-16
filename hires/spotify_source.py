@@ -44,6 +44,7 @@ from .models import (
     HiresError,
     PlaylistNotFoundError,
     PlaylistRef,
+    RateLimitedError,
     SourceUnavailableError,
     TrackRef,
 )
@@ -101,6 +102,10 @@ TRACK_PAGE_LIMIT = 100
 
 #: Hard stop for pagination loops - a broken ``next`` link must not hang the GUI.
 MAX_PAGES = 500
+
+#: Most results Spotify's search returns per call. Kept at 10: apps in
+#: development mode are capped there.
+SEARCH_LIMIT = 10
 
 _TOKEN_FILE_VERSION = 1
 
@@ -658,7 +663,9 @@ class WebApiBackend:
             if status == 429:
                 attempt += 1
                 if attempt > MAX_RATE_LIMIT_RETRIES:
-                    raise SourceUnavailableError(
+                    # RateLimitedError stops a whole port run instead of
+                    # moving on to the next track's search.
+                    raise RateLimitedError(
                         f"Spotify rate limit not lifted after {MAX_RATE_LIMIT_RETRIES} retries: {url}"
                     )
                 wait = self._retry_after(response)
@@ -926,6 +933,25 @@ class WebApiBackend:
     def get_liked_tracks(self) -> List[TrackRef]:
         raw = self._paginate("/me/tracks", limit=TRACK_PAGE_LIMIT, user_only=True)
         return _tracks_from_items(raw)
+
+    def search_tracks(self, query: str, limit: int = SEARCH_LIMIT) -> List[TrackRef]:
+        """Track search -- what porting a playlist *to* Spotify matches against.
+
+        Works with the app token alone, so no user sign-in is needed. Spotify
+        accepts ``isrc:<code>`` as a query, which :meth:`find_by_isrc` uses.
+        """
+        size = max(1, min(int(limit or SEARCH_LIMIT), SEARCH_LIMIT))
+        data = self._api_get(API_BASE + "/search", {"q": query, "type": "track", "limit": size})
+        items = _as_list(_as_dict(data.get("tracks")).get("items"))
+        return [track for track in (_track_from_api(i) for i in items) if track is not None]
+
+    def find_by_isrc(self, isrc: str) -> List[TrackRef]:
+        code = _text(isrc).upper()
+        if not code:
+            return []
+        hits = self.search_tracks(f"isrc:{code}")
+        # Spotify's search is fuzzy even for isrc: -- keep only exact hits.
+        return [t for t in hits if (t.isrc or "").upper() == code]
 
     def liked_track_count(self) -> int:
         """Total number of Liked Songs. Returns 0 when it cannot be read."""
