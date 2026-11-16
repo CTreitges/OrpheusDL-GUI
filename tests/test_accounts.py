@@ -640,7 +640,11 @@ class TestYouTubeStatus:
     def test_youtube_old_export_gets_a_reexport_hint(self, tmp_path):
         path = str(tmp_path / "c.txt")
         write_cookies(path, [cookie("__Secure-3PSID", _time.time() + 86400 * 365)])
-        later = _time.time() + 86400 * 45
+        # Fixed timestamps: on a CI runner the file's mtime can land a hair
+        # after time.time(), which turned "45 days" into "44 days".
+        exported = 1_790_000_000
+        os.utime(path, (exported, exported))
+        later = exported + 86400 * 45 + 3600
         status = make_youtube_status_provider(
             ProviderGui(tmp_path, cookies_path=path), now=lambda: later
         )()
