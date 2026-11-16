@@ -60,11 +60,21 @@ from hires.queue_store import QueueStore  # noqa: E402
 
 @pytest.fixture
 def root():
-    """A real CTk window, destroyed afterwards."""
-    try:
-        window = customtkinter.CTk()
-    except tkinter.TclError as exc:  # pragma: no cover - display trouble
-        pytest.skip(f"cannot open a window: {exc}")
+    """A real CTk window, destroyed afterwards.
+
+    The Windows venv's Tcl sometimes fails to initialise ("can't find a usable
+    tk.tcl", "invalid command name tcl_findLibrary") and works on the next try;
+    three tries before skipping.
+    """
+    window = None
+    for attempt in range(3):
+        try:
+            window = customtkinter.CTk()
+            break
+        except tkinter.TclError as exc:  # pragma: no cover - display trouble
+            if attempt == 2:
+                pytest.skip(f"cannot open a window: {exc}")
+            time.sleep(0.2)
     window.geometry("1100x700")
     yield window
     try:
