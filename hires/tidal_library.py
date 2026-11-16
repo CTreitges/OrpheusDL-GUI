@@ -150,16 +150,21 @@ def _cover_id(data: Dict[str, Any]) -> Any:
     )
 
 
-TIDAL_RATE_LIMITED = "TIDAL is limiting requests (HTTP 429). Stopped; try again later."
+TIDAL_RATE_LIMITED = "TIDAL is refusing requests (HTTP 429/403). Stopped; try again later."
 
 
 def _is_rate_limited(exc: BaseException) -> bool:
-    """HTTP 429 from TIDAL, however the module wrapped it."""
+    """HTTP 429 -- or 403 -- from a TIDAL catalogue call, however the module wrapped it.
+
+    A 403 counts too: the module renews its session on a 403 and retries, so
+    one that still reaches us is a block, and every further search would only
+    repeat it (review part 2, N1). Stopping is the safe direction.
+    """
     response = getattr(exc, "response", None)
-    if getattr(response, "status_code", None) == 429:
+    if getattr(response, "status_code", None) in (403, 429):
         return True
     text = str(exc).lower()
-    return "429" in text or "too many requests" in text
+    return any(word in text for word in ("429", "too many requests", "403", "forbidden"))
 
 
 def _is_error_payload(data: Dict[str, Any]) -> bool:

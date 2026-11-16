@@ -311,3 +311,14 @@ def test_port_matrix_queueing_builds_no_provider(tmp_path):
     assert items and {i.quality for i in items} == {"hifi"} and {i.platform for i in items} == {"TIDAL"}
     ctrl.apply_review_and_enqueue({}, report=done[0])
     assert calls == before
+
+
+# -- N1 (re-check): a TIDAL 403 on search is a block, not a note ------------------
+
+@pytest.mark.parametrize("message", ["403 Client Error: Forbidden for url: https://x", "HTTP 403 Forbidden"])
+def test_port_matrix_tidal_403_on_search_stops(message):
+    library = TidalLibrary(TidalApi(message))
+    with pytest.raises(RateLimitedError):
+        library.search_tracks("x")
+    with pytest.raises(RateLimitedError):
+        library.find_by_isrc("USQX91300108")
