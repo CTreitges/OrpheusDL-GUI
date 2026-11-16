@@ -28,8 +28,6 @@ if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
 from hires.controllers import (  # noqa: E402
     QueueController,
     ReviewRow,
-    SpotifyImportController,
-    TidalBrowserController,
     UiDispatcher,
 )
 from hires.gui_panel import (  # noqa: E402
@@ -37,10 +35,12 @@ from hires.gui_panel import (  # noqa: E402
     PlaylistList,
     QueueTab,
     ReviewDialog,
-    SpotifyConvertTab,
-    TidalPlaylistTab,
     build_tabs,
 )
+from hires.playlists_controller import PlaylistsController  # noqa: E402
+from hires.playlists_panel import PlaylistsTab  # noqa: E402
+from hires.port_controller import PortController  # noqa: E402
+from hires.port_panel import PortTab  # noqa: E402
 from hires.models import (  # noqa: E402
     AccountState,
     ConversionReport,
@@ -157,6 +157,33 @@ class FakeMatcher:
             for i, r in enumerate(self._results, 1):
                 progress_callback(i, len(self._results), r)
         return list(self._results)
+
+
+def tidal_playlists_tab(parent, queue, library, *, dispatch, output_provider=None):
+    """The Playlists tab with only TIDAL -- what the old TIDAL tab was."""
+    controller = PlaylistsController(
+        {"TIDAL": lambda: library}, queue, dispatch=dispatch, output_provider=output_provider
+    )
+    return PlaylistsTab(parent, controller, service="TIDAL")
+
+
+def spotify_port_tab(parent, queue, source, matcher, *, dispatch):
+    """The Port tab in its default direction -- what the old Spotify tab was."""
+    controller = PortController(
+        {"Spotify": lambda: source, "TIDAL": lambda: object()},
+        queue,
+        spotify_source_provider=lambda: source,
+        dispatch=dispatch,
+        matcher_factory=lambda _target, _name: matcher,
+    )
+    return PortTab(parent, controller)
+
+
+def legacy_providers(library=None, source=None):
+    return {
+        "TIDAL": lambda: library if library is not None else FakeTidalLibrary(),
+        "Spotify": lambda: source if source is not None else FakeSpotifySource(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -469,10 +496,7 @@ class TestPlaylistList:
 
 class TestTidalPlaylistTab:
     def _tab(self, root, queue, library, **kwargs):
-        controller = TidalBrowserController(
-            lambda: library, queue, dispatch=UiDispatcher(root), **kwargs
-        )
-        return TidalPlaylistTab(root, controller)
+        return tidal_playlists_tab(root, queue, library, dispatch=UiDispatcher(root), **kwargs)
 
     def test_builds_with_an_instruction_message(self, root, queue):
         tab = self._tab(root, queue, FakeTidalLibrary())
@@ -566,10 +590,7 @@ def review(sid, tid, alternatives=None):
 
 class TestSpotifyConvertTab:
     def _tab(self, root, queue, source, matcher, **kwargs):
-        controller = SpotifyImportController(
-            lambda: source, lambda: matcher, queue, dispatch=UiDispatcher(root), **kwargs
-        )
-        return SpotifyConvertTab(root, controller)
+        return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root), **kwargs)
 
     def test_builds(self, root, queue):
         tab = self._tab(root, queue, FakeSpotifySource(), FakeMatcher())
@@ -786,15 +807,15 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(),
+            playlist_providers=legacy_providers(),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
         )
         pump(root)
 
-        assert set(tabs) == {"queue", "tidal", "spotify"}
+        assert set(tabs) == {"queue", "playlists", "port"}
         names = tabview._name_list if hasattr(tabview, "_name_list") else []
-        for expected in ("Queue", "TIDAL Playlists", "Spotify → TIDAL"):
+        for expected in ("Queue", "Playlists", "Port"):
             assert expected in names
 
     def test_tabs_can_be_switched(self, root, tabview, queue):
@@ -802,13 +823,13 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(),
+            playlist_providers=legacy_providers(),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
         )
         pump(root)
 
-        for name in ("TIDAL Playlists", "Spotify → TIDAL", "Queue"):
+        for name in ("Playlists", "Port", "Queue"):
             tabview.set(name)
             pump(root)
             assert tabview.get() == name
@@ -820,16 +841,16 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(playlists=[playlist]),
+            playlist_providers=legacy_providers(FakeTidalLibrary(playlists=[playlist])),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
             output_provider=lambda: str(tmp_path),
         )
         pump(root)
 
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
 
         # The queue tab repaints through the dispatcher's timer, so the loop
         # has to actually run -- pumping a fixed number of times races it.
@@ -874,9 +895,9 @@ class TestSetupTabsWiring:
 
         tabs, queue = result["tabs"], result["queue"]
         playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
         pump(root)
 
         assert queue.list(), "nothing was queued"
@@ -888,9 +909,9 @@ class TestSetupTabsWiring:
         tabs, queue, runtime = result["tabs"], result["queue"], result["runtime"]
 
         playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
         pump(root)
 
         runtime._pump()
@@ -901,7 +922,7 @@ class TestSetupTabsWiring:
 
     def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")
-        assert set(result["tabs"]) == {"accounts", "queue", "tidal", "spotify"}
+        assert set(result["tabs"]) == {"accounts", "queue", "playlists", "port"}
         assert result["runtime"] is not None
 
     # -- accounts -----------------------------------------------------------
@@ -962,7 +983,7 @@ class TestSetupTabsWiring:
         """
         _gui, result = self._build(root, tmp_path, "hifi")
         tabs = result["tabs"]
-        assert tabs["accounts"].controller.spotify_controller is tabs["spotify"].controller
+        assert tabs["accounts"].controller.spotify_controller is tabs["port"].controller
 
     def test_tidal_sign_in_reaches_the_module(self, root, tmp_path):
         """The wiring's whole point: the button drives the real module call."""
@@ -1003,7 +1024,7 @@ class TestSetupTabsWiring:
         forever without anything failing.
         """
         gui, result = self._build(root, tmp_path, "hifi")
-        tab = result["tabs"]["tidal"]
+        tab = result["tabs"]["playlists"]
 
         seen = {}
 
@@ -1020,7 +1041,7 @@ class TestSetupTabsWiring:
                 seen["flat"] = True
                 return []
 
-        tab.controller.library_provider = lambda: FolderLibrary()
+        tab.controller.browsers["TIDAL"].library_provider = lambda: FolderLibrary()
         tab.load()
         pump_until(root, lambda: tab.list.has_folders)
 
@@ -1031,7 +1052,7 @@ class TestSetupTabsWiring:
     def test_batch_queueing_through_the_real_assembly_stays_hi_res(self, root, tmp_path):
         """Same guarantee as the single-playlist path, on the new batch path."""
         gui, result = self._build(root, tmp_path, "high")
-        tab, queue = result["tabs"]["tidal"], result["queue"]
+        tab, queue = result["tabs"]["playlists"], result["queue"]
 
         playlists = [
             PlaylistRef(id="a", name="One", platform="TIDAL"),
@@ -1329,13 +1350,13 @@ class TestPlaylistListSelection:
 
 class TestTidalTabBatch:
     def _tab(self, root, tabview, queue, library, tmp_path):
-        controller = TidalBrowserController(
-            lambda: library,
+        tab = tidal_playlists_tab(
+            tabview.add("TIDAL"),
             queue,
+            library,
             dispatch=UiDispatcher(root),
             output_provider=lambda: str(tmp_path),
         )
-        tab = TidalPlaylistTab(tabview.add("TIDAL"), controller)
         pump(root)
         return tab
 

@@ -456,28 +456,6 @@ def _spotify_credentials(gui: Any) -> tuple:
     return (creds.get("client_id") or "").strip(), (creds.get("client_secret") or "").strip()
 
 
-def make_tidal_library_provider(gui: Any) -> Callable[[], Any]:
-    def provider():
-        from .tidal_library import TidalLibrary
-
-        return TidalLibrary.from_orpheus(getattr(gui, "orpheus_instance", None))
-
-    return provider
-
-
-def make_matcher_provider(gui: Any) -> Callable[[], Any]:
-    def provider():
-        from .matcher import TrackMatcher
-        from .tidal_library import TidalLibrary
-
-        library = TidalLibrary.from_orpheus(getattr(gui, "orpheus_instance", None))
-        if library is None:
-            return None
-        return TrackMatcher(library)
-
-    return provider
-
-
 def make_spotify_source_provider(gui: Any) -> Callable[[], Any]:
     def provider():
         from .spotify_source import SpotifySource
@@ -681,10 +659,10 @@ def make_spotify_status_provider(gui: Any) -> Callable[[], Any]:
 
 
 def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> Optional[dict]:
-    """Add the Queue / TIDAL / Spotify tabs and start the queue runner.
+    """Add the Accounts / Queue / Playlists / Port tabs and start the queue runner.
 
     This is the single entry point gui.py calls. Everything is wrapped so a
-    failure here degrades to "the three extra tabs are missing" rather than
+    failure here degrades to "the extra tabs are missing" rather than
     breaking the application.
 
     Returns a dict with ``runtime``, ``queue`` and ``tabs``, or ``None``.
@@ -699,13 +677,15 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
         store = QueueStore(queue_path or default_queue_path(gui))
         runtime = HiresRuntime(gui, store)
 
+        from .provider_registry import make_playlist_providers
+
         tabs = build_tabs(
             tabview,
             queue=store,
             app=getattr(gui, "app", None),
-            tidal_library_provider=make_tidal_library_provider(gui),
+            # Spotify, TIDAL, YouTube, SoundCloud for the Playlists and Port tabs.
+            playlist_providers=make_playlist_providers(gui),
             spotify_source_provider=make_spotify_source_provider(gui),
-            matcher_provider=make_matcher_provider(gui),
             # Deliberately NOT the GUI's global quality: the whole point of
             # this suite is hi-res, and both tabs say so on screen. Reading the
             # global setting here silently downgraded every converted playlist

@@ -629,21 +629,34 @@ class TestInstall:
         assert result is None
 
     def test_providers_are_lazy_and_do_not_raise_at_build_time(self):
+        """Since the Playlists/Port tabs: the four playlist providers (registry)."""
+        from hires.provider_registry import make_playlist_providers
+
         gui = FakeGui()
         # Building a provider must not import or contact anything.
-        assert callable(integration.make_tidal_library_provider(gui))
-        assert callable(integration.make_matcher_provider(gui))
+        factories = make_playlist_providers(gui)
+        assert set(factories) == {"Spotify", "TIDAL", "YouTube", "SoundCloud"}
+        assert all(callable(f) for f in factories.values())
         assert callable(integration.make_spotify_source_provider(gui))
 
-    def test_tidal_provider_returns_none_without_orpheus(self):
-        gui = FakeGui()
-        gui.orpheus_instance = None
-        assert integration.make_tidal_library_provider(gui)() is None
+    def test_tidal_provider_explains_itself_without_orpheus(self):
+        """Was: TIDAL library provider returns None. Now: a provider with a hint (N3)."""
+        from hires.provider_registry import make_tidal_provider
 
-    def test_matcher_provider_returns_none_without_tidal(self):
         gui = FakeGui()
         gui.orpheus_instance = None
-        assert integration.make_matcher_provider(gui)() is None
+        status = make_tidal_provider(gui)().status()
+        assert status.available is False and "TIDAL" in status.hint
+
+    def test_tidal_search_target_refuses_without_tidal(self):
+        """Was: matcher provider returns None. Now: searching TIDAL raises the hint."""
+        from hires.models import HiresError
+        from hires.provider_registry import make_tidal_provider
+
+        gui = FakeGui()
+        gui.orpheus_instance = None
+        with pytest.raises(HiresError, match="TIDAL"):
+            make_tidal_provider(gui)().search_tracks("anything")
 
 
 # ---------------------------------------------------------------------------

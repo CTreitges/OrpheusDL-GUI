@@ -361,7 +361,12 @@ class QueueController:
 # ---------------------------------------------------------------------------
 
 class TidalBrowserController:
-    """Lists the user's TIDAL playlists and queues them for download."""
+    """Lists a service's playlists and queues them for download.
+
+    Written for TIDAL, used by the Playlists tab for every service: ``service``
+    names the platform on queue items and in messages. With the default
+    ``"TIDAL"`` everything behaves exactly as before.
+    """
 
     def __init__(
         self,
@@ -369,17 +374,20 @@ class TidalBrowserController:
         queue,
         *,
         dispatch: Optional[UiDispatcher] = None,
-        quality_provider: Optional[Callable[[], str]] = None,
+        quality_provider: Optional[Callable[[], Optional[str]]] = None,
         output_provider: Optional[Callable[[], Optional[str]]] = None,
         folder_per_playlist: bool = True,
+        service: str = "TIDAL",
     ):
         """
         Args:
             library_provider: returns a ``TidalLibrary`` (or raises). Called
                 lazily so the tab works even if TIDAL is set up after startup.
-            quality_provider: returns the tier to download at. Defaults to hi-res.
+            quality_provider: returns the tier to download at. Defaults to hi-res;
+                ``None`` leaves the tier to the GUI (services other than TIDAL).
             output_provider: returns the base download folder.
         """
+        self.service = service
         self.library_provider = library_provider
         self.queue = queue
         self.dispatch = dispatch or UiDispatcher()
@@ -409,7 +417,8 @@ class TidalBrowserController:
                 library = self.library_provider()
                 if library is None:
                     raise HiresError(
-                        "TIDAL module not available. Install it and log in under Settings > TIDAL."
+                        f"{self.service} module not available. "
+                        f"Install it and log in under Settings > {self.service}."
                     )
                 lister = getattr(library, "list_folders", None)
                 if callable(lister):
@@ -418,7 +427,7 @@ class TidalBrowserController:
                     # A library that predates folders is still perfectly usable.
                     root = flat_root(
                         library.list_playlists(include_favorites=include_favorites),
-                        platform="TIDAL",
+                        platform=self.service,
                     )
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
@@ -439,14 +448,14 @@ class TidalBrowserController:
             try:
                 library = self.library_provider()
                 if library is None:
-                    raise HiresError("TIDAL module not available.")
+                    raise HiresError(f"{self.service} module not available.")
                 tracks = library.get_playlist_tracks(playlist.id)
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
             self.dispatch(on_done, list(tracks))
 
-        return run_in_background(work, name="hires-tidal-tracks")
+        return run_in_background(work, name="hires-playlist-tracks")
 
     # -- queueing -----------------------------------------------------------
     def enqueue_many(
@@ -481,20 +490,30 @@ class TidalBrowserController:
         """
         from .tidal_library import playlist_url
 
+        url = playlist.url
+        if not url and self.service == "TIDAL":
+            url = playlist_url(playlist.id)
+        if not url:
+            raise HiresError(f"{playlist.name or playlist.id} has no link to download from.")
+        svc = self.service.lower()
         item = QueueItem(
-            url=playlist.url or playlist_url(playlist.id),
+            url=url,
             title=playlist.name or playlist.id,
             subtitle=playlist.owner,
-            platform="TIDAL",
+            platform=self.service,
             media_kind="playlist",
             output_path=self.output_provider(),
-            quality=normalize_tier(self.quality_provider()),
+            quality=self._tier(),
             # The folder name when one was queued, so the queue shows what the
             # item belonged to rather than repeating its own title.
             group_label=group_label or playlist.name or playlist.id,
-            source={"kind": "tidal_playlist", "tidal_playlist_id": playlist.id},
+            source={"kind": f"{svc}_playlist", f"{svc}_playlist_id": playlist.id},
         )
         return self.queue.add(item)
+
+    def _tier(self) -> Optional[str]:
+        tier = self.quality_provider()
+        return normalize_tier(tier) if tier else None
 
     def enqueue_tracks(
         self, playlist: PlaylistRef, tracks: Sequence[TrackRef]
@@ -508,15 +527,17 @@ class TidalBrowserController:
         target = base
         if base and self.folder_per_playlist:
             target = os.path.join(
-                base, sanitize_folder_name(playlist.name or playlist.id, fallback="TIDAL Playlist")
+                base,
+                sanitize_folder_name(playlist.name or playlist.id, fallback=f"{self.service} Playlist"),
             )
 
         items = queue_items_for_tracks(
             tracks,
-            quality=normalize_tier(self.quality_provider()),
+            quality=self._tier(),
             output_path=target,
-            group_id=f"tidal-{playlist.id}-{int(time.time())}",
+            group_id=f"{self.service.lower()}-{playlist.id}-{int(time.time())}",
             group_label=playlist.name or playlist.id,
+            platform=self.service,
         )
         return self.queue.add_many(items)
 

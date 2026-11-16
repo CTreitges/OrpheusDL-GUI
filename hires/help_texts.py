@@ -62,7 +62,7 @@ HELP: Dict[str, HelpEntry] = {
             "3–4 for TIDAL and SoundCloud, 1–2 for Spotify and YouTube; 5 or more only for small jobs. "
             "streamrip, another TIDAL downloader, defaults to 6 at once; YouTube allows guests only about "
             "300 videos an hour, and parallel audio from one Spotify account looks unlike a real player "
-            "(rule of thumb, no official limit)."
+            "(rule of thumb, no official limit). New installs start at 3."
         ),
         short="Recommended: 3–4 (TIDAL, SoundCloud), 1–2 (Spotify, YouTube).",
     ),
@@ -255,7 +255,7 @@ HELP: Dict[str, HelpEntry] = {
         recommendation=(
             "10–20 s, the pause yt-dlp's own 'sleep' preset uses; 5 s is the bare minimum. YouTube lets "
             "guests fetch only about 300 videos an hour, and a signed-in account that downloads too much "
-            "can be blocked."
+            "can be blocked. New installs start at 10 s."
         ),
         short="Recommended: 10–20 s; 5 s is the minimum.",
     ),
@@ -306,24 +306,80 @@ HELP: Dict[str, HelpEntry] = {
         text="Opens this service's settings, where its token or cookie file is entered.",
         recommendation="Press Refresh afterwards to see the new status.",
     ),
-    # -- Hi-res tabs: TIDAL playlists ----------------------------------------------
-    "hires.tidal.load": H(text="Loads your TIDAL playlists and favourites.", recommendation="Sign in on the Accounts tab first."),
-    "hires.tidal.include_favorites": H(text="Also lists playlists you saved but do not own.", recommendation="On, to see every playlist you use."),
-    "hires.tidal.select_all": H(text="Ticks or unticks every playlist.", recommendation="Tick folders to queue a whole set in one go."),
-    "hires.tidal.add_to_queue": H(
-        text="Queues the ticked playlists, or the highlighted one.",
+    # -- Hi-res tabs: Playlists ----------------------------------------------------
+    "hires.playlists.service": H(
+        text="The service whose playlists are shown: Spotify, TIDAL, YouTube or SoundCloud.",
+        recommendation="TIDAL downloads in hi-res; the others at the quality set in Settings.",
+    ),
+    "hires.playlists.load": H(
+        text="Lists your own playlists on the chosen service, where its login allows it.",
+        recommendation="Sign in on the Accounts tab first; without a login, paste a link instead.",
+    ),
+    "hires.playlists.include_favorites": H(
+        text="TIDAL only: also lists playlists you saved but do not own.",
+        recommendation="On, to see every playlist you use.",
+    ),
+    "hires.playlists.link": H(
+        text="A playlist link of the chosen service.",
+        recommendation="Public playlists open without any login.",
+    ),
+    "hires.playlists.open_link": H(
+        text="Opens the pasted playlist and shows its tracks.",
+        recommendation="Check the track count against the website before queueing.",
+    ),
+    "hires.playlists.select_all": H(
+        text="Ticks or unticks every playlist.",
+        recommendation="Tick folders to queue a whole set in one go.",
+    ),
+    "hires.playlists.add_to_queue": H(
+        text="Queues the ticked playlists, or the highlighted one, each as a whole.",
         recommendation="Each playlist becomes its own group in the queue.",
     ),
-    # -- Hi-res tabs: Spotify -> TIDAL -----------------------------------------------
-    "hires.spotify.url": H(text="A Spotify playlist link (open.spotify.com/playlist/…).", recommendation="Public links work without signing in."),
-    "hires.spotify.convert": H(text="Finds every track of the linked playlist on TIDAL.", recommendation="Review uncertain matches before queueing."),
-    "hires.spotify.my_playlists": H(text="Lists your own Spotify playlists and Liked Songs.", recommendation="Needs Client ID and Secret under Settings > Spotify."),
-    "hires.spotify.queue_matches": H(
-        text="Queues the confident matches; uncertain ones wait for review.",
-        recommendation="Tick several playlists to convert and queue them one after another.",
+    "hires.playlists.tracks": H(
+        text="Tracks of the highlighted playlist. Click, Shift+click or Ctrl+click to pick some.",
+        recommendation="Pick tracks only when you do not want the whole playlist.",
     ),
-    "hires.spotify.review": H(text="Confirm, swap or skip each uncertain match.", recommendation="Check live versions and remixes here."),
-    "hires.spotify.select_all": H(text="Ticks or unticks every playlist.", recommendation="Untick playlists you already converted."),
+    "hires.playlists.queue_tracks": H(
+        text="Queues only the tracks picked in the list, as one group named after the playlist.",
+        recommendation="Use it for a few tracks of a long playlist.",
+    ),
+    # -- Hi-res tabs: Port --------------------------------------------------------
+    "hires.port.source": H(
+        text="Where the playlist is read from. Nothing is changed there.",
+        recommendation="Spotify gives ISRCs, which make matching near-exact.",
+    ),
+    "hires.port.target": H(
+        text="Where every track is searched and then downloaded from.",
+        recommendation="TIDAL for lossless; YouTube and SoundCloud only for tracks missing elsewhere.",
+    ),
+    "hires.port.swap": H(
+        text="Swaps source and target.",
+        recommendation="Ports never write to an account, so swapping is safe.",
+    ),
+    "hires.port.url": H(
+        text="A playlist link of the source service.",
+        recommendation="Public links work without signing in.",
+    ),
+    "hires.port.convert": H(
+        text="Reads the linked playlist and searches every track on the target.",
+        recommendation="Review uncertain matches before queueing.",
+    ),
+    "hires.port.my_playlists": H(
+        text="Lists your own playlists on the source service.",
+        recommendation="Spotify needs Client ID and Secret; SoundCloud a token; YouTube a cookie file.",
+    ),
+    "hires.port.queue_matches": H(
+        text="Queues the confident matches as one group; uncertain ones wait for review.",
+        recommendation="Tick several playlists to port and queue them one after another.",
+    ),
+    "hires.port.review": H(
+        text="Confirm, swap or skip each uncertain match.",
+        recommendation="Check live versions, remixes and re-uploads here.",
+    ),
+    "hires.port.select_all": H(
+        text="Ticks or unticks every playlist.",
+        recommendation="Untick playlists you already ported.",
+    ),
 }
 
 

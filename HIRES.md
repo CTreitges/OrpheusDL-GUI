@@ -2,10 +2,14 @@
 
 Four additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
 
-1. **Accounts** — sign in to TIDAL and Spotify before you queue anything.
-2. **Download queue** — a persistent, reorderable queue that survives restarts.
-3. **TIDAL playlist browser** — pick your own TIDAL playlists inside the app.
-4. **Spotify → TIDAL** — convert a Spotify playlist and download it in hi-res.
+1. **Accounts** — TIDAL, Spotify, SoundCloud and YouTube: sign in or check the
+   token/cookie file before you queue anything.
+2. **Download queue** — a persistent queue grouped by playlist that survives restarts.
+3. **Playlists** — browse playlists of Spotify, TIDAL, YouTube and SoundCloud
+   and queue them whole or in part.
+4. **Port** — read a playlist on one of the four services, find its tracks on
+   another and queue the matches (12 directions; Spotify → TIDAL in hi-res is
+   the default).
 
 Everything lives in the `hires/` package. The only change to `gui.py` is four
 lines that add the tabs, wrapped in a `try/except` — if anything here breaks,
@@ -67,7 +71,7 @@ who never signed in and their downloads would quietly not be hi-res;
 
 ### Spotify
 
-Runs the same PKCE flow described under *Spotify → TIDAL* below, just started
+Runs the same PKCE flow described under *Port* below, just started
 explicitly. It needs the Client ID and Secret from *Settings → Spotify*; without
 them the tab reports "Setup needed" rather than sending you to a consent page
 that can only be rejected.
@@ -160,20 +164,41 @@ enabled will be marked failed. Retrying such an item is harmless.
 
 ---
 
-## TIDAL playlist browser
+## Playlists
 
-A new **TIDAL Playlists** tab lists your own playlists and your favourites,
-read through the TIDAL module you already have installed and logged in.
+The **Playlists** tab (it replaced "TIDAL Playlists") shows playlists of one
+service at a time — pick **Spotify**, **TIDAL**, **YouTube** or **SoundCloud**
+at the top.
 
-- **Load playlists** — fetches your library (paginated; large libraries work).
-- **Include favorites** — toggle between "mine only" and "mine + saved".
-- **Add to queue** — queues the playlist as a single item, so OrpheusDL's own
-  playlist handling (folder naming, `.m3u` writing) stays intact.
+- **My playlists** — your own playlists, where the service's login allows it.
+- **Open link** — any public playlist link of the chosen service.
+- Clicking a playlist shows its **tracks** on the right. Click, Shift+click or
+  Ctrl+click picks some of them; **Queue picked tracks** queues only those, as
+  one group named after the playlist.
+- **Add to queue** — queues the highlighted (or every ticked) playlist as a
+  whole, as a single item, so OrpheusDL's own playlist handling (folder naming,
+  `.m3u` writing) stays intact.
 
-Requires the TIDAL module installed under `modules/tidal` and a logged-in
-account. Without it the tab explains what is missing instead of failing silently.
+What each service needs — and the tab says so in a line under the link field
+whenever something is missing, instead of showing an empty list:
 
-### Folders
+| Service | Own playlists | Links |
+|---------|---------------|-------|
+| TIDAL | signed in on the Accounts tab (also *Include favorites*, folders) | signed in |
+| Spotify | signed in (Client ID and Secret under *Settings → Spotify*) | public links without anything |
+| YouTube | a `cookies.txt` under *Settings → YouTube* | public links without anything |
+| SoundCloud | the token under *Settings → SoundCloud* | public links without anything |
+
+Downloads from TIDAL are pinned to hi-res as before; the other services
+download at the quality set in Settings.
+
+SoundCloud is read through the SoundCloud module's own API client. Its built-in
+public client id is out of date (SoundCloud answers 401 without a token), so the
+tab looks up the id the web player currently uses — once, the same way yt-dlp
+does. YouTube is read through yt-dlp; the cookie file is only handed over as a
+temporary copy and never read by the suite itself.
+
+### Folders (TIDAL)
 
 Playlists appear inside your TIDAL folders where TIDAL will tell us about them.
 
@@ -203,10 +228,38 @@ the single-playlist actions, and with boxes ticked the button acts on the ticks.
 
 ---
 
-## Spotify → TIDAL
+## Port
 
-A new **Spotify → TIDAL** tab. Give it a Spotify playlist, it finds each track
-on TIDAL and queues the matches for hi-res download.
+The **Port** tab (it replaced "Spotify → TIDAL") reads a playlist on one
+service and finds every track on another: **From** and **To** take any two of
+Spotify, TIDAL, YouTube and SoundCloud — 12 directions. **⇄** swaps them;
+picking the other side's service swaps them too. The matches become one group
+in the queue.
+
+Porting only **reads** the source and only **searches** the target. Nothing is
+created, changed or liked in any account.
+
+| | Read from (source) | Search on (target) |
+|---|---|---|
+| Spotify | public links; own playlists after sign-in | needs Client ID and Secret (app token, no sign-in) |
+| TIDAL | signed in | signed in |
+| YouTube | public links; own playlists with `cookies.txt` | always |
+| SoundCloud | public links; own playlists with the token | always |
+
+Matching works as described below for every direction: ISRC first where both
+sides have one (Spotify and TIDAL look ISRCs up; SoundCloud label uploads carry
+them as a source), otherwise title, artist and length with the version guard.
+YouTube and SoundCloud titles are split into artist and title first
+("Artist - Title (Official Video)" → artist, title; channel names lose
+"- Topic" and "VEVO").
+
+Searches are paced — at least 1 s between two YouTube or SoundCloud requests
+(yt-dlp's own "sleep" preset spaces requests 0.75 s apart). An HTTP 429 or a
+bot check stops the whole port at once instead of moving on to the next track.
+
+Spotify → TIDAL is the default direction and behaves exactly as the former tab:
+
+### Spotify → TIDAL
 
 ### Getting the playlist
 
@@ -314,16 +367,19 @@ recommendation is also shown next to the field:
 | Quality | lossless (16/44.1 FLAC); hifi only for CDJ-3000/CDJ-2000NXS2-class players | rekordbox FAQ: no Pioneer player above 96 kHz, XDJ-RX3/XDJ-XZ up to 48 kHz |
 | AAC / MP3 / Opus | AAC ≥ 256k, MP3 320k CBR, avoid Opus | Digital DJ Tips; Engine DJ and Traktor format lists (no Opus) |
 
-The recommendations are hints only; no default value was changed.
+The recommendations are hints. Two defaults follow them for **new installs
+only** -- 3 concurrent downloads (was 5) and a 10 s YouTube pause (was 5 s);
+an existing `settings.json` keeps its values, because loading lets every value
+in the file win over the defaults.
 
 ## What this does not do
 
-- It does not create a playlist on TIDAL — it downloads the tracks. Nothing is
-  written to your TIDAL account.
-- It does not download from Spotify. Spotify is only read for metadata; the
-  audio comes from TIDAL.
-- Tracks that are not on TIDAL cannot be downloaded. They are listed as
-  "not found" rather than quietly dropped.
+- It does not create a playlist anywhere — it downloads the tracks. Nothing is
+  written to any account (TIDAL, Spotify, YouTube, SoundCloud).
+- Porting from Spotify does not download from Spotify. Spotify is only read for
+  metadata; the audio comes from the target service.
+- Tracks the target service does not have cannot be downloaded. They are listed
+  as "not found" rather than quietly dropped.
 
 You need your own valid TIDAL subscription. Hi-res streams require a plan that
 includes them.
@@ -340,7 +396,11 @@ free of tkinter and can be tested headlessly:
 | `models.py` | Shared dataclasses — the contract every other module implements against |
 | `queue_store.py` | Persistent, thread-safe queue |
 | `tidal_library.py` | TIDAL playlist/track access |
-| `spotify_source.py` | Spotify Web API + embed fallback |
+| `spotify_source.py` | Spotify Web API + embed fallback, track search |
+| `playlist_providers.py` | One interface for all four services (read, open by link, search, ISRC) |
+| `soundcloud_source.py`, `youtube_source.py` | SoundCloud and YouTube behind that interface |
+| `provider_registry.py` | Builds the four providers from the running GUI |
+| `playlists_controller.py`, `port_controller.py` | Logic of the Playlists and Port tabs |
 | `matcher.py` | ISRC + fuzzy matching |
 | `converter.py` | Playlist → matches → queue items |
 | `quality.py` | Quality tiers and the hi-res override |
@@ -349,8 +409,9 @@ free of tkinter and can be tested headlessly:
 | `auto_refresh.py` | Bounded automatic re-checks of the account states |
 | `account_providers.py` | SoundCloud/YouTube status, service explanations |
 | `help_texts.py` | Help text and recommendation per setting and control |
-| `gui_panel.py` | Widgets only (Accounts, TIDAL, Spotify tabs) |
+| `gui_panel.py` | Widgets only: Accounts tab, shared playlist list and review dialog, `build_tabs` |
 | `queue_panel.py` | Widgets of the grouped Queue tab |
+| `playlists_panel.py`, `port_panel.py` | Widgets of the Playlists and Port tabs |
 | `help_widget.py`, `dialogs.py`, `ui_style.py` | "?" marker and tooltip, confirmation dialog, palette |
 | `integration.py` | The bridge into `gui.py` |
 
@@ -401,5 +462,5 @@ The Accounts tab followed that rule: alongside its controller tests in
 `tests/test_accounts.py`, `TestSetupTabsWiring` asserts against the *real*
 `setup_tabs` output that the status providers are the ones it built, that the
 sign-in button reaches the TIDAL module with `force=True`, and that the
-Accounts and Spotify tabs share one controller — three things a test with
+Accounts and Port tabs share one controller — three things a test with
 injected providers would pass without ever proving.

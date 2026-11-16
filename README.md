@@ -3,9 +3,10 @@
 <img src="https://raw.githubusercontent.com/bascurtiz/OrpheusDL-GUI/main/animated.gif" alt="GUI overview">
 
 > **This fork adds a Hi-Res Suite** on top of upstream `v2.0.3`: a persistent
-> **download queue**, a **TIDAL playlist browser**, and **Spotify → TIDAL**
-> playlist conversion that downloads your Spotify playlists from TIDAL in
-> hi-res (24 bit FLAC). See **[HIRES.md](HIRES.md)**.
+> **download queue** grouped by playlist, a **Playlists** tab for Spotify,
+> TIDAL, YouTube and SoundCloud, and a **Port** tab that finds a playlist's
+> tracks on another of those services — Spotify → TIDAL downloads your Spotify
+> playlists from TIDAL in hi-res (24 bit FLAC). See **[HIRES.md](HIRES.md)**.
 >
 > Upstream project: [bascurtiz/OrpheusDL-GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
 

@@ -1,4 +1,8 @@
-"""The three hi-res tabs: Queue, TIDAL Playlists, Spotify -> TIDAL.
+"""Shared widgets of the hi-res tabs, the Accounts tab and the wiring.
+
+The Queue, Playlists and Port tabs live in ``queue_panel``, ``playlists_panel``
+and ``port_panel``; this module holds what they share (playlist list, review
+dialog) and :func:`build_tabs`.
 
 Widget code only. Every decision lives in :mod:`hires.controllers`, which is
 importable without tkinter and covered by tests; this module just draws things
@@ -17,20 +21,14 @@ from .controllers import (
     AccountsController,
     QueueController,
     ReviewRow,
-    SpotifyImportController,
-    TidalBrowserController,
     UiDispatcher,
 )
 from .models import (
     AccountState,
-    ConversionReport,
     FolderRef,
-    MatchDecision,
     PlaylistRef,
-    QueueStatus,
     flat_root,
 )
-from .quality import HIRES, label_for
 
 from .queue_panel import MAX_RENDERED_ROWS, STATUS_COLORS, QueueTab  # noqa: F401  (re-exported)
 from .ui_style import (  # noqa: F401  (re-exported for older imports)
@@ -285,394 +283,6 @@ class PlaylistList:
         except Exception:
             pass
         self.on_select(playlist)
-
-
-# ---------------------------------------------------------------------------
-# TIDAL playlists tab
-# ---------------------------------------------------------------------------
-
-class TidalPlaylistTab:
-    """Browse your own TIDAL playlists and send them to the queue."""
-
-    def __init__(self, parent, controller: TidalBrowserController):
-        self.controller = controller
-
-        self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.frame.pack(fill="both", expand=True, padx=9, pady=10)
-
-        bar = customtkinter.CTkFrame(self.frame, fg_color="transparent")
-        bar.pack(fill="x", pady=(0, 8))
-
-        load_button = _button(bar, "⟳  Load playlists", self.load, width=140, fg=PRIMARY_ACTION)
-        load_button.pack(side="left", padx=(0, 6))
-        attach_tooltip(load_button, "hires.tidal.load")
-
-        self.favorites_var = tkinter.BooleanVar(value=True)
-        favorites = customtkinter.CTkCheckBox(
-            bar,
-            text="Include favorites",
-            variable=self.favorites_var,
-            text_color=SECONDARY_TEXT,
-            checkbox_width=18,
-            checkbox_height=18,
-        )
-        favorites.pack(side="left", padx=(0, 12))
-        attach_tooltip(favorites, "hires.tidal.include_favorites")
-
-        self.select_all_button = _button(
-            bar, "Select all", self._toggle_all, width=90, state="disabled"
-        )
-        self.select_all_button.pack(side="left", padx=(0, 6))
-        attach_tooltip(self.select_all_button, "hires.tidal.select_all")
-
-        self.download_button = _button(
-            bar, "⬇  Add to queue", self.enqueue_selected, width=140, state="disabled"
-        )
-        self.download_button.pack(side="left")
-        attach_tooltip(self.download_button, "hires.tidal.add_to_queue")
-
-        self.status_label = customtkinter.CTkLabel(bar, text="", text_color=SECONDARY_TEXT)
-        self.status_label.pack(side="right")
-
-        self.list = PlaylistList(self.frame, self._on_select, on_check=self._on_check)
-        self.list.pack(fill="both", expand=True)
-        self.list.set_message(
-            "Click “Load playlists” to show your TIDAL playlists.\n"
-            "Not signed in yet? The Accounts tab does that first."
-        )
-
-    # -- selection ----------------------------------------------------------
-    def _on_select(self, playlist: PlaylistRef) -> None:
-        """A row was highlighted. Ticked boxes take precedence over this."""
-        if not self.list.checked:
-            self.download_button.configure(state="normal")
-            self.status_label.configure(
-                text=f"Selected: {playlist.name}", text_color=SECONDARY_TEXT
-            )
-
-    def _on_check(self) -> None:
-        checked = self.list.checked
-        if checked:
-            self.download_button.configure(text=f"⬇  Queue {len(checked)}", state="normal")
-            self.status_label.configure(
-                text=_selection_label(checked), text_color=SECONDARY_TEXT
-            )
-        else:
-            self.download_button.configure(
-                text="⬇  Add to queue",
-                state="normal" if self.list.selected else "disabled",
-            )
-        self.select_all_button.configure(
-            text="Select none" if checked else "Select all",
-            state="normal" if self.list.playlists else "disabled",
-        )
-
-    def _toggle_all(self) -> None:
-        self.list.check_all(not self.list.checked)
-
-    # -- loading ------------------------------------------------------------
-    def load(self) -> None:
-        self.status_label.configure(text="Loading…", text_color=SECONDARY_TEXT)
-        self.list.set_message("Loading your TIDAL playlists…")
-        self.download_button.configure(state="disabled")
-        self.controller.load_playlists(
-            self._on_loaded, self._on_error, include_favorites=self.favorites_var.get()
-        )
-
-    def _on_loaded(self, root: FolderRef) -> None:
-        self.list.set_root(root)
-        summary = _count_label(root.total_playlists, "playlist")
-        if root.folders:
-            summary = f"{_count_label(len(root.folders), 'folder')} · {summary}"
-        self.status_label.configure(text=summary, text_color=SECONDARY_TEXT)
-
-    def _on_error(self, message: str) -> None:
-        self.list.set_message(message, color=ERROR)
-        self.status_label.configure(text="Failed", text_color=ERROR)
-
-    # -- queueing -----------------------------------------------------------
-    def enqueue_selected(self) -> None:
-        """Queue the ticked playlists, or the highlighted one if none are ticked."""
-        checked = self.list.checked
-        if checked:
-            try:
-                items = self.controller.enqueue_many(checked)
-            except Exception as exc:
-                self.status_label.configure(text=str(exc), text_color=ERROR)
-                return
-            self.list.check_all(False)
-            self.status_label.configure(
-                text=f"Queued {len(items)} playlists.", text_color=SUCCESS
-            )
-            return
-
-        playlist = self.list.selected
-        if playlist is None:
-            return
-        try:
-            self.controller.enqueue_playlist_as_one(playlist)
-        except Exception as exc:
-            self.status_label.configure(text=str(exc), text_color=ERROR)
-            return
-        self.status_label.configure(
-            text=f"Queued: {playlist.name}", text_color=SUCCESS
-        )
-
-
-# ---------------------------------------------------------------------------
-# Spotify -> TIDAL tab
-# ---------------------------------------------------------------------------
-
-class SpotifyConvertTab:
-    """Convert a Spotify playlist to TIDAL and download it in hi-res."""
-
-    def __init__(self, parent, controller: SpotifyImportController):
-        self.controller = controller
-        self.report: Optional[ConversionReport] = None
-        self.review_choices: Dict[str, Any] = {}
-
-        self.frame = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.frame.pack(fill="both", expand=True, padx=9, pady=10)
-
-        # -- source row -----------------------------------------------------
-        top = customtkinter.CTkFrame(self.frame, fg_color="transparent")
-        top.pack(fill="x", pady=(0, 8))
-
-        self.url_entry = customtkinter.CTkEntry(
-            top,
-            placeholder_text="Paste a Spotify playlist link — or load your own playlists →",
-            height=30,
-        )
-        self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        attach_tooltip(self.url_entry, "hires.spotify.url")
-
-        convert_button = _button(top, "Convert", self.convert_from_url, width=90, fg=PRIMARY_ACTION)
-        convert_button.pack(side="left", padx=(0, 6))
-        attach_tooltip(convert_button, "hires.spotify.convert")
-        mine_button = _button(top, "⟳  My playlists", self.load_playlists, width=130)
-        mine_button.pack(side="left")
-        attach_tooltip(mine_button, "hires.spotify.my_playlists")
-
-        # -- playlist list --------------------------------------------------
-        self.list = PlaylistList(self.frame, self._on_select, on_check=self._on_check)
-        self.list.pack(fill="both", expand=True, pady=(0, 8))
-        self.list.set_message(
-            "Paste a public Spotify playlist link above, or click “My playlists”\n"
-            "to list your own playlists and Liked Songs.\n"
-            "Tick several to convert and queue them in one go.\n"
-            "Signing in ahead of time is done on the Accounts tab."
-        )
-
-        # -- progress -------------------------------------------------------
-        self.progress = customtkinter.CTkProgressBar(self.frame, height=6)
-        self.progress.set(0)
-        self.progress.pack(fill="x", pady=(0, 4))
-
-        self.status_label = customtkinter.CTkLabel(
-            self.frame, text="", text_color=SECONDARY_TEXT, anchor="w"
-        )
-        self.status_label.pack(fill="x", pady=(0, 6))
-
-        # -- actions --------------------------------------------------------
-        actions = customtkinter.CTkFrame(self.frame, fg_color="transparent")
-        actions.pack(fill="x")
-
-        self.queue_button = _button(
-            actions, "⬇  Queue matches", self.queue_confident, width=140, state="disabled"
-        )
-        self.queue_button.pack(side="left", padx=(0, 6))
-        attach_tooltip(self.queue_button, "hires.spotify.queue_matches")
-
-        self.review_button = _button(
-            actions, "Review uncertain…", self.open_review, width=150, state="disabled"
-        )
-        self.review_button.pack(side="left", padx=(0, 6))
-        attach_tooltip(self.review_button, "hires.spotify.review")
-
-        self.select_all_button = _button(
-            actions, "Select all", self._toggle_all, width=90, state="disabled"
-        )
-        self.select_all_button.pack(side="left")
-        attach_tooltip(self.select_all_button, "hires.spotify.select_all")
-
-        customtkinter.CTkLabel(
-            actions,
-            text=f"Downloads at {label_for(HIRES)}",
-            text_color=GRAY_TEXT,
-            font=("", 11),
-        ).pack(side="right")
-
-    # -- loading ------------------------------------------------------------
-    def load_playlists(self) -> None:
-        """List the user's own playlists, signing in to Spotify if needed."""
-        self.list.set_message("Loading your Spotify playlists…")
-        self.status_label.configure(text="", text_color=SECONDARY_TEXT)
-        self.controller.load_playlists(
-            self._on_playlists, self._on_error, on_status=self._on_status
-        )
-
-    def _on_status(self, message: str) -> None:
-        """Progress from the sign-in flow (browser consent can take a while)."""
-        self.list.set_message(message)
-        self.status_label.configure(text=message, text_color=SECONDARY_TEXT)
-
-    def _on_playlists(self, root: FolderRef) -> None:
-        self.list.set_root(root)
-        self.status_label.configure(
-            text=f"{root.total_playlists} playlists", text_color=SECONDARY_TEXT
-        )
-
-    def _on_select(self, playlist: PlaylistRef) -> None:
-        # With boxes ticked the click is being used to browse, not to start a
-        # conversion the user did not ask for.
-        if self.list.checked:
-            return
-        self.status_label.configure(
-            text=f"Selected: {playlist.name}", text_color=SECONDARY_TEXT
-        )
-        self.start_conversion(playlist)
-
-    def _on_check(self) -> None:
-        checked = self.list.checked
-        self.select_all_button.configure(
-            text="Select none" if checked else "Select all",
-            state="normal" if self.list.playlists else "disabled",
-        )
-        if checked:
-            self.queue_button.configure(
-                text=f"⬇  Convert & queue {len(checked)}", state="normal"
-            )
-            self.review_button.configure(state="disabled")
-            self.status_label.configure(
-                text=_selection_label(checked), text_color=SECONDARY_TEXT
-            )
-        else:
-            self.queue_button.configure(
-                text="⬇  Queue matches",
-                state="normal" if self.report else "disabled",
-            )
-            self.review_button.configure(
-                state="normal" if (self.report and self.report.needs_review) else "disabled"
-            )
-
-    def _toggle_all(self) -> None:
-        self.list.check_all(not self.list.checked)
-
-    # -- conversion ---------------------------------------------------------
-    def convert_from_url(self) -> None:
-        url = self.url_entry.get().strip()
-        if not url:
-            self.status_label.configure(text="Paste a Spotify playlist link first.", text_color=WARNING)
-            return
-        self.start_conversion(url)
-
-    def start_conversion(self, playlist: Any) -> None:
-        self.report = None
-        self.review_choices = {}
-        self.progress.set(0)
-        self.queue_button.configure(state="disabled")
-        self.review_button.configure(state="disabled")
-        self.status_label.configure(text="Reading playlist…", text_color=SECONDARY_TEXT)
-        self.controller.convert(playlist, self._on_progress, self._on_converted, self._on_error)
-
-    def _on_progress(self, done: int, total: int, _result) -> None:
-        if total > 0:
-            self.progress.set(done / total)
-        self.status_label.configure(
-            text=self.controller.progress_text(done, total), text_color=SECONDARY_TEXT
-        )
-
-    def _on_converted(self, report: ConversionReport) -> None:
-        self.report = report
-        self.progress.set(1)
-        self.status_label.configure(
-            text=self.controller.result_summary(report), text_color=WHITE_TEXT
-        )
-        self.queue_button.configure(state="normal")
-        self.review_button.configure(
-            state="normal" if report.needs_review else "disabled"
-        )
-
-    def _on_error(self, message: str) -> None:
-        self.progress.set(0)
-        self.status_label.configure(text=message, text_color=ERROR)
-
-    # -- queueing -----------------------------------------------------------
-    def queue_confident(self) -> None:
-        """Queue the current report, or convert every ticked playlist in turn."""
-        checked = self.list.checked
-        if checked:
-            self.convert_checked(checked)
-            return
-
-        if self.report is None:
-            return
-        try:
-            items = self.controller.enqueue_confident_only(self.report)
-        except Exception as exc:
-            self.status_label.configure(text=str(exc), text_color=ERROR)
-            return
-        self.status_label.configure(
-            text=f"Queued {len(items)} tracks in hi-res.", text_color=SUCCESS
-        )
-
-    def convert_checked(self, playlists) -> None:
-        """Convert several playlists back to back, queueing each as it finishes."""
-        self.report = None
-        self.progress.set(0)
-        self.queue_button.configure(state="disabled")
-        self.review_button.configure(state="disabled")
-        self._batch_total = len(playlists)
-        self.status_label.configure(
-            text=f"Converting {self._batch_total} playlists…", text_color=SECONDARY_TEXT
-        )
-        self.controller.convert_many(
-            playlists,
-            self._on_batch_playlist,
-            self._on_progress,
-            self._on_batch_done,
-            self._on_error,
-        )
-
-    def _on_batch_playlist(self, index: int, total: int, playlist) -> None:
-        name = getattr(playlist, "name", "") or getattr(playlist, "id", "")
-        self.progress.set(index / total if total else 0)
-        self.status_label.configure(
-            text=f"[{index + 1}/{total}] {name}", text_color=SECONDARY_TEXT
-        )
-
-    def _on_batch_done(self, reports) -> None:
-        self.progress.set(1)
-        queued = sum(
-            len([r for r in report.results if r.decision == MatchDecision.AUTO_ACCEPT.value])
-            for report in reports
-        )
-        self.status_label.configure(
-            text=f"Queued {queued} tracks from {len(reports)} playlists in hi-res.",
-            text_color=SUCCESS,
-        )
-        self.list.check_all(False)
-
-    def open_review(self) -> None:
-        if self.report is None:
-            return
-        rows = self.controller.review_rows(self.report)
-        if not rows:
-            return
-        ReviewDialog(self.frame, rows, self._apply_review)
-
-    def _apply_review(self, decisions: Dict[str, Any]) -> None:
-        try:
-            items = self.controller.apply_review_and_enqueue(
-                decisions, report=self.report
-            )
-        except Exception as exc:
-            self.status_label.configure(text=str(exc), text_color=ERROR)
-            return
-        self.status_label.configure(
-            text=f"Queued {len(items)} tracks in hi-res.", text_color=SUCCESS
-        )
-        self.review_button.configure(state="disabled")
 
 
 # ---------------------------------------------------------------------------
@@ -1146,9 +756,8 @@ def build_tabs(
     *,
     queue,
     app=None,
-    tidal_library_provider: Callable[[], Any],
+    playlist_providers: Dict[str, Callable[[], Any]],
     spotify_source_provider: Callable[[], Any],
-    matcher_provider: Callable[[], Any],
     quality_provider: Optional[Callable[[], str]] = None,
     output_provider: Optional[Callable[[], Optional[str]]] = None,
     tidal_status_provider: Optional[Callable[[], Any]] = None,
@@ -1159,22 +768,32 @@ def build_tabs(
     youtube_status_provider: Optional[Callable[[], Any]] = None,
     open_settings: Optional[Callable[[str], Any]] = None,
     stop_active: Optional[Callable[[], Any]] = None,
+    matcher_factory: Optional[Callable[[Any, str], Any]] = None,
 ) -> Dict[str, Any]:
     """Add the hi-res tabs to an existing CTkTabview.
 
     Returns the tab objects so gui.py can refresh them later. The Accounts tab
     is only built when both status providers are supplied -- without them there
     is nothing truthful to show.
+
+    ``playlist_providers`` maps a service name to its provider factory (see
+    :mod:`hires.provider_registry`); the Playlists and Port tabs offer exactly
+    those services.
     """
+    from .playlists_controller import PlaylistsController
+    from .playlists_panel import PlaylistsTab
+    from .port_controller import PortController
+    from .port_panel import PortTab
+
     dispatch = UiDispatcher(app)
 
-    spotify_controller = SpotifyImportController(
-        spotify_source_provider,
-        matcher_provider,
+    port_controller = PortController(
+        playlist_providers,
         queue,
+        spotify_source_provider=spotify_source_provider,
         dispatch=dispatch,
-        quality_provider=quality_provider,
         output_provider=output_provider,
+        matcher_factory=matcher_factory,
     )
 
     tabs: Dict[str, Any] = {}
@@ -1189,9 +808,9 @@ def build_tabs(
                 soundcloud_status_provider=soundcloud_status_provider,
                 youtube_status_provider=youtube_status_provider,
                 tidal_sign_in=tidal_sign_in,
-                # Shared so a sign-in here is immediately visible over there:
-                # one source object, one set of tokens.
-                spotify_controller=spotify_controller,
+                # Shared so a sign-in here is immediately visible on the Port
+                # tab: one controller, one Spotify source, one set of tokens.
+                spotify_controller=port_controller,
                 dispatch=dispatch,
                 busy_provider=busy_provider,
             ),
@@ -1204,19 +823,18 @@ def build_tabs(
         dispatch=dispatch,
     )
 
-    tabs["tidal"] = TidalPlaylistTab(
-        tabview.add("TIDAL Playlists"),
-        TidalBrowserController(
-            tidal_library_provider,
+    tabs["playlists"] = PlaylistsTab(
+        tabview.add("Playlists"),
+        PlaylistsController(
+            playlist_providers,
             queue,
             dispatch=dispatch,
-            quality_provider=quality_provider,
             output_provider=output_provider,
+            quality_provider=quality_provider,
         ),
+        service="TIDAL" if "TIDAL" in playlist_providers else "",
     )
 
-    tabs["spotify"] = SpotifyConvertTab(
-        tabview.add("Spotify → TIDAL"), spotify_controller
-    )
+    tabs["port"] = PortTab(tabview.add("Port"), port_controller)
 
     return tabs
