@@ -13,6 +13,7 @@ one grid column, so moving a line costs a single ``grid(row=…)``.
 
 from __future__ import annotations
 
+import tkinter
 from typing import Callable, List, Optional
 
 import customtkinter
@@ -87,30 +88,45 @@ class _Line:
         self.container.destroy()
 
 
+def _fonts(widget) -> tuple:
+    """``(normal, small)`` fonts for plain tk labels, scaled like CTk's own.
+
+    Track lines are plain tkinter widgets: a CTk frame or label redraws its
+    rounded canvas on every geometry change, which made the first paint of a
+    full queue take seconds. Plain labels need the scaling applied by hand.
+    """
+    family = customtkinter.CTkFont().cget("family")
+    try:
+        scale = customtkinter.ScalingTracker.get_widget_scaling(widget)
+    except Exception:
+        scale = 1.0
+    return (family, -round(13 * scale)), (family, -round(11 * scale))
+
+
 class _QueueRowWidgets(_Line):
     """The widgets of one track line, kept alive so they can be reused."""
 
-    def __init__(self, parent, on_click: Callable[[str], None]):
+    def __init__(self, parent, on_click: Callable[[str], None], fonts: tuple):
         super().__init__()
         self._on_click = on_click
         self.item_id: str = ""
+        normal, small = fonts
 
-        self.container = customtkinter.CTkFrame(parent, corner_radius=4, fg_color="transparent")
-        self.status = customtkinter.CTkLabel(self.container, text="", width=24)
-        self.status.pack(side="left", padx=(22, 2))
+        self.container = tkinter.Frame(parent, bg=SURFACE, highlightthickness=0, bd=0)
+        self.status = tkinter.Label(self.container, text="", width=2, bg=SURFACE, font=normal)
+        self.status.pack(side="left", padx=(24, 4))
 
-        self.text_frame = customtkinter.CTkFrame(self.container, fg_color="transparent")
+        self.text_frame = tkinter.Frame(self.container, bg=SURFACE)
         self.text_frame.pack(side="left", fill="x", expand=True, pady=2)
 
-        self.title = customtkinter.CTkLabel(self.text_frame, text="", text_color=WHITE_TEXT, anchor="w")
+        self.title = tkinter.Label(self.text_frame, text="", fg=WHITE_TEXT, bg=SURFACE, anchor="w", font=normal)
         self.title.pack(fill="x")
 
-        self.detail = customtkinter.CTkLabel(
-            self.text_frame, text="", text_color=GRAY_TEXT, anchor="w", font=("", 11)
-        )
-        self.quality = customtkinter.CTkLabel(self.container, text="", text_color=GRAY_TEXT, font=("", 11))
+        self.detail = tkinter.Label(self.text_frame, text="", fg=GRAY_TEXT, bg=SURFACE, anchor="w", font=small)
+        self.quality = tkinter.Label(self.container, text="", fg=GRAY_TEXT, bg=SURFACE, font=small)
 
-        for widget in (self.container, self.status, self.text_frame, self.title, self.detail):
+        self._parts = (self.container, self.status, self.text_frame, self.title, self.detail, self.quality)
+        for widget in self._parts[:5]:
             widget.bind("<Button-1>", self._clicked)
 
     def _clicked(self, _event=None) -> None:
@@ -120,13 +136,12 @@ class _QueueRowWidgets(_Line):
     def update(self, row, selected: bool) -> None:
         """Point this line at ``row``. Only touches what actually changed."""
         self.item_id = row.id
-        self._set(self.container, "bg", fg_color=ROW_HOVER if selected else "transparent")
-        self._set(
-            self.status,
-            "status",
-            text=row.symbol,
-            text_color=STATUS_COLORS.get(row.status, SECONDARY_TEXT),
-        )
+        background = ROW_HOVER if selected else SURFACE
+        if self._shown.get("bg") != background:
+            self._shown["bg"] = background
+            for widget in self._parts:
+                widget.configure(bg=background)
+        self._set(self.status, "status", text=row.symbol, fg=STATUS_COLORS.get(row.status, SECONDARY_TEXT))
         self._set(self.title, "title", text=row.title)
 
         # Inside a playlist group the playlist name would repeat on every line.
@@ -134,7 +149,7 @@ class _QueueRowWidgets(_Line):
         if row.error:
             detail_text = f"{detail_text} · {row.error}" if detail_text else row.error
         if detail_text:
-            self._set(self.detail, "detail", text=detail_text, text_color=ERROR if row.error else GRAY_TEXT)
+            self._set(self.detail, "detail", text=detail_text, fg=ERROR if row.error else GRAY_TEXT)
             if not self.detail.winfo_ismapped():
                 self.detail.pack(fill="x")
         elif self.detail.winfo_ismapped():
@@ -262,6 +277,7 @@ class QueueTab:
         )
         self.list_frame.pack(fill="both", expand=True)
         self.list_frame.grid_columnconfigure(0, weight=1)
+        self._row_fonts = _fonts(self.list_frame)
 
         self.empty_label = customtkinter.CTkLabel(
             self.list_frame, text="", text_color=GRAY_TEXT, justify="center"
@@ -389,7 +405,9 @@ class QueueTab:
         # Grow or shrink the pools; lines are only destroyed when the queue
         # actually got shorter.
         self._resize(self._headers, len(groups), self._new_header)
-        self._resize(self._rows, total_rows, lambda: _QueueRowWidgets(self.list_frame, self._select))
+        self._resize(
+            self._rows, total_rows, lambda: _QueueRowWidgets(self.list_frame, self._select, self._row_fonts)
+        )
 
         next_key = self.controller.next_group_key()
         grid_row = 0

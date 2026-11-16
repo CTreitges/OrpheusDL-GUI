@@ -119,9 +119,38 @@ class TestHelpCoverageOfSettings:
             assert short_hint(key), f"{key} has no visible recommendation"
 
     def test_help_coverage_message_combines_base_text_and_recommendation(self):
-        message = help_message("general.concurrent_downloads", "Number of tracks at once.")
-        assert message.startswith("Number of tracks at once.")
+        message = help_message("general.search_limit", "Maximum number of results.")
+        assert message.startswith("Maximum number of results.")
         assert "Recommended:" in message
+
+    def test_help_coverage_own_text_replaces_a_contradicting_gui_tooltip(self):
+        """gui.py says '4-6: most systems'; the block-risk advice says 1-4."""
+        message = help_message("general.concurrent_downloads", "Recommended values: 4-6: Most systems")
+        assert "4-6" not in message
+        assert "3–4" in message
+
+    @staticmethod
+    def _calls_fit_their_definitions(tree, calls):
+        """Every call passes only arguments its gui.py helper accepts.
+
+        Regression: ``_hires_help_pack(..., padx=…)`` met a definition without
+        ``**kwargs``; the TypeError aborted the TIDAL settings tab on start.
+        gui.py cannot be imported in a test, so the signatures are compared
+        on the syntax tree.
+        """
+        defs = {
+            node.name: node.args
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_hires_h")
+        }
+        for call in calls:
+            spec = defs[call.func.id]
+            positional = [a.arg for a in spec.args]
+            assert len(call.args) <= len(positional) or spec.vararg, ast.unparse(call)
+            for keyword in call.keywords:
+                assert keyword.arg in positional or spec.kwarg is not None, (
+                    f"line {call.lineno}: {call.func.id} does not accept {keyword.arg}="
+                )
 
     def test_help_coverage_gui_attaches_the_markers(self, tree):
         """The settings code must actually call the "?" for each kind of row."""
@@ -144,6 +173,7 @@ class TestHelpCoverageOfSettings:
         assert "full_key" in names, "the Global loop attaches no help"
         assert {"aac_full_key", "flac_full_key", "mp3_setting_key", "opus_full_key"} <= names
         assert fstrings, "the generic credential rows attach no help"
+        self._calls_fit_their_definitions(tree, calls)
         for key in (
             "credentials.Spotify.username",
             "credentials.Spotify.download_pause_seconds",

@@ -12,6 +12,7 @@ written down.
 
 from __future__ import annotations
 
+import tkinter
 from typing import Optional
 
 import customtkinter
@@ -26,19 +27,107 @@ TOOLTIP_BG = "#222323"
 ICON_ROOM = 22
 
 
-def _tooltip(widget, message: str) -> None:
-    from CTkToolTip import CTkToolTip
+class _SharedTip:
+    """One tooltip window per main window, shared by every help marker.
 
-    CTkToolTip(
-        widget,
-        message=message,
-        bg_color=TOOLTIP_BG,
-        text_color=WHITE_TEXT,
-        padx=12,
-        pady=12,
-        justify="left",
-        wraplength=460,
-    )
+    CTkToolTip builds a hidden Toplevel per widget. With a "?" on ~90
+    settings and tooltips on every queue header that is a hundred-odd
+    windows, and creating them showed up as a large part of the queue's
+    first paint. One window, re-texted on hover, looks the same and costs
+    nothing per widget.
+    """
+
+    DELAY_MS = 350
+
+    def __init__(self, toplevel):
+        self.toplevel = toplevel
+        self.window = None
+        self.label = None
+        self._after = None
+
+    def _ensure(self):
+        if self.window is not None and self.window.winfo_exists():
+            return
+        self.window = tkinter.Toplevel(self.toplevel)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        try:
+            self.window.attributes("-topmost", True)
+        except Exception:
+            pass
+        family = customtkinter.CTkFont().cget("family")
+        try:
+            scale = customtkinter.ScalingTracker.get_widget_scaling(self.toplevel)
+        except Exception:
+            scale = 1.0
+        self.label = tkinter.Label(
+            self.window,
+            text="",
+            justify="left",
+            wraplength=int(460 * scale),
+            bg=TOOLTIP_BG,
+            fg=WHITE_TEXT,
+            padx=int(12 * scale),
+            pady=int(10 * scale),
+            font=(family, -round(12 * scale)),
+            highlightthickness=1,
+            highlightbackground="#3A3C40",
+        )
+        self.label.pack()
+
+    def schedule(self, widget, message: str) -> None:
+        self.cancel()
+        self._after = self.toplevel.after(self.DELAY_MS, lambda: self._show(widget, message))
+
+    def _show(self, widget, message: str) -> None:
+        self._after = None
+        try:
+            if not widget.winfo_exists():
+                return
+            self._ensure()
+            self.label.configure(text=message)
+            x, y = widget.winfo_pointerx(), widget.winfo_pointery()
+            left, top = widget.winfo_rootx(), widget.winfo_rooty()
+            inside = left <= x <= left + widget.winfo_width() and top <= y <= top + widget.winfo_height()
+            if inside:
+                x, y = x + 16, y + 14
+            else:
+                # Opened without the mouse on it (keyboard focus, a test):
+                # anchor to the widget instead of wherever the pointer is.
+                x, y = left, top + widget.winfo_height() + 6
+            self.window.geometry(f"+{x}+{y}")
+            self.window.deiconify()
+            self.window.lift()
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self.toplevel.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+        if self.window is not None:
+            try:
+                self.window.withdraw()
+            except Exception:
+                pass
+
+
+_TIPS: dict = {}
+
+
+def _tooltip(widget, message: str) -> None:
+    toplevel = widget.winfo_toplevel()
+    tip = _TIPS.get(str(toplevel))
+    if tip is None or tip.toplevel is not toplevel:
+        tip = _SharedTip(toplevel)
+        _TIPS[str(toplevel)] = tip
+    widget._hires_help_text = message
+    widget.bind("<Enter>", lambda _e: tip.schedule(widget, message), add="+")
+    widget.bind("<Leave>", lambda _e: tip.cancel(), add="+")
+    widget.bind("<ButtonPress>", lambda _e: tip.cancel(), add="+")
 
 
 def help_icon(parent, key: str, base_text: str = ""):

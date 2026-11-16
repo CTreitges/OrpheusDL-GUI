@@ -55,6 +55,9 @@ HELP: Dict[str, HelpEntry] = {
         recommendation="Tick only the services you have an account for; every extra one slows an 'All' search."
     ),
     "general.concurrent_downloads": H(
+        # Replaces gui.py's own tooltip, whose "4-6 for most systems" is about
+        # bandwidth and contradicts the block-risk advice below.
+        text="Number of tracks downloaded at the same time (1–10).",
         recommendation=(
             "3–4 for TIDAL and SoundCloud, 1–2 for Spotify and YouTube; 5 or more only for small jobs. "
             "streamrip, another TIDAL downloader, defaults to 6 at once; YouTube allows guests only about "
@@ -332,10 +335,12 @@ def help_message(key: str, base_text: str = "") -> str:
     """Hover text for ``key``: what it does, then what to pick.
 
     ``base_text`` is gui.py's own tooltip for the setting, when it has one --
-    shown instead of repeating it here.
+    shown instead of repeating it here. An entry's own ``text`` wins over it:
+    that is how a gui.py tooltip that contradicts the recommendation is
+    replaced rather than shown next to it.
     """
     item = HELP.get(key)
-    text = (base_text or (item.text if item else "")).strip()
+    text = ((item.text if item else "") or base_text).strip()
     recommendation = item.recommendation.strip() if item else ""
     if recommendation:
         return f"{text}\n\nRecommended: {recommendation}" if text else f"Recommended: {recommendation}"

@@ -215,6 +215,38 @@ class TestConfirmDialog:
 
 
 # ---------------------------------------------------------------------------
+# The shared help tooltip
+# ---------------------------------------------------------------------------
+
+class TestHelpCoverageTooltip:
+    def test_help_coverage_tooltip_appears_on_hover_and_hides_on_leave(self, root):
+        from hires import help_widget
+
+        target = customtkinter.CTkButton(root, text="Clear all…")
+        target.pack()
+        help_widget.attach_tooltip(target, "hires.queue.clear_all")
+        pump(root)
+        tip = help_widget._TIPS[str(root)]
+
+        tip.schedule(target, target._hires_help_text)
+        assert pump_until(root, lambda: tip.window is not None and tip.window.winfo_viewable())
+        assert "asking" in tip.label.cget("text") and "Recommended:" in tip.label.cget("text")
+
+        tip.cancel()
+        pump(root)
+        assert not tip.window.winfo_viewable()
+
+    def test_help_coverage_one_tooltip_window_for_many_markers(self, root):
+        from hires import help_widget
+
+        for key in ("hires.queue.pause", "hires.queue.remove", "hires.queue.clear_all"):
+            help_widget.attach_tooltip(customtkinter.CTkButton(root, text=key), key)
+        pump(root)
+        windows = [w for w in root.winfo_children() if isinstance(w, tkinter.Toplevel)]
+        assert len(windows) <= 1, f"{len(windows)} tooltip windows for three markers"
+
+
+# ---------------------------------------------------------------------------
 # Accounts: automatic re-checks on screen
 # ---------------------------------------------------------------------------
 

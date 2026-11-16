@@ -17117,9 +17117,9 @@ def _hires_help(label, key, base_text=""):
     return _hires_help_call("attach_help", label, key, base_text or "")
 
 
-def _hires_help_pack(parent, key, base_text=""):
+def _hires_help_pack(parent, key, base_text="", **pack_kwargs):
     """A "?" packed into a row of checkboxes."""
-    return _hires_help_call("pack_help", parent, key, base_text or "")
+    return _hires_help_call("pack_help", parent, key, base_text or "", **pack_kwargs)
 
 
 def _hires_hint(parent, key, row, column=1, **grid_kwargs):
