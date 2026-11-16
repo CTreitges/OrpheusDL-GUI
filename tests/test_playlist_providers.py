@@ -53,6 +53,16 @@ from test_spotify_source import FakeResponse, api_track, make_backend, token_res
 FIXTURES = os.path.join(HERE, "fixtures", "providers")
 
 
+@pytest.fixture(autouse=True)
+def fresh_soundcloud_client_id():
+    """The found public client id is shared per run; tests must not share it."""
+    import hires.soundcloud_source as scs
+
+    scs._PUBLIC_CLIENT_ID["value"] = ""
+    yield
+    scs._PUBLIC_CLIENT_ID["value"] = ""
+
+
 def fixture(name):
     with open(os.path.join(FIXTURES, f"{name}.json"), encoding="utf-8") as fh:
         return json.load(fh)
@@ -553,3 +563,47 @@ class TestPlaylistProviderRegistry:
         monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None)
         status = make_youtube_provider(FakeGui())().status()
         assert not status.available and "yt-dlp" in status.hint
+
+
+class TestSoundCloudPlaylistProviderRegressions:
+    """Found by the real-window run (drive_part2.py, 16.11.2026)."""
+
+    class PlaylistsByIdNeedLogin(FakeSoundCloudApi):
+        def _get(self, path, params=None):
+            self.calls.append(("get", path))
+            if path.startswith("playlists/"):
+                raise Exception("Unauthorized (401). Response: ")
+            return super()._get(path, params)
+
+    def test_a_listed_playlist_is_read_through_its_link_not_its_id(self):
+        """api-v2 answers playlists/<id> with 401 without a login; resolve works."""
+        api = self.PlaylistsByIdNeedLogin()
+        provider = SoundCloudProvider(api, pacer=NoWait(), http_get=lambda u: "")
+        ref = PlaylistRef(id="243061639", name="RAM", url="https://soundcloud.com/daftpunkofficialmusic/sets/ram")
+        assert provider.get_playlist_tracks(ref)
+        assert ("resolve", ref.url) in api.calls
+        assert not any(c[0] == "get" and c[1].startswith("playlists/") for c in api.calls)
+
+    def test_a_found_client_id_is_reused_by_the_next_provider(self):
+        import hires.soundcloud_source as scs
+
+        scs._PUBLIC_CLIENT_ID["value"] = ""
+        pages = {
+            "https://soundcloud.com/": '<script src="https://a-v2.sndcdn.com/assets/49-b.js"></script>',
+            "https://a-v2.sndcdn.com/assets/49-b.js": 'client_id:"AbCdEfGhIjKlMnOpQrStUvWxYz012345"',
+        }
+        fetched = []
+        first = FakeSoundCloudApi(errors=["Unauthorized (401). Response: "])
+        SoundCloudProvider(first, pacer=NoWait(), http_get=lambda u: fetched.append(u) or pages[u]).search_tracks("x")
+        second = FakeSoundCloudApi()
+        SoundCloudProvider(second, pacer=NoWait(), http_get=lambda u: fetched.append(u) or pages[u]).search_tracks("y")
+        assert second.calls[0][-1] == "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        assert len(fetched) == 2, "the second provider scraped soundcloud.com again"
+        scs._PUBLIC_CLIENT_ID["value"] = ""
+
+    def test_without_a_token_a_401_does_not_blame_the_token(self):
+        api = FakeSoundCloudApi(errors=["Unauthorized (401). Response: "] * 2)
+        provider = SoundCloudProvider(api, pacer=NoWait(), http_get=lambda u: "")
+        with pytest.raises(AuthRequiredError) as caught:
+            provider.search_tracks("x")
+        assert "token" not in str(caught.value).lower()

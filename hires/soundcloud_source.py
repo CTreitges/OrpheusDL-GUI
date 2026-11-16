@@ -42,6 +42,11 @@ NOT_SIGNED_IN_HINT = (
 #: How the web player's scripts carry the public client id (same as yt-dlp).
 _CLIENT_ID = re.compile(r'client_id\s*:\s*"([0-9a-zA-Z]{32})"')
 
+#: The last public client id found on soundcloud.com, shared by every provider
+#: of this run -- the tabs build a fresh provider per action, and looking it up
+#: again each time would cost three requests.
+_PUBLIC_CLIENT_ID = {"value": ""}
+
 
 def _default_get(url: str) -> str:
     import requests
@@ -137,6 +142,8 @@ class SoundCloudProvider(PlaylistProvider):
         self.pacer = pacer or Pacer(REQUEST_INTERVAL)
         self.http_get = http_get or _default_get
         self._client_id_refreshed = False
+        if not self._has_token() and _PUBLIC_CLIENT_ID["value"] and hasattr(api, "client_id"):
+            api.client_id = _PUBLIC_CLIENT_ID["value"]
 
     # -- plumbing -----------------------------------------------------------
     def _has_token(self) -> bool:
@@ -161,7 +168,7 @@ class SoundCloudProvider(PlaylistProvider):
                 self.pacer.wait()
                 match = _CLIENT_ID.search(self.http_get(src))
                 if match:
-                    self.api.client_id = match.group(1)
+                    self.api.client_id = _PUBLIC_CLIENT_ID["value"] = match.group(1)
                     return True
         except RateLimitedError:
             raise
@@ -186,9 +193,14 @@ class SoundCloudProvider(PlaylistProvider):
                 return self._call(fn, *args)
             if unauthorized:
                 # The module quotes the response body here -- never pass it on.
-                raise AuthRequiredError(
-                    "SoundCloud rejected the request (401). The token may have expired."
-                ) from exc
+                if self._has_token():
+                    message = "SoundCloud rejected the request (401). The token may have expired."
+                else:
+                    message = (
+                        "SoundCloud refused the request (401) without a login, even with a "
+                        "current public client id. Private or region-locked?"
+                    )
+                raise AuthRequiredError(message) from exc
             if message.startswith("404"):
                 raise SourceUnavailableError("SoundCloud: not found (deleted or private).") from exc
             raise SourceUnavailableError(f"SoundCloud request failed: {message[:160]}") from exc
@@ -221,7 +233,11 @@ class SoundCloudProvider(PlaylistProvider):
         return [p for p in playlists if p.id]
 
     def _playlist_json(self, playlist: Any) -> Dict[str, Any]:
-        if isinstance(playlist, PlaylistRef) and playlist.id.isdigit():
+        # The link first: api-v2 answers playlists/<id> with 401 without a
+        # login, while resolving the permalink works for every public set.
+        if isinstance(playlist, PlaylistRef) and self.owns_url(playlist.url):
+            data = self._call(self.api.resolve_url, playlist.url)
+        elif isinstance(playlist, PlaylistRef) and playlist.id.isdigit():
             data = self._get(f"playlists/{playlist.id}")
         else:
             key = playlist.url if isinstance(playlist, PlaylistRef) else _text(playlist)
