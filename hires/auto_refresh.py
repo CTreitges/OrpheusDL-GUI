@@ -30,7 +30,7 @@ class AutoRefresh:
 
     def __init__(
         self,
-        read: Callable[[], Optional[List[Any]]],
+        read: Callable[[bool], Optional[List[Any]]],
         is_done: Callable[[List[Any]], bool],
         dispatch: Callable[..., None],
         *,
@@ -40,7 +40,8 @@ class AutoRefresh:
     ):
         """
         Args:
-            read: blocking read of all statuses; ``None`` when it failed.
+            read: ``read(recheck)`` -- blocking read of the statuses; ``None``
+                when it failed. ``recheck`` is False for the first read.
             is_done: True when no further check is needed (all signed in).
             wait: ``wait(cancel_event, seconds) -> cancelled``.
             start_thread: runs the loop on a worker (daemon thread by default).
@@ -54,8 +55,6 @@ class AutoRefresh:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._generation = 0
-        #: Number of the re-check in progress (0 = the first read).
-        self.attempt = 0
 
     @property
     def limit(self) -> int:
@@ -91,34 +90,33 @@ class AutoRefresh:
         def current() -> bool:
             return not cancel.is_set() and generation == self._generation
 
+        def send(callback, *args) -> None:
+            """Dispatch, but drop it if this run is superseded by the time
+            the UI thread gets to it -- a callback already queued when
+            Refresh was pressed must not repaint over the new run."""
+            if callback is None or not current():
+                return
+            self._dispatch(lambda: callback(*args) if current() else None)
+
         def finished(statuses) -> bool:
             return bool(statuses) and self._is_done(statuses)
 
         def work() -> None:
-            self.attempt = 0
-            statuses = self._read()
-            if not current():
-                return
+            statuses = self._read(False)
             if statuses is not None:
-                self._dispatch(on_update, statuses)
+                send(on_update, statuses)
             attempt = 0
             while attempt < self.limit and not finished(statuses):
                 delay = self.delays[attempt]
                 attempt += 1
-                if on_waiting is not None:
-                    self._dispatch(on_waiting, attempt, self.limit, delay)
+                send(on_waiting, attempt, self.limit, delay)
                 if self._wait(cancel, delay) or not current():
                     return
-                self.attempt = attempt
-                if on_checking is not None:
-                    self._dispatch(on_checking, attempt, self.limit)
-                statuses = self._read()
-                if not current():
-                    return
+                send(on_checking, attempt, self.limit)
+                statuses = self._read(True)
                 if statuses is not None:
-                    self._dispatch(on_update, statuses)
-            if on_finished is not None and current():
-                self._dispatch(on_finished, finished(statuses), attempt)
+                    send(on_update, statuses)
+            send(on_finished, finished(statuses), attempt)
 
         return self._start_thread(work)
 

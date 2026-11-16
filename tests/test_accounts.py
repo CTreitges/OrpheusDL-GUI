@@ -522,6 +522,19 @@ class TestSoundCloudStatus:
         assert "expired" in status.detail
         assert FAKE_TOKEN not in all_text(status)
 
+    def test_soundcloud_offline_is_not_reported_as_an_expired_token(self, tmp_path):
+        """Review part 1, finding 3: a network error is not a dead token."""
+
+        def offline(_token):
+            raise ConnectionError("Max retries exceeded with url: /me")
+
+        provider = make_soundcloud_status_provider(
+            ProviderGui(tmp_path, token=FAKE_TOKEN), me_fetcher=offline
+        )
+        status = provider()
+        assert "expired" not in status.detail
+        assert "could not be checked" in status.detail and "ConnectionError" in status.detail
+
     def test_soundcloud_module_missing_is_unavailable(self, tmp_path):
         gui = ProviderGui(tmp_path, token=FAKE_TOKEN, modules=("tidal",))
         status = make_soundcloud_status_provider(gui)()

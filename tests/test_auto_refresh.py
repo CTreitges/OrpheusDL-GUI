@@ -126,6 +126,91 @@ class TestAutoRefreshSchedule:
         assert not ctrl.is_reading
 
 
+class TestAutoRefreshReviewFindings:
+    """Findings 2 and 4 of the part-1 review."""
+
+    def test_auto_refresh_rechecks_only_services_not_signed_in(self):
+        spotify_reads = []
+
+        def spotify():
+            spotify_reads.append(1)
+            return AccountStatus(service="Spotify", state=AccountState.SIGNED_IN)
+
+        tidal = statuses_from([AccountState.SIGNED_OUT])
+        ctrl = AccountsController(
+            tidal_status_provider=tidal,
+            spotify_status_provider=spotify,
+            dispatch=SyncDispatcher(),
+            auto_wait=FakeClock(),
+        )
+        wait(ctrl.start_auto_refresh(lambda _s: None))
+
+        assert len(tidal.reads) == 6
+        assert len(spotify_reads) == 1, "a signed-in service was asked again on every re-check"
+
+    def test_auto_refresh_queued_callbacks_of_a_superseded_run_are_dropped(self):
+        """What sits in the UI queue when Refresh is pressed must not paint."""
+        queued = []
+
+        def queueing_dispatch(fn, *args):
+            queued.append(lambda: fn(*args))
+
+        first_updates, second_updates = [], []
+        parked = threading.Event()
+
+        def clock(event, _seconds):
+            parked.set()
+            return event.wait(timeout=5)
+
+        refresher = AutoRefresh(
+            lambda _recheck: [AccountStatus(service="X", state=AccountState.SIGNED_OUT)],
+            lambda statuses: all(s.is_signed_in for s in statuses),
+            queueing_dispatch,
+            wait=clock,
+        )
+        first = refresher.start(first_updates.append)
+        assert parked.wait(timeout=5)
+        stale = list(queued)  # first run's update, not yet run by the UI
+        queued.clear()
+        parked.clear()
+
+        second = refresher.start(second_updates.append)
+        assert parked.wait(timeout=5)
+        for callback in stale + queued:
+            callback()
+        refresher.stop()
+        wait(first)
+        wait(second)
+
+        assert first_updates == [], "a superseded run repainted the tab"
+        assert len(second_updates) == 1
+
+    def test_auto_refresh_a_slow_stale_read_does_not_overwrite_a_newer_state(self):
+        hold = threading.Event()
+        in_second_read = threading.Event()
+        state = {"signed_in": False, "calls": 0}
+
+        def tidal():
+            state["calls"] += 1
+            if state["calls"] == 2:  # the first re-check, slow and stale
+                in_second_read.set()
+                hold.wait(timeout=5)
+                return AccountStatus(service="TIDAL", state=AccountState.SIGNED_OUT)
+            signed = AccountState.SIGNED_IN if state["signed_in"] else AccountState.SIGNED_OUT
+            return AccountStatus(service="TIDAL", state=signed)
+
+        ctrl = controller(tidal, FakeClock())
+        first = ctrl.start_auto_refresh(lambda _s: None)
+        assert in_second_read.wait(timeout=5)
+
+        state["signed_in"] = True  # the sign-in finished meanwhile ...
+        wait(ctrl.start_auto_refresh(lambda _s: None))  # ... and restarted the checks
+        hold.set()
+        wait(first)
+
+        assert ctrl.known_statuses()[0].is_signed_in, "the stale read overwrote the sign-in"
+
+
 class TestAutoRefreshRestart:
     def test_auto_refresh_refresh_restarts_the_count(self):
         """Refresh cancels the running schedule and starts again from zero."""
@@ -175,7 +260,7 @@ class TestAutoRefreshRestart:
         answers = [None, [AccountStatus(service="X", state=AccountState.SIGNED_IN)]]
         updates, done = [], []
         refresher = AutoRefresh(
-            lambda: answers.pop(0),
+            lambda _recheck: answers.pop(0),
             lambda statuses: all(s.is_signed_in for s in statuses),
             lambda fn, *args: fn(*args),
             wait=FakeClock(),

@@ -186,12 +186,20 @@ def make_soundcloud_status_provider(
             )
         try:
             me = fetch(token) or {}
-        except Exception:
-            # The exception text may quote the request; never show it.
+        except Exception as exc:
+            # The exception text may quote the request; never show it. Only
+            # decide from it whether the token itself was refused.
+            text = str(exc).lower()
+            if "401" in text or "unauthorized" in text:
+                return status(
+                    AccountState.SIGNED_OUT,
+                    "SoundCloud rejected the token — it has probably expired.",
+                    hint="Copy a fresh token from your browser into Settings > SoundCloud.",
+                )
             return status(
                 AccountState.SIGNED_OUT,
-                "SoundCloud rejected the token — it has probably expired.",
-                hint="Copy a fresh token from your browser into Settings > SoundCloud.",
+                f"Token set, but SoundCloud could not be checked ({type(exc).__name__}) — offline?",
+                hint="This is checked again automatically.",
             )
         go_plus, plan = soundcloud_plan(me)
         username = str(me.get("username") or "").strip()

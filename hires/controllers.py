@@ -338,6 +338,11 @@ class QueueController:
             if group.key in collapsed:
                 rows[group.key] = []
                 continue
+            if budget == 0:
+                # Nothing more fits; do not build rows only to throw them away.
+                hidden += group.total
+                rows[group.key] = []
+                continue
             group_rows = [self._row(items[item_id]) for item_id in group.item_ids]
             if len(group_rows) > budget:
                 group_rows.sort(key=lambda r: _DISPLAY_PRIORITY.get(r.status, 9))
@@ -971,8 +976,13 @@ class AccountsController:
         """
         return [self.status_for(service) for service in self.SERVICES]
 
-    def status_for(self, service: str) -> AccountStatus:
-        """Read one service's state. **Blocking** -- this can do HTTP."""
+    def status_for(self, service: str, remember: bool = True) -> AccountStatus:
+        """Read one service's state. **Blocking** -- this can do HTTP.
+
+        ``remember=False`` leaves the cached state alone: the automatic
+        re-check stores its result only once it is known to be current, so
+        a superseded, slow read cannot overwrite a newer sign-in result.
+        """
         provider = self._providers.get(service)
         try:
             if provider is None:
@@ -985,7 +995,8 @@ class AccountsController:
                 state=AccountState.UNAVAILABLE,
                 detail=_describe(exc),
             )
-        self._last[service] = status
+        if remember:
+            self._last[service] = status
         return status
 
     def known_statuses(self) -> List[AccountStatus]:
@@ -1049,10 +1060,24 @@ class AccountsController:
         return run_in_background(work, name="hires-accounts-status")
 
     # -- automatic re-checks ------------------------------------------------
-    def _read_for_auto_refresh(self) -> Optional[List[AccountStatus]]:
+    def _read_for_auto_refresh(self, recheck: bool) -> Optional[List[AccountStatus]]:
+        """All statuses; a re-check only asks the services not signed in.
+
+        A missing module or cookie file never turns into "Signed in" on its
+        own, so most starts run all five re-checks. Re-reading the signed-in
+        services each time would repeat their HTTP calls (Spotify's /me,
+        SoundCloud's /me) for nothing (review part 1, finding 2).
+        """
         self._begin_read(exclusive=False)
         try:
-            return self.statuses()
+            out = []
+            for service in self.SERVICES:
+                last = self._last.get(service)
+                if recheck and last is not None and last.is_signed_in:
+                    out.append(last)
+                else:
+                    out.append(self.status_for(service, remember=False))
+            return out
         except Exception:
             return None
         finally:
@@ -1063,8 +1088,18 @@ class AccountsController:
         return self.auto_refresh.limit
 
     def start_auto_refresh(self, on_update, **callbacks) -> threading.Thread:
-        """Read now, then re-check what is not signed in -- see :class:`AutoRefresh`."""
-        return self.auto_refresh.start(on_update, **callbacks)
+        """Read now, then re-check what is not signed in -- see :class:`AutoRefresh`.
+
+        Results are cached here, in the update callback, because AutoRefresh
+        only delivers it while its run is still the current one.
+        """
+
+        def update(statuses: List[AccountStatus]) -> None:
+            for status in statuses:
+                self._last[status.service] = status
+            on_update(statuses)
+
+        return self.auto_refresh.start(update, **callbacks)
 
     def stop_auto_refresh(self) -> None:
         self.auto_refresh.stop()

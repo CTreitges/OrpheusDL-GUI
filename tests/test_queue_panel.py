@@ -268,6 +268,33 @@ class TestAccountsAutoRefreshOnScreen:
         assert [t for t in shown if t.startswith("Checking")] == [f"Checking… ({n}/5)" for n in range(1, 6)]
         assert tab.refresh_button.cget("state") == "normal"
 
+    def test_auto_refresh_ends_when_the_tab_is_destroyed(self, root):
+        """Review part 1, finding 8: the worker must not outlive the tab."""
+        import threading as _threading
+
+        parked = _threading.Event()
+        cancelled = []
+
+        def clock(event, _seconds):
+            parked.set()
+            stopped = event.wait(timeout=5)
+            cancelled.append(stopped)
+            return stopped
+
+        controller = AccountsController(
+            tidal_status_provider=lambda: AccountStatus(service="TIDAL", state=AccountState.SIGNED_OUT),
+            spotify_status_provider=lambda: AccountStatus(service="Spotify", state=AccountState.SIGNED_OUT),
+            dispatch=UiDispatcher(root),
+            auto_wait=clock,
+        )
+        frame = customtkinter.CTkFrame(root)
+        frame.pack()
+        AccountsTab(frame, controller)
+        assert pump_until(root, parked.is_set)
+
+        frame.destroy()
+        assert pump_until(root, lambda: cancelled == [True]), "the re-check kept waiting after destroy"
+
     def test_auto_refresh_soundcloud_and_youtube_cards_explain_and_open_settings(self, root):
         opened = []
         controller = AccountsController(

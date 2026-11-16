@@ -924,6 +924,8 @@ class AccountsTab:
         self.repaint()
 
     def _on_read_failed(self, message: str) -> None:
+        if not self._alive():
+            return
         self._set_reading(False)
         self.repaint()
         self.summary_label.configure(text=message)
@@ -1005,11 +1007,14 @@ class AccountsTab:
 
     def _on_done(self, service: str) -> None:
         self._note(service, f"Signed in to {service}.", SUCCESS)
-        self.refresh()
+        # Restart the schedule rather than a single refresh: a refresh is
+        # refused while an automatic re-check reads, and that read may have
+        # started before the sign-in finished (review part 1, finding 1).
+        self.start_auto_refresh()
 
     def _on_error(self, service: str, message: str) -> None:
         self._note(service, message, ERROR)
-        self.refresh()
+        self.start_auto_refresh()
 
 
 # ---------------------------------------------------------------------------

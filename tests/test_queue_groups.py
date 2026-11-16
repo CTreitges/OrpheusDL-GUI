@@ -276,6 +276,20 @@ class TestClearAll:
         assert stops == []
         assert queue.list() == []
 
+    def test_clear_all_never_stops_a_user_download_that_followed_ours(self, queue):
+        """Review part 1, finding 5: our item ended, the user started another
+        download before the next poll -- that one must keep running."""
+        gui = FakeGui(output_path=None)
+        stops = []
+        gui.stop_download = lambda: stops.append(1)
+        runtime = HiresRuntime(gui, queue, logger=lambda _line: None)
+        queue.add_many(playlist("A", 1))
+        runtime._pump()  # ours runs
+        gui._active_download_thread = object()  # the user's download now
+
+        assert runtime.stop_active() is False
+        assert stops == []
+
     def test_clear_all_runtime_never_stops_a_download_it_did_not_start(self, queue):
         gui = FakeGui()
         gui.stop_download = lambda: gui.stop_event.set()

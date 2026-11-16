@@ -250,6 +250,10 @@ class HiresRuntime:
         with self._lock:
             if self._active_id is None:
                 return False
+            # Our item may be over already while the GUI runs a download the
+            # user started; the next poll would notice. Never stop that one.
+            if self._gui_started_another_download():
+                return False
         stopper = getattr(self.gui, "stop_download", None)
         if callable(stopper):
             stopper()
