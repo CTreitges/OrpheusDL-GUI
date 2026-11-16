@@ -8401,7 +8401,7 @@ def load_settings():
                     },
                     "youtube": {
                         "cookies_path": "./config/youtube-cookies.txt",
-                        "download_pause_seconds": 5,
+                        "download_pause_seconds": 10,
                         "download_mode": "sequential"
                     }
                 }
@@ -20042,7 +20042,7 @@ if __name__ == "__main__":
                     "quality": "hifi",
                     "search_limit": 25,
                     "disabled_search_platforms": [],
-                    "concurrent_downloads": 5,
+                    "concurrent_downloads": 3,
                     "play_sound_on_finish": True,
                     "minimize_to_tray": False,
                     "throttle_batch_size": 0,
@@ -20130,7 +20130,7 @@ if __name__ == "__main__":
                     "force_login": False,
                 },
                 "LRCLIB": {},
-                "YouTube": { "cookies_path": "./config/youtube-cookies.txt", "download_pause_seconds": 5, "download_mode": "sequential" }
+                "YouTube": { "cookies_path": "./config/youtube-cookies.txt", "download_pause_seconds": 10, "download_mode": "sequential" }
             }
         }
         installed_platform_keys = []
