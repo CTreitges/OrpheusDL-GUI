@@ -211,7 +211,8 @@ class PortTab:
         if not target.available or not target.can_search:
             hints.append(f"{target.service}: {target.hint or 'cannot be searched.'}")
         self.hint_label.configure(text="\n".join(hints))
-        self.mine_button.configure(state="normal" if source.can_list_own or source.service == "Spotify" else "disabled")
+        # "My playlists" stays usable: a module that loads late would leave a
+        # disabled button dead. The hint says what is missing.
 
     # -- loading ------------------------------------------------------------
     def load_playlists(self) -> None:
@@ -304,6 +305,7 @@ class PortTab:
     def _on_error(self, message: str) -> None:
         self.progress.set(0)
         self.status_label.configure(text=message, text_color=ERROR)
+        self.controller.read_statuses(self._on_statuses)  # the hint may be stale
 
     # -- queueing -----------------------------------------------------------
     def queue_confident(self) -> None:

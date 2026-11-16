@@ -215,11 +215,11 @@ class TestPlaylistsTabWidgets:
         tab = result["tabs"]["playlists"]
         assert tab.service == "TIDAL"
         assert pump_until(window, lambda: "TIDAL" in tab.hint_label.cget("text"))
-        assert tab.load_button.cget("state") == "disabled"
+        assert tab.load_button.cget("state") == "normal"  # stays usable; the hint explains
 
         tab.set_service("YouTube")
         assert pump_until(window, lambda: tab.hint_label.cget("text") != "")
-        assert tab.load_button.cget("state") == "disabled"
+        assert tab.load_button.cget("state") == "normal"  # stays usable; the hint explains
         assert "YouTube" in tab.list._message.cget("text") if hasattr(tab.list, "_message") else True
 
     def test_playlists_tab_queues_picked_tracks_as_one_group(self, window, tmp_path):
@@ -250,3 +250,17 @@ class TestPlaylistsTabWidgets:
         tab.set_service("SoundCloud")
         tab._on_loaded("YouTube", FolderRef(playlists=[PlaylistRef(id="x", name="Stale")]))
         assert tab.list.playlists == []
+
+    def test_playlists_tab_works_once_a_late_module_has_loaded(self, window, tmp_path):
+        """TIDAL often loads after the window: My playlists must not stay dead."""
+        _view, result = assemble(window, tmp_path)
+        tab = result["tabs"]["playlists"]
+        assert pump_until(window, lambda: "TIDAL" in tab.hint_label.cget("text"))
+        assert tab.load_button.cget("state") == "normal"
+
+        late = FakeService("TIDAL")  # the module has loaded meanwhile
+        tab.controller.providers["TIDAL"] = lambda: late
+        tab.controller.browsers["TIDAL"].library_provider = lambda: late
+        tab.load_button.invoke()
+        assert pump_until(window, lambda: len(tab.list.playlists) == 1)
+        assert pump_until(window, lambda: tab.hint_label.cget("text") == "")

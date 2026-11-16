@@ -33,6 +33,12 @@ REQUEST_INTERVAL = 1.0
 #: Pages followed for the user's own playlists (200 per page).
 MAX_PAGES = 10
 
+#: Why a Go+ track is never queued without asking (SoundCloud policy SNIP).
+PREVIEW_REASON = "Go+ only: without Go+ this downloads a 30 s preview"
+
+#: Tracks fetched per call when completing a playlist's stub entries.
+TRACK_BATCH = 50
+
 NOT_SIGNED_IN_HINT = (
     "Links and search work without a login. To list your own playlists, enter "
     "your SoundCloud token under Settings > SoundCloud."
@@ -86,6 +92,10 @@ def track_from_json(data: Any) -> Optional[TrackRef]:
             title = title[len(prefix):].strip()
     else:
         artists, title = split_artist_title(title, uploader)
+    extra: Dict[str, Any] = {}
+    playable, full = data.get("duration") or 0, data.get("full_duration") or 0
+    if data.get("policy") == "SNIP" or (playable and full and playable < full - 1000):
+        extra["review_reason"] = PREVIEW_REASON
     return TrackRef(
         id=str(data["id"]),
         title=title,
@@ -96,6 +106,7 @@ def track_from_json(data: Any) -> Optional[TrackRef]:
         url=_text(data.get("permalink_url")),
         image_url=_text(data.get("artwork_url")),
         platform=SERVICE,
+        extra=extra,
     )
 
 
@@ -188,6 +199,12 @@ class SoundCloudProvider(PlaylistProvider):
                 raise RateLimitedError(
                     "SoundCloud is limiting requests (HTTP 429). Stopped; try again later."
                 ) from exc
+            if fn == getattr(self.api, "search", None) and message.startswith("This track is not available"):
+                # The module turns every 403 into this text. A search is never
+                # "restricted": a 403 here is SoundCloud's bot check.
+                raise RateLimitedError(
+                    "SoundCloud refused a search (403), probably a bot check. Stopped; try again later."
+                ) from exc
             unauthorized = message.startswith("401") or "unauthorized" in lowered
             if unauthorized and not self._has_token() and self._refresh_client_id():
                 return self._call(fn, *args)
@@ -258,12 +275,20 @@ class SoundCloudProvider(PlaylistProvider):
     def get_playlist_tracks(self, playlist: Any) -> List[TrackRef]:
         data = self._playlist_json(playlist)
         entries = [t for t in (data.get("tracks") or []) if isinstance(t, dict) and t.get("id")]
-        if any("title" not in t for t in entries):
-            # Big playlists only carry full objects for the first few tracks;
-            # the module's helper fetches the rest 50 at a time, in order.
-            full = self._call(self.api.get_tracks_from_tracklist, entries)
-            entries = list(full.values()) if isinstance(full, dict) else entries
-        return [t for t in (track_from_json(e) for e in entries) if t is not None]
+        stubs = [str(t["id"]) for t in entries if "title" not in t]
+        if stubs:
+            # Big playlists only carry full objects for the first few tracks.
+            # Fetched here, paced, 50 at a time: the module's helper raises
+            # KeyError for a deleted track and makes the playlist unreadable.
+            full: Dict[str, Any] = {}
+            for start in range(0, len(stubs), TRACK_BATCH):
+                batch = self._get("tracks", {"ids": ",".join(stubs[start:start + TRACK_BATCH])})
+                for item in batch if isinstance(batch, list) else []:
+                    if isinstance(item, dict) and item.get("id"):
+                        full[str(item["id"])] = item
+            # Gone or private tracks are simply missing from the answer.
+            entries = [t if "title" in t else full.get(str(t["id"])) for t in entries]
+        return [t for t in (track_from_json(e) for e in entries if e) if t is not None]
 
     def owns_url(self, url: str) -> bool:
         return "soundcloud.com/" in (url or "").lower()

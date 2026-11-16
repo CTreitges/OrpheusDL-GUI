@@ -177,10 +177,17 @@ class PlaylistsTab:
         self.controller.read_status(service, self._on_status)
 
     def _on_status(self, status: ProviderStatus) -> None:
+        # The button stays usable on purpose: TIDAL usually loads after the
+        # window, and a button disabled at that moment stayed dead until the
+        # user switched services. The hint says what is missing; a click
+        # re-reads it.
         if status.service != self.service:
             return  # the user has moved on to another service
         self.hint_label.configure(text=status.hint or "")
-        self.load_button.configure(state="normal" if status.can_list_own else "disabled")
+
+    def _recheck(self, service: str) -> None:
+        if service == self.service:
+            self.controller.read_status(service, self._on_status)
 
     # -- selection ----------------------------------------------------------
     def _on_select(self, playlist: PlaylistRef) -> None:
@@ -229,12 +236,14 @@ class PlaylistsTab:
             summary = f"{_count_label(len(root.folders), 'folder')} · {summary}"
         self.status_label.configure(text=summary, text_color=SECONDARY_TEXT)
         self._on_check()
+        self._recheck(service)
 
     def _on_error(self, service: str, message: str) -> None:
         if service != self.service:
             return
         self.list.set_message(message, color=ERROR)
         self.status_label.configure(text="Failed", text_color=ERROR)
+        self._recheck(service)
 
     def open_link(self) -> None:
         service = self.service

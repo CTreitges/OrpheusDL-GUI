@@ -84,7 +84,8 @@ def track_from_entry(entry: Any) -> Optional[TrackRef]:
 def _raise_for(exc: Exception) -> None:
     message = str(exc)
     lowered = message.lower()
-    if "429" in message or "too many requests" in lowered or "not a bot" in lowered or "captcha" in lowered:
+    blocked = ("429", "too many requests", "not a bot", "captcha", "rate-limit", "rate limit", "try again later")
+    if any(word in lowered for word in blocked):
         raise RateLimitedError(
             "YouTube is limiting requests (HTTP 429 or bot check). Stopped; try again later."
         ) from exc

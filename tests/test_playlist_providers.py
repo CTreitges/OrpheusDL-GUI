@@ -209,9 +209,11 @@ class TestTidalPlaylistProvider:
 
     def test_search_and_isrc_reach_the_library_and_items_stay_hi_res(self):
         library = FakeLibrary()
-        provider = TidalProvider(library)
+        pacer = NoWait()
+        provider = TidalProvider(library, pacer=pacer)
         provider.search_tracks("daft punk", limit=10)
         provider.find_by_isrc("USQX91300108")
+        assert pacer.calls == 2, "TIDAL lookups must be paced"
         assert ("search", "daft punk", 10) in library.calls and ("isrc", "USQX91300108") in library.calls
         assert provider.quality == "hifi"
         assert provider.status().can_list_own
@@ -412,6 +414,9 @@ class FakeSoundCloudApi:
                 "collection": [{"id": 7, "title": "Warm up", "track_count": 3, "permalink_url": "https://soundcloud.com/dj/sets/warm-up"}],
                 "next_href": "https://evil.example.com/steal",
             }
+        if path == "tracks":  # api-v2 tracks?ids=: full objects for stub entries
+            ids = [i for i in str((params or {}).get("ids", "")).split(",") if i]
+            return [{"id": int(i), "title": f"Track {i}", "duration": 1000} for i in ids]
         return fixture("soundcloud_resolve_playlist")
 
 
@@ -439,7 +444,7 @@ class TestSoundCloudPlaylistProvider:
         api = StubApi()
         tracks = SoundCloudProvider(api, pacer=NoWait()).get_playlist_tracks("https://soundcloud.com/a/sets/b")
         assert [t.title for t in tracks][1:] == ["Track 1", "Track 2"]
-        assert ("tracklist", 3) in api.calls
+        assert api.calls.count(("get", "tracks")) == 1, "stubs must be fetched in one batch"
 
     def test_recorded_search_maps_tracks(self):
         api = FakeSoundCloudApi()

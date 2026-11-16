@@ -38,6 +38,7 @@ from .models import (
     MatchMethod,
     MatchResult,
     RateLimitedError,
+    RunCancelled,
     TrackRef,
 )
 
@@ -498,7 +499,20 @@ class TrackMatcher:
 
     # -- public -------------------------------------------------------------
     def match(self, source: TrackRef) -> MatchResult:
-        """Best TIDAL track for ``source``, plus what to do with it."""
+        """Best target track for ``source``, plus what to do with it.
+
+        A candidate whose provider set ``extra["review_reason"]`` (a SoundCloud
+        Go+ track that only plays as a 30 s preview without Go+) is never
+        accepted on its own, however well it scores.
+        """
+        result = self._match(source)
+        reason = (result.best.track.extra or {}).get("review_reason") if result.best else None
+        if reason and result.decision == MatchDecision.AUTO_ACCEPT.value:
+            result.decision = MatchDecision.NEEDS_REVIEW.value
+            result.best.reasons.append(reason)
+        return result
+
+    def _match(self, source: TrackRef) -> MatchResult:
         notes: List[str] = []
 
         isrc = (getattr(source, "isrc", None) or "").strip()
@@ -558,6 +572,8 @@ class TrackMatcher:
             if progress_callback is not None:
                 try:
                     progress_callback(index, total, result)
+                except RunCancelled:
+                    raise  # cancelled or superseded: stop searching now
                 except Exception:
                     # A broken progress display must never stop a conversion.
                     pass

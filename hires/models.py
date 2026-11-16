@@ -489,6 +489,15 @@ class PlaylistNotFoundError(SourceUnavailableError):
     """Raised when a playlist is gone or private. Its text is meant for the user."""
 
 
+class RunCancelled(HiresError):
+    """A conversion was cancelled or superseded by a newer one.
+
+    The matcher passes exactly this on (and swallows anything else a progress
+    display raises), so a cancelled port stops searching instead of finishing
+    in the background.
+    """
+
+
 class RateLimitedError(SourceUnavailableError):
     """A service answered HTTP 429 or asked for a captcha.
 

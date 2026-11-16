@@ -34,6 +34,8 @@ from .models import (
     PlaylistRef,
     QueueItem,
     QueueStatus,
+    RateLimitedError,
+    RunCancelled,
     TrackRef,
     flat_root,
 )
@@ -449,7 +451,12 @@ class TidalBrowserController:
                 library = self.library_provider()
                 if library is None:
                     raise HiresError(f"{self.service} module not available.")
-                tracks = library.get_playlist_tracks(playlist.id)
+                # TIDAL's library wants the id; the other providers read a
+                # playlist through its link (SoundCloud answers playlists/<id>
+                # with 401 without a login).
+                tracks = library.get_playlist_tracks(
+                    playlist.id if self.service == "TIDAL" else playlist
+                )
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
@@ -743,13 +750,18 @@ class SpotifyImportController:
 
                 def progress(done, total, result, _i=index):
                     if cancel.is_set() or not self._is_current(generation):
-                        raise HiresError("Conversion cancelled")
+                        raise RunCancelled("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
                 try:
                     report = converter.convert(playlist, progress_callback=progress)
                     if enqueue:
                         converter.enqueue(report, include_review=False)
+                except RateLimitedError as exc:
+                    # The service said stop: the next playlist would only
+                    # make a block likelier. Reports done so far stay queued.
+                    failures.append(_describe(exc))
+                    break
                 except HiresError as exc:
                     if cancel.is_set():
                         break
@@ -794,7 +806,7 @@ class SpotifyImportController:
 
                 def progress(done, total, result):
                     if cancel.is_set() or not self._is_current(generation):
-                        raise HiresError("Conversion cancelled")
+                        raise RunCancelled("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
                 report = converter.convert(playlist, progress_callback=progress)

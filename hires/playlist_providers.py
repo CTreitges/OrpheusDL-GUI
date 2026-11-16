@@ -37,6 +37,13 @@ from .quality import HIRES
 #: The four services of this suite, in the order the tabs show them.
 SERVICES: Tuple[str, ...] = ("Spotify", "TIDAL", "YouTube", "SoundCloud")
 
+#: Tier pinned on queue items found on a service; others leave it to the GUI.
+TARGET_QUALITY = {"TIDAL": HIRES}
+
+#: Seconds between two TIDAL catalogue calls: streamrip's default of 60
+#: requests per minute (W/research-delays.md).
+TIDAL_REQUEST_INTERVAL = 1.0
+
 
 def port_directions(services: Sequence[str] = SERVICES) -> List[Tuple[str, str]]:
     """Every (source, target) pair with two different services -- 12 for 4."""
@@ -211,10 +218,11 @@ class TidalProvider(PlaylistProvider):
     """:class:`hires.tidal_library.TidalLibrary` behind the common interface."""
 
     service = "TIDAL"
-    quality = HIRES
+    quality = TARGET_QUALITY["TIDAL"]
 
-    def __init__(self, library: Any):
+    def __init__(self, library: Any, *, pacer: Optional[Pacer] = None):
         self.library = library
+        self.pacer = pacer or Pacer(TIDAL_REQUEST_INTERVAL)
 
     def status(self) -> ProviderStatus:
         return ProviderStatus(self.service, can_list_own=True)
@@ -256,9 +264,11 @@ class TidalProvider(PlaylistProvider):
         return "tidal.com" in (url or "").lower()
 
     def search_tracks(self, query: str, limit: int = 10) -> List[TrackRef]:
+        self.pacer.wait()
         return self.library.search_tracks(query, limit=limit)
 
     def find_by_isrc(self, isrc: str) -> List[TrackRef]:
+        self.pacer.wait()
         return self.library.find_by_isrc(isrc)
 
 

@@ -18,7 +18,7 @@ from .controllers import SpotifyImportController, UiDispatcher, _describe, run_i
 from .converter import PlaylistConverter
 from .matcher import TrackMatcher
 from .models import ConversionReport, HiresError, QueueItem
-from .playlist_providers import SERVICES, ProviderStatus, port_directions
+from .playlist_providers import SERVICES, TARGET_QUALITY, ProviderStatus, port_directions
 from .playlists_controller import provider_status
 
 MatcherFactory = Callable[[Any, str], Any]
@@ -122,8 +122,20 @@ class PortController(SpotifyImportController):
         )
 
     def _converter_for(self, report: ConversionReport) -> PlaylistConverter:
-        """Queue a report in the direction that produced it."""
-        return self._build_converter((report.source_service, report.target_service))
+        """Queue a report in the direction that produced it.
+
+        Queueing needs neither service: no provider is built (building the
+        TIDAL one can load the module, and this runs on the UI thread).
+        """
+        return PlaylistConverter(
+            None,
+            None,
+            self.queue,
+            quality=TARGET_QUALITY.get(report.target_service),
+            output_root=self.output_provider(),
+            source_name=report.source_service,
+            target_name=report.target_service,
+        )
 
     def apply_review_and_enqueue(
         self,
@@ -148,7 +160,20 @@ class PortController(SpotifyImportController):
 
     # -- listing ------------------------------------------------------------
     def load_playlists(self, on_done, on_error, on_status=None) -> threading.Thread:
-        """The source's own playlists. Spotify keeps its sign-in-on-demand."""
+        """The source's own playlists. Spotify keeps its sign-in-on-demand.
+
+        An answer that arrives after the direction changed is dropped: shown
+        under the new source, a click would port the wrong service's playlist.
+        """
+        direction = self.direction
+
+        def still(callback):
+            def deliver(*args):
+                if self.direction == direction:
+                    callback(*args)
+            return deliver
+
+        on_done, on_error = still(on_done), still(on_error)
         if self.source_service == "Spotify":
             return super().load_playlists(on_done, on_error, on_status=on_status)
         service = self.source_service
@@ -160,7 +185,8 @@ class PortController(SpotifyImportController):
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
-            self.playlists = root.all_playlists()
+            if self.direction == direction:
+                self.playlists = root.all_playlists()
             self.dispatch(on_done, root)
 
         return run_in_background(work, name="hires-port-playlists")

@@ -19,6 +19,7 @@ from .models import (
     FolderRef,
     HiresError,
     PlaylistRef,
+    RateLimitedError,
     SourceUnavailableError,
     TrackRef,
     flat_root,
@@ -147,6 +148,18 @@ def _cover_id(data: Dict[str, Any]) -> Any:
         or data.get("cover")
         or data.get("picture")
     )
+
+
+TIDAL_RATE_LIMITED = "TIDAL is limiting requests (HTTP 429). Stopped; try again later."
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """HTTP 429 from TIDAL, however the module wrapped it."""
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 429:
+        return True
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text
 
 
 def _is_error_payload(data: Dict[str, Any]) -> bool:
@@ -527,21 +540,33 @@ class TidalLibrary:
         try:
             data = _as_dict(self.api.get_search_data(query, limit=limit))
         except Exception as exc:
+            if _is_rate_limited(exc):
+                raise RateLimitedError(TIDAL_RATE_LIMITED) from exc
             raise SourceUnavailableError(f"TIDAL search for {query!r} failed: {exc}") from exc
+        if _int_or_none(data.get("status")) == 429:
+            raise RateLimitedError(TIDAL_RATE_LIMITED)
 
         items = _as_list(_as_dict(data.get("tracks")).get("items"))
         tracks = [_track_from_json(i) for i in items]
         return [t for t in tracks if t.id]
 
     def find_by_isrc(self, isrc: str) -> List[TrackRef]:
-        """Tracks with this ISRC. Never raises - an unknown ISRC yields ``[]``."""
+        """Tracks with this ISRC; an unknown ISRC yields ``[]``.
+
+        Raises only :class:`RateLimitedError` -- a 429 must stop a port, not
+        turn every remaining track into "no ISRC hit".
+        """
         code = _text(isrc).upper()
         if not code:
             return []
         try:
             data = _as_dict(self.api.get_tracks_by_isrc(code))
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                raise RateLimitedError(TIDAL_RATE_LIMITED) from exc
             return []
+        if _int_or_none(data.get("status")) == 429:
+            raise RateLimitedError(TIDAL_RATE_LIMITED)
         if _is_error_payload(data):
             return []
         tracks = [_track_from_json(i) for i in _as_list(data.get("items"))]
