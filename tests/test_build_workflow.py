@@ -53,6 +53,25 @@ def test_windows_zip_contains_the_update_script():
     assert 'cp "installer/windows/Update OrpheusDL.cmd" dist/' in _workflow()
 
 
+def test_second_test_version_is_never_built_for_a_tag():
+    """Review PR #3: on a tag the release job attaches artifacts/**/* -- a
+    second ZIP with the same name and another baked version must not exist."""
+    text = _workflow()
+    guard = "inputs.second_version != '' && !startsWith(github.ref, 'refs/tags/')"
+    for step in ("- name: Build second version", "- name: Upload second version"):
+        block = text[text.index(step):]
+        assert guard in block.split("\n      - name:")[0], step
+
+
+def test_update_script_failure_text_claims_nothing():
+    """Review PR #3: exit 1 can mean 'EXE updated, modules not' -- the console
+    must not say that nothing was replaced; the message window tells."""
+    with open(SCRIPT, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "nothing was replaced" not in text.lower()
+    assert "The message window said what happened" in text
+
+
 def test_update_script_only_calls_the_new_exe():
     """One code path: the script hands everything to the EXE (--install-into)."""
     with open(SCRIPT, "rb") as handle:

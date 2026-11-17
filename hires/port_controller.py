@@ -64,8 +64,8 @@ class PortController(SpotifyImportController):
         )
         self.providers = dict(providers)
         self.matcher_factory = matcher_factory or _default_matcher
-        #: id(report) -> (report, source ids already queued from it).
-        self._queued: Dict[int, Tuple[ConversionReport, set]] = {}
+        #: (report, source ids already queued from it) -- the latest report only.
+        self._queued: Optional[Tuple[ConversionReport, set]] = None
         self.source_service = "Spotify"
         self.target_service = "TIDAL"
 
@@ -168,11 +168,9 @@ class PortController(SpotifyImportController):
         queued -- and downloaded -- a second time with the reviewed ones.
         Same playlist, same start time: the remainder joins the same group.
         """
-        entry = self._queued.get(id(report))
-        if entry is None or entry[0] is not report:
-            entry = (report, set())
-            self._queued[id(report)] = entry
-        done = entry[1]
+        if self._queued is None or self._queued[0] is not report:
+            self._queued = (report, set())
+        done = self._queued[1]
         fresh = ConversionReport(
             playlist=report.playlist,
             results=[r for r in report.results if r.source.id not in done],

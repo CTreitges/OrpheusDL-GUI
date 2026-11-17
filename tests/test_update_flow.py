@@ -191,12 +191,52 @@ class TestInstalling:
         def refuse(app_dir, staged, exe_name):
             raise su.UpdateError("no write access to the program folder (PermissionError)")
 
+        (tmp_path / "OrpheusDL_GUI.exe").write_bytes(b"MZ old")
         h.controller._swap = refuse
         h.controller.check_now()
         h.controller.accept()
         assert h.quit == 0
         assert "no write access" in h.view.events[-1][1]
         assert not h.staged.exists()
+
+    def test_swap_failure_without_exe_keeps_the_new_one(self, tmp_path):
+        """Review PR #3: swap_exe keeps .new.exe when neither EXE is in place
+        and says to rename it -- the flow must not delete it, nor claim that
+        nothing was replaced."""
+        h = Harness(tmp_path)
+
+        def half_done(app_dir, staged, exe_name):
+            raise su.UpdateError("the previous program is OrpheusDL_GUI.old.exe and the new one "
+                                 "OrpheusDL_GUI.new.exe -- rename one of them to OrpheusDL_GUI.exe")
+
+        h.controller._swap = half_done
+        h.controller.check_now()
+        h.controller.accept()
+        assert h.staged.exists(), "the only complete new program stays"
+        assert h.view.events[-1][0] == "failed"
+        assert "rename one of them" in h.view.events[-1][1]
+        assert "Nothing was replaced" not in h.view.events[-1][1]
+        assert h.quit == 0 and h.held[-1] is False
+
+    def test_progress_after_cancel_opens_no_window(self, tmp_path):
+        """Review PR #3: progress dispatches still queued after Cancel must not
+        open a fresh 'Downloading' dialog that nothing closes."""
+        h = Harness(tmp_path)
+        h.controller.check_now()
+        workers, queued = [], []
+        h.controller._run_worker = workers.append            # the download runs "later"
+        h.controller._dispatch = lambda fn, *a: queued.append((fn, a))
+        assert h.controller.accept()
+        h.controller.cancel()                                 # closes the view
+        assert h.controller.view is None
+        h.view.events.clear()
+        opened = []
+        h.controller._view_factory = lambda: opened.append(1) or h.view
+        workers[0]()                                          # worker reads more blocks
+        for fn, args in queued:                               # main thread drains the queue
+            fn(*args)
+        assert opened == [] and h.view.events == []
+        assert h.swapped == [] and not h.staged.exists()
 
     def test_restart_failure_keeps_the_app_open(self, tmp_path):
         h = Harness(tmp_path, restart_error=OSError("blocked"))

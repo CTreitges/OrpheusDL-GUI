@@ -294,6 +294,44 @@ class TestRefreshModules:
         assert (app / "modules" / "spotify" / "interface.py").read_text() == "# old spotify"
         assert su.read_marker(str(app)) == ""
 
+    def test_failed_copy_rolls_back_every_module(self, app, bundle, monkeypatch):
+        """Review PR #3: modules renewed before the failing one go back too --
+        no untested old/new mix, no new backup folder on every start."""
+        before = tree_hash(app / "modules")
+        real = su.shutil.copytree
+
+        def flaky(src, dst, *a, **k):
+            if os.path.basename(src) == "spotify":
+                raise OSError("disk full")
+            return real(src, dst, *a, **k)
+
+        monkeypatch.setattr(su.shutil, "copytree", flaky)
+        for _ in range(2):  # two starts in a row
+            with pytest.raises(su.UpdateError, match="spotify"):
+                su.refresh_modules(str(app), str(bundle / "modules"), NEW_VERSION)
+        assert tree_hash(app / "modules") == before
+        assert list(app.glob("modules.backup-*")) == []
+
+    def test_half_removed_module_is_not_nested(self, app, bundle, monkeypatch):
+        """Review PR #3: when the half copy cannot be removed, the old module
+        must not end up inside it as modules/tidal/tidal."""
+        real = su.shutil.copytree
+
+        def partial(src, dst, *a, **k):
+            if os.path.basename(src) == "tidal":
+                os.makedirs(dst)
+                Path(dst, "locked.py").write_text("half")
+                raise OSError("locked")
+            return real(src, dst, *a, **k)
+
+        monkeypatch.setattr(su.shutil, "copytree", partial)
+        monkeypatch.setattr(su.shutil, "rmtree", lambda path, ignore_errors=False: None)
+        with pytest.raises(su.UpdateError, match="tidal"):
+            su.refresh_modules(str(app), str(bundle / "modules"), NEW_VERSION)
+        assert not (app / "modules" / "tidal" / "tidal").exists()
+        backups = list(app.glob("modules.backup-*"))
+        assert backups and (backups[0] / "tidal" / "interface.py").read_text() == "# old tidal"
+
     def test_on_start_runs_once_per_version(self, app, bundle):
         assert su.refresh_modules_on_start(str(app), str(bundle), NEW_VERSION) is not None
         assert su.refresh_modules_on_start(str(app), str(bundle), NEW_VERSION) is None
@@ -330,6 +368,29 @@ class TestInstallInto:
         assert (app / "modules" / "mymodule" / "interface.py").read_text() == "# old mymodule"
         assert protected_hash(app) == before
         assert before["config"], "fixture must really have config files"
+
+    def test_different_sizes_skip_hashing(self, app, bundle, tmp_path, monkeypatch):
+        """Review PR #3: EXEs of different size are different -- no 2 x 150 MB hash."""
+        assert len(NEW_EXE_BYTES) != len(OLD_EXE_BYTES)
+        hashed = []
+        real = su.sha256_file
+        monkeypatch.setattr(su, "sha256_file", lambda p: hashed.append(p) or real(p))
+        result = su.install_into(str(app), own_exe=str(self._new_exe(tmp_path)), bundle_dir=str(bundle),
+                                 new_version=NEW_VERSION, is_running=lambda: False)
+        assert result.code == su.EXIT_OK, result.message
+        assert hashed == []
+
+    def test_unreadable_new_exe_is_a_clear_failure(self, app, bundle, tmp_path, monkeypatch):
+        """Review PR #3: the EXE comparison runs inside the error handling."""
+        def denied(path):
+            raise PermissionError(13, "denied", path)
+
+        monkeypatch.setattr(su.os.path, "getsize", denied)
+        result = su.install_into(str(app), own_exe=str(self._new_exe(tmp_path)), bundle_dir=str(bundle),
+                                 new_version=NEW_VERSION, is_running=lambda: False)
+        assert result.code == su.EXIT_FAILED
+        assert "PermissionError" in result.message and str(tmp_path) not in result.message
+        assert (app / "OrpheusDL_GUI.exe").read_bytes() == OLD_EXE_BYTES
 
     def test_wrong_folder_changes_nothing(self, tmp_path, bundle):
         """N6: no OrpheusDL_GUI.exe + config/ -> refused, not a single file written."""
@@ -544,6 +605,10 @@ class TestGuiWiring:
 
     def test_update_check_replaces_the_stock_check_and_waits_for_the_main_loop(self, main_block):
         assert "run_check_in_thread(__version__, app)" not in main_block, "stock check asks bascurtiz releases"
+        # Deliberately no fallback to it either (review PR #3): it would offer
+        # the releases of another repo. Its import is gone with it.
+        source = (Path(__file__).resolve().parents[1] / "gui.py").read_text(encoding="utf-8")
+        assert "from update_checker import run_check_in_thread" not in source
         assert "app.after(4000, _hires_updater.start_auto)" in main_block
         assert "add_check_button(mid_inner, _hires_updater)" in main_block
 

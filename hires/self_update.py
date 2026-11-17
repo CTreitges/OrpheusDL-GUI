@@ -292,12 +292,34 @@ def _backup_dir(app_dir: str, label: str) -> str:
     return path
 
 
+def _roll_back_modules(done: List[tuple], backup: str) -> None:
+    """Undo ``refresh_modules`` for ``done`` = [(dst, moved)], newest first.
+
+    A module whose new copy cannot be removed stays in the backup folder
+    (moving it into the half copy would nest it as modules/<name>/<name>).
+    The backup folder goes when it is empty again.
+    """
+    for dst, moved in reversed(done):
+        shutil.rmtree(dst, ignore_errors=True)
+        if moved and not os.path.exists(dst):
+            try:
+                shutil.move(moved, dst)
+            except OSError:
+                pass  # stays in the backup folder
+    if backup:
+        try:
+            os.rmdir(backup)
+        except OSError:
+            pass  # not empty: it still holds what could not go back
+
+
 def refresh_modules(app_dir: str, bundled: str, new_version: str) -> ModuleRefresh:
     """Replace every bundled module in ``app_dir/modules`` with the new one.
 
     Old copies move to ``modules.backup-<old version>/``; modules the bundle
-    does not ship (the user's own) are left alone. A module that fails to copy
-    is put back from the backup before the error is raised.
+    does not ship (the user's own) are left alone. All or nothing: when one
+    module fails, every module touched so far is put back from the backup
+    before the error is raised (no old/new mix, no new backup per start).
     """
     result = ModuleRefresh()
     if not os.path.isdir(bundled):
@@ -309,25 +331,29 @@ def refresh_modules(app_dir: str, bundled: str, new_version: str) -> ModuleRefre
     os.makedirs(modules, exist_ok=True)
     old_label = read_marker(app_dir) or f"before-{short_label(new_version)}"
     backup = ""
+    done: List[tuple] = []  # (dst, moved) of every module touched so far
     for name in names:
         dst = os.path.join(modules, name)
         moved = ""
-        if os.path.exists(dst):
-            if not backup:
-                backup = _backup_dir(app_dir, old_label)
-                os.makedirs(backup)
-            moved = os.path.join(backup, name)
-            try:
-                shutil.move(dst, moved)
-            except OSError as exc:
-                raise UpdateError(f"module {name} is in use ({type(exc).__name__})") from None
         try:
-            shutil.copytree(os.path.join(bundled, name), dst)
-        except OSError as exc:
-            shutil.rmtree(dst, ignore_errors=True)
-            if moved:
-                shutil.move(moved, dst)
-            raise UpdateError(f"module {name} could not be copied ({type(exc).__name__})") from None
+            if os.path.exists(dst):
+                if not backup:
+                    backup = _backup_dir(app_dir, old_label)
+                    os.makedirs(backup)
+                moved = os.path.join(backup, name)
+                try:
+                    shutil.move(dst, moved)
+                except OSError as exc:
+                    moved = ""
+                    raise UpdateError(f"module {name} is in use ({type(exc).__name__})") from None
+            done.append((dst, moved))
+            try:
+                shutil.copytree(os.path.join(bundled, name), dst)
+            except OSError as exc:
+                raise UpdateError(f"module {name} could not be copied ({type(exc).__name__})") from None
+        except UpdateError:
+            _roll_back_modules(done, backup)
+            raise
         (result.replaced if moved else result.added).append(name)
     with open(os.path.join(modules, MARKER), "w", encoding="utf-8") as handle:
         handle.write(new_version)
@@ -486,6 +512,15 @@ class InstallResult:
     message: str
 
 
+def _same_exe(own_exe: str, target_exe: str) -> bool:
+    """Same file or same bytes; the size decides most cases without hashing."""
+    if os.path.abspath(own_exe) == target_exe:
+        return True
+    if os.path.getsize(own_exe) != os.path.getsize(target_exe):
+        return False
+    return sha256_file(own_exe) == sha256_file(target_exe)
+
+
 def install_into(
     target_dir: str,
     *,
@@ -518,9 +553,9 @@ def install_into(
         )
     old_label = read_marker(target_dir) or "previous version"
     target_exe = os.path.join(target_dir, EXE_NAME)
-    same_exe = os.path.abspath(own_exe) == target_exe or sha256_file(own_exe) == sha256_file(target_exe)
     swapped = False
     try:
+        same_exe = _same_exe(own_exe, target_exe)
         if not same_exe:
             swap_exe(target_dir, own_exe)
             swapped = True

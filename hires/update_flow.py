@@ -174,7 +174,7 @@ class UpdateController:
             try:
                 staged = self._stage(
                     self.app_dir, release, self.channel,
-                    progress=lambda done, total: self._dispatch(self._show, "progress", done, total),
+                    progress=lambda done, total: self._dispatch(self._progress, done, total),
                     cancelled=lambda: self._cancelled,
                 )
             except su.UpdateError as exc:
@@ -187,6 +187,11 @@ class UpdateController:
 
         self._run_worker(work)
         return True
+
+    def _progress(self, done: int, total: int) -> None:
+        # Blocks still queued after Cancel would open a fresh dialog otherwise.
+        if not self._cancelled:
+            self._show("progress", done, total)
 
     def _downloaded(self, staged: str) -> None:
         if self._cancelled:
@@ -213,8 +218,13 @@ class UpdateController:
         try:
             self._swap(self.app_dir, self.staged, exe_name=self.exe_name)
         except su.UpdateError as exc:
-            self._discard(self.staged)
-            self._failed(str(exc))
+            if os.path.isfile(os.path.join(self.app_dir, self.exe_name)):
+                self._discard(self.staged)
+                self._failed(str(exc))
+            else:
+                # Neither EXE is in place: swap_exe kept the new one and says
+                # how to rename it -- keep it, and don't claim nothing changed.
+                self._failed(str(exc), replaced_nothing=False)
             return
         su.log(self.app_dir, f"auto-update {self.version} -> {self.release.tag}: exe replaced, restarting")
         self._log(f"[Update] Installed {self.release.tag}; restarting.")
@@ -246,7 +256,7 @@ class UpdateController:
         url = self.release.page_url if self.release else self.channel.page_url
         self._open_page(url)
 
-    def _failed(self, message: str) -> None:
+    def _failed(self, message: str, replaced_nothing: bool = True) -> None:
         self._hold(False)
         cancelled = self._cancelled
         self.state = self.IDLE
@@ -254,7 +264,8 @@ class UpdateController:
             self._log("[Update] Download cancelled.")
             return
         self._log(f"[Update] Update failed: {message}")
-        self._show("failed", f"Update failed: {message}. Nothing was replaced.")
+        tail = " Nothing was replaced." if replaced_nothing else ""
+        self._show("failed", f"Update failed: {message}.{tail}")
 
     def _discard(self, staged: str) -> None:
         if staged:

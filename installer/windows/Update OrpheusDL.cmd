@@ -26,7 +26,7 @@ set "RC=%errorlevel%"
 if "%RC%"=="0" (
   echo Done.
 ) else (
-  echo The update did not run. The message window said why, nothing was replaced.
+  echo The update did not finish. The message window said what happened.
 )
 :done
 if not defined ORPHEUSDL_NO_PAUSE pause

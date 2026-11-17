@@ -171,9 +171,10 @@ jobs:
           7z a -tzip "../${{ matrix.artifact }}.zip" ./*
 
       # Update tests only: the same code once more as a second version, so one
-      # run yields an "old" and a "new" EXE for a real update.
+      # run yields an "old" and a "new" EXE for a real update. Never on a tag:
+      # the release job would attach this ZIP too, under the same name.
       - name: Build second version (Windows, update tests)
-        if: matrix.label == 'windows' && inputs.second_version != ''
+        if: matrix.label == 'windows' && inputs.second_version != '' && !startsWith(github.ref, 'refs/tags/')
         working-directory: app
         shell: bash
         env:
@@ -192,7 +193,7 @@ jobs:
           7z a -tzip "../second/${{ matrix.artifact }}.zip" ./*
 
       - name: Upload second version
-        if: matrix.label == 'windows' && inputs.second_version != ''
+        if: matrix.label == 'windows' && inputs.second_version != '' && !startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}-second

@@ -1737,7 +1737,6 @@ def setup_logging(log_queue):
         _set_capture_file_logging(False)
         root_logger.setLevel(logging.CRITICAL)
 __version__ = "2.0.3"
-from update_checker import run_check_in_thread
 _mutex_handle = None
 _tray_icon = None  # pystray.Icon while minimized to the system tray
 if platform.system() == "Windows":
