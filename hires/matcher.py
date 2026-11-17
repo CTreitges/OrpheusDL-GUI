@@ -37,6 +37,8 @@ from .models import (
     MatchDecision,
     MatchMethod,
     MatchResult,
+    RateLimitedError,
+    RunCancelled,
     TrackRef,
 )
 
@@ -485,15 +487,32 @@ class TrackMatcher:
         auto_accept_threshold: float = 0.88,
         review_threshold: float = 0.62,
         max_alternatives: int = 4,
+        target_name: str = "TIDAL",
     ):
         self.search_provider = search_provider
+        #: Only used in notes ("no TIDAL search result"), so the Port tab can
+        #: say which service it searched.
+        self.target_name = target_name
         self.auto_accept_threshold = float(auto_accept_threshold)
         self.review_threshold = float(review_threshold)
         self.max_alternatives = max(0, int(max_alternatives))
 
     # -- public -------------------------------------------------------------
     def match(self, source: TrackRef) -> MatchResult:
-        """Best TIDAL track for ``source``, plus what to do with it."""
+        """Best target track for ``source``, plus what to do with it.
+
+        A candidate whose provider set ``extra["review_reason"]`` (a SoundCloud
+        Go+ track that only plays as a 30 s preview without Go+) is never
+        accepted on its own, however well it scores.
+        """
+        result = self._match(source)
+        reason = (result.best.track.extra or {}).get("review_reason") if result.best else None
+        if reason and result.decision == MatchDecision.AUTO_ACCEPT.value:
+            result.decision = MatchDecision.NEEDS_REVIEW.value
+            result.best.reasons.append(reason)
+        return result
+
+    def _match(self, source: TrackRef) -> MatchResult:
         notes: List[str] = []
 
         isrc = (getattr(source, "isrc", None) or "").strip()
@@ -508,7 +527,7 @@ class TrackMatcher:
         if error:
             notes.append(error)
         if not candidates:
-            notes.append("no TIDAL search result")
+            notes.append(f"no {self.target_name} search result")
             return MatchResult(
                 source=source,
                 decision=MatchDecision.NO_MATCH.value,
@@ -553,6 +572,8 @@ class TrackMatcher:
             if progress_callback is not None:
                 try:
                     progress_callback(index, total, result)
+                except RunCancelled:
+                    raise  # cancelled or superseded: stop searching now
                 except Exception:
                     # A broken progress display must never stop a conversion.
                     pass
@@ -565,6 +586,8 @@ class TrackMatcher:
             return [], ""
         try:
             hits = finder(isrc)
+        except RateLimitedError:
+            raise
         except Exception as exc:
             return [], f"ISRC lookup failed: {exc}"
         return [t for t in list(hits or []) if _track_id(t)], ""
@@ -632,8 +655,10 @@ class TrackMatcher:
         for query in self._queries(source):
             try:
                 results = self.search_provider.search_tracks(query, limit=SEARCH_LIMIT)
+            except RateLimitedError:
+                raise  # stop the whole run: every further call makes a block likelier
             except Exception as exc:
-                errors.append(f"TIDAL search for {query!r} failed: {exc}")
+                errors.append(f"{self.target_name} search for {query!r} failed: {exc}")
                 continue
 
             for track in list(results or []):

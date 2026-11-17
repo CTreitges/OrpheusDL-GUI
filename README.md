@@ -3,9 +3,21 @@
 <img src="https://raw.githubusercontent.com/bascurtiz/OrpheusDL-GUI/main/animated.gif" alt="GUI overview">
 
 > **This fork adds a Hi-Res Suite** on top of upstream `v2.0.3`: a persistent
-> **download queue**, a **TIDAL playlist browser**, and **Spotify → TIDAL**
-> playlist conversion that downloads your Spotify playlists from TIDAL in
-> hi-res (24 bit FLAC). See **[HIRES.md](HIRES.md)**.
+> **download queue** grouped by playlist, a **Playlists** tab for Spotify,
+> TIDAL, YouTube and SoundCloud, and a **Port** tab that finds a playlist's
+> tracks on another of those services — Spotify → TIDAL downloads your Spotify
+> playlists from TIDAL in hi-res (24 bit FLAC). A **Target format** setting
+> (Settings › Codecs) turns every download into WAV, FLAC or AIFF without
+> upsampling, with a **Convert folder…** button for files you already have, and
+> the queue shows the quality each download really arrived in.
+> See **[HIRES.md](HIRES.md)**.
+>
+> **Updating the Windows one-folder build** keeps settings, logins, queue and
+> downloads: once, unpack the new release ZIP *into* your old folder and run
+> **`Update OrpheusDL.cmd`** from it; from then on the app's **auto-update**
+> (About › Check for updates, or the daily check) installs new releases of this
+> fork itself — after asking, with the download checked against GitHub's
+> SHA-256. Details: [HIRES.md › Updates](HIRES.md#updates).
 >
 > Upstream project: [bascurtiz/OrpheusDL-GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
 

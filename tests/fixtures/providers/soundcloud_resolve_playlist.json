@@ -1,0 +1,109 @@
+{
+ "id": 243061639,
+ "kind": "playlist",
+ "title": "Random Access Memories",
+ "track_count": 6,
+ "duration": 4477780,
+ "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/sets/random-access-memories-4",
+ "is_album": true,
+ "artwork_url": "https://i1.sndcdn.com/artworks-88465663-277b-4f51-a6a1-9a2d6f2c89de-0-large.jpg",
+ "user": {
+  "username": "Daft Punk"
+ },
+ "tracks": [
+  {
+   "id": 254111901,
+   "kind": "track",
+   "title": "Give Life Back to Music",
+   "duration": 30000,
+   "full_duration": 275435,
+   "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/give-life-back-to-music",
+   "artwork_url": "https://i1.sndcdn.com/artworks-hVaIyHUXhoow-0-large.jpg",
+   "user": {
+    "username": "Daft Punk"
+   },
+   "publisher_metadata": {
+    "artist": "Daft Punk",
+    "isrc": "USQX91300101",
+    "album_title": "Random Access Memories",
+    "release_title": "Give Life Back to Music"
+   }
+  },
+  {
+   "id": 254112059,
+   "kind": "track",
+   "title": "The Game of Love",
+   "duration": 30000,
+   "full_duration": 322194,
+   "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/the-game-of-love",
+   "artwork_url": "https://i1.sndcdn.com/artworks-rPWd4VXmMDrs-0-large.jpg",
+   "user": {
+    "username": "Daft Punk"
+   },
+   "publisher_metadata": {
+    "artist": "Daft Punk",
+    "isrc": "USQX91300102",
+    "album_title": "Random Access Memories",
+    "release_title": "The Game of Love"
+   }
+  },
+  {
+   "id": 254112136,
+   "kind": "track",
+   "title": "Giorgio by Moroder",
+   "duration": 30000,
+   "full_duration": 544653,
+   "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/giorgio-by-moroder",
+   "artwork_url": "https://i1.sndcdn.com/artworks-zIyXROUva5Ir-0-large.jpg",
+   "user": {
+    "username": "Daft Punk"
+   },
+   "publisher_metadata": {
+    "artist": "Daft Punk",
+    "isrc": "USQX91300103",
+    "album_title": "Random Access Memories",
+    "release_title": "Giorgio by Moroder"
+   }
+  },
+  {
+   "id": 254111980,
+   "kind": "track",
+   "title": "Within",
+   "duration": 30000,
+   "full_duration": 228545,
+   "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/within",
+   "artwork_url": "https://i1.sndcdn.com/artworks-ZN5iwju0BE5E-0-large.jpg",
+   "user": {
+    "username": "Daft Punk"
+   },
+   "publisher_metadata": {
+    "artist": "Daft Punk",
+    "isrc": "USQX91300104",
+    "album_title": "Random Access Memories",
+    "release_title": "Within"
+   }
+  },
+  {
+   "id": 254112175,
+   "kind": "track",
+   "title": "Instant Crush (feat. Julian Casablancas)",
+   "duration": 30000,
+   "full_duration": 337607,
+   "permalink_url": "https://soundcloud.com/daftpunkofficialmusic/instant-crush",
+   "artwork_url": "https://i1.sndcdn.com/artworks-gIQgSsZBbu79-0-large.jpg",
+   "user": {
+    "username": "Daft Punk"
+   },
+   "publisher_metadata": {
+    "artist": "Daft Punk, Julian Casablancas",
+    "isrc": "USQX91300105",
+    "album_title": "Random Access Memories",
+    "release_title": "Instant Crush (feat. Julian Casablancas)"
+   }
+  },
+  {
+   "id": 254111905,
+   "kind": "track"
+  }
+ ]
+}

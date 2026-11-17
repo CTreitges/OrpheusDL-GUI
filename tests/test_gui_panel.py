@@ -28,8 +28,6 @@ if not os.environ.get("DISPLAY") and sys.platform.startswith("linux"):
 from hires.controllers import (  # noqa: E402
     QueueController,
     ReviewRow,
-    SpotifyImportController,
-    TidalBrowserController,
     UiDispatcher,
 )
 from hires.gui_panel import (  # noqa: E402
@@ -37,10 +35,12 @@ from hires.gui_panel import (  # noqa: E402
     PlaylistList,
     QueueTab,
     ReviewDialog,
-    SpotifyConvertTab,
-    TidalPlaylistTab,
     build_tabs,
 )
+from hires.playlists_controller import PlaylistsController  # noqa: E402
+from hires.playlists_panel import PlaylistsTab  # noqa: E402
+from hires.port_controller import PortController  # noqa: E402
+from hires.port_panel import PortTab  # noqa: E402
 from hires.models import (  # noqa: E402
     AccountState,
     ConversionReport,
@@ -60,11 +60,21 @@ from hires.queue_store import QueueStore  # noqa: E402
 
 @pytest.fixture
 def root():
-    """A real CTk window, destroyed afterwards."""
-    try:
-        window = customtkinter.CTk()
-    except tkinter.TclError as exc:  # pragma: no cover - display trouble
-        pytest.skip(f"cannot open a window: {exc}")
+    """A real CTk window, destroyed afterwards.
+
+    The Windows venv's Tcl sometimes fails to initialise ("can't find a usable
+    tk.tcl", "invalid command name tcl_findLibrary") and works on the next try;
+    three tries before skipping.
+    """
+    window = None
+    for attempt in range(3):
+        try:
+            window = customtkinter.CTk()
+            break
+        except tkinter.TclError as exc:  # pragma: no cover - display trouble
+            if attempt == 2:
+                pytest.skip(f"cannot open a window: {exc}")
+            time.sleep(0.2)
     window.geometry("1100x700")
     yield window
     try:
@@ -157,6 +167,33 @@ class FakeMatcher:
             for i, r in enumerate(self._results, 1):
                 progress_callback(i, len(self._results), r)
         return list(self._results)
+
+
+def tidal_playlists_tab(parent, queue, library, *, dispatch, output_provider=None):
+    """The Playlists tab with only TIDAL -- what the old TIDAL tab was."""
+    controller = PlaylistsController(
+        {"TIDAL": lambda: library}, queue, dispatch=dispatch, output_provider=output_provider
+    )
+    return PlaylistsTab(parent, controller, service="TIDAL")
+
+
+def spotify_port_tab(parent, queue, source, matcher, *, dispatch):
+    """The Port tab in its default direction -- what the old Spotify tab was."""
+    controller = PortController(
+        {"Spotify": lambda: source, "TIDAL": lambda: object()},
+        queue,
+        spotify_source_provider=lambda: source,
+        dispatch=dispatch,
+        matcher_factory=lambda _target, _name: matcher,
+    )
+    return PortTab(parent, controller)
+
+
+def legacy_providers(library=None, source=None):
+    return {
+        "TIDAL": lambda: library if library is not None else FakeTidalLibrary(),
+        "Spotify": lambda: source if source is not None else FakeSpotifySource(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -469,10 +506,7 @@ class TestPlaylistList:
 
 class TestTidalPlaylistTab:
     def _tab(self, root, queue, library, **kwargs):
-        controller = TidalBrowserController(
-            lambda: library, queue, dispatch=UiDispatcher(root), **kwargs
-        )
-        return TidalPlaylistTab(root, controller)
+        return tidal_playlists_tab(root, queue, library, dispatch=UiDispatcher(root), **kwargs)
 
     def test_builds_with_an_instruction_message(self, root, queue):
         tab = self._tab(root, queue, FakeTidalLibrary())
@@ -564,12 +598,73 @@ def review(sid, tid, alternatives=None):
     )
 
 
+class TestPortAndQueue:
+    """One click: port, confident matches into the queue, the rest to review."""
+
+    def _tab(self, root, queue, matcher):
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root))
+
+    def test_port_and_queue_queues_confident_and_keeps_uncertain_for_review(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), accepted("s3", "t3"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        items = queue.list()
+        assert [i.url.rsplit("/", 1)[-1] for i in items] == ["t1", "t3"]
+        assert len({i.group_id for i in items}) == 1, "one port = one group in the queue"
+        assert "Queued 2 tracks" in tab.status_label.cget("text")
+        assert "1 uncertain wait for review" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "normal"
+        assert tab.queue_button.cget("state") == "disabled", "queueing again would download twice"
+
+    def test_port_and_queue_review_queues_only_the_reviewed(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: tab.review_button.cget("state") == "normal")
+        tab._apply_review({"s2": "t2"})
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1", "t2"]
+
+    def test_port_and_queue_without_link_warns(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.port_and_queue()
+        pump(root)
+        assert "Paste a Spotify playlist link" in tab.status_label.cget("text")
+        assert queue.list() == []
+
+    def test_port_and_queue_nothing_uncertain(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: queue.list())
+        assert "Nothing uncertain" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "disabled"
+
+    def test_port_link_row_appears_after_porting_a_link(self, root, queue):
+        """Regression (gui review): the list kept the intro text after a port by link."""
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.list.playlists)
+        assert [p.name for p in tab.list.playlists] == ["Remote"]
+        assert "x" in tab.list._rows
+
+    def test_port_link_row_keeps_own_playlists_and_no_duplicates(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.list.set_playlists([PlaylistRef(id="mine", name="Mine")])
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: len(tab.list.playlists) == 2)
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.status_label.cget("text").endswith("not found"))
+        assert [p.id for p in tab.list.playlists] == ["x", "mine"]
+
+
 class TestSpotifyConvertTab:
     def _tab(self, root, queue, source, matcher, **kwargs):
-        controller = SpotifyImportController(
-            lambda: source, lambda: matcher, queue, dispatch=UiDispatcher(root), **kwargs
-        )
-        return SpotifyConvertTab(root, controller)
+        return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root), **kwargs)
 
     def test_builds(self, root, queue):
         tab = self._tab(root, queue, FakeSpotifySource(), FakeMatcher())
@@ -786,15 +881,15 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(),
+            playlist_providers=legacy_providers(),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
         )
         pump(root)
 
-        assert set(tabs) == {"queue", "tidal", "spotify"}
+        assert set(tabs) == {"queue", "playlists", "port"}
         names = tabview._name_list if hasattr(tabview, "_name_list") else []
-        for expected in ("Queue", "TIDAL Playlists", "Spotify → TIDAL"):
+        for expected in ("Queue", "Playlists", "Port"):
             assert expected in names
 
     def test_tabs_can_be_switched(self, root, tabview, queue):
@@ -802,13 +897,13 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(),
+            playlist_providers=legacy_providers(),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
         )
         pump(root)
 
-        for name in ("TIDAL Playlists", "Spotify → TIDAL", "Queue"):
+        for name in ("Playlists", "Port", "Queue"):
             tabview.set(name)
             pump(root)
             assert tabview.get() == name
@@ -820,16 +915,16 @@ class TestBuildTabs:
             tabview,
             queue=queue,
             app=root,
-            tidal_library_provider=lambda: FakeTidalLibrary(playlists=[playlist]),
+            playlist_providers=legacy_providers(FakeTidalLibrary(playlists=[playlist])),
             spotify_source_provider=lambda: FakeSpotifySource(),
-            matcher_provider=lambda: FakeMatcher(),
+            matcher_factory=lambda _t, _n: FakeMatcher(),
             output_provider=lambda: str(tmp_path),
         )
         pump(root)
 
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
 
         # The queue tab repaints through the dispatcher's timer, so the loop
         # has to actually run -- pumping a fixed number of times races it.
@@ -874,9 +969,9 @@ class TestSetupTabsWiring:
 
         tabs, queue = result["tabs"], result["queue"]
         playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
         pump(root)
 
         assert queue.list(), "nothing was queued"
@@ -888,9 +983,9 @@ class TestSetupTabsWiring:
         tabs, queue, runtime = result["tabs"], result["queue"], result["runtime"]
 
         playlist = PlaylistRef(id="p1", name="Mix", platform="TIDAL")
-        tabs["tidal"].list.set_playlists([playlist])
-        tabs["tidal"].list.selected = playlist
-        tabs["tidal"].enqueue_selected()
+        tabs["playlists"].list.set_playlists([playlist])
+        tabs["playlists"].list.selected = playlist
+        tabs["playlists"].enqueue_selected()
         pump(root)
 
         runtime._pump()
@@ -899,9 +994,115 @@ class TestSetupTabsWiring:
         _url, _path, data = gui.calls[0]
         assert data["extra_kwargs"]["download_quality_override"] == "hifi"
 
+    # -- in-app update ------------------------------------------------------
+    def _updater(self, root, tmp_path):
+        """setup_tabs' own updater; only the outside edges are replaced."""
+        from hires import update_check as uc
+
+        gui, result = self._build(root, tmp_path, "hifi")
+        updater = result["updater"]
+        assert updater is not None, "setup_tabs built no updater"
+        events = {"swapped": [], "restarted": [], "quit": 0}
+        staged = tmp_path / "OrpheusDL_GUI.new.exe"
+
+        def stage(app_dir, release, channel, progress, cancelled):
+            staged.write_bytes(b"MZ")
+            return str(staged)
+
+        def quit_app():
+            events["quit"] += 1
+
+        updater.release = uc.ReleaseInfo(
+            tag="v2.0.3-hires.13", name="", notes="", page_url=uc.RELEASES_PAGE,
+            asset_url="https://github.com/CTreitges/OrpheusDL-GUI/releases/download/v2.0.3-hires.13/x.zip",
+            size=1, sha256="a" * 64,
+        )
+        updater.state = updater.OFFERED
+        updater.can_self_install = True
+        updater._stage = stage
+        updater._swap = lambda app_dir, path, exe_name: events["swapped"].append(path)
+        updater._restart = lambda app_dir, exe_name: events["restarted"].append(exe_name)
+        updater._quit = quit_app
+        updater._run_worker = lambda fn: fn()
+        updater._view_factory = lambda: type("V", (), {"__getattr__": lambda s, n: (lambda *a: None)})()
+        return gui, result, updater, events
+
+    def test_update_busy_no_restart_while_the_gui_downloads(self, root, tmp_path):
+        """N3 through the real assembly: busy = the runtime's view of gui.py."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        gui.download_process_active = True
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["swapped"] == [] and events["quit"] == 0
+        gui.download_process_active = False
+        updater._try_install()
+        assert events["swapped"] and events["restarted"] and events["quit"] == 1
+
+    def test_update_busy_queue_starts_nothing_new_while_waiting(self, root, tmp_path):
+        """While the update waits, the runtime holds; Cancel lets the queue go on."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        runtime, queue = result["runtime"], result["queue"]
+        queue.add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        gui.download_process_active = True  # a download the user started by hand
+        updater.accept()
+        pump_until(root, lambda: runtime.held)
+        assert runtime.held
+        gui.download_process_active = False
+        runtime._pump()
+        assert gui.calls == [], "queue started an item although an update waits"
+        updater.cancel()
+        assert not runtime.held
+        runtime._pump()
+        assert len(gui.calls) == 1
+
+    def test_update_busy_queue_item_counts_as_busy(self, root, tmp_path):
+        gui, result, updater, events = self._updater(root, tmp_path)
+        result["queue"].add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        result["runtime"]._pump()          # the queue hands an item to gui.py
+        assert gui.calls
+        gui.download_process_active = False  # between polls: GUI idle, item still ours
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["quit"] == 0
+
+    def test_update_busy_convert_folder_counts_as_busy(self, root, tmp_path, monkeypatch):
+        from hires import integration
+
+        gui, result, updater, events = self._updater(root, tmp_path)
+        monkeypatch.setattr(integration, "folder_job_running", lambda: True)
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        monkeypatch.setattr(integration, "folder_job_running", lambda: False)
+        updater._try_install()
+        assert events["quit"] == 1
+
+    def test_port_and_queue_button_in_the_real_assembly(self, root, tmp_path):
+        """The real button of setup_tabs' Port tab; only the services are fakes."""
+        gui, result = self._build(root, tmp_path, "high")
+        port, queue = result["tabs"]["port"], result["queue"]
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        controller = port.controller
+        controller.providers = {"Spotify": lambda: source, "TIDAL": lambda: object()}
+        controller.matcher_factory = lambda _t, _n: FakeMatcher([accepted("s1", "t1"), review("s2", "t2")])
+        controller._build_converter = lambda direction=None: __import__(
+            "hires.converter", fromlist=["PlaylistConverter"]
+        ).PlaylistConverter(source, controller.matcher_factory(None, "TIDAL"), queue, quality="hifi",
+                            output_root=str(tmp_path), source_name="Spotify", target_name="TIDAL")
+        port.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        port.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1"]
+        assert queue.list()[0].quality == "hifi"
+        assert port.review_button.cget("state") == "normal"
+        assert [p.name for p in port.list.playlists] == ["Remote"]
+
     def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")
-        assert set(result["tabs"]) == {"accounts", "queue", "tidal", "spotify"}
+        assert set(result["tabs"]) == {"accounts", "queue", "playlists", "port"}
         assert result["runtime"] is not None
 
     # -- accounts -----------------------------------------------------------
@@ -915,7 +1116,12 @@ class TestSetupTabsWiring:
         accounts = result["tabs"]["accounts"]
 
         by_service = {s.service: s for s in accounts.controller.statuses()}
-        assert set(by_service) == {"TIDAL", "Spotify"}
+        # The DJ upgrade added SoundCloud and YouTube next to the two sign-in
+        # services; all four must come from setup_tabs' own providers.
+        assert set(by_service) == {"TIDAL", "Spotify", "SoundCloud", "YouTube"}
+        # FakeGui has no SoundCloud token and no YouTube cookie file.
+        assert by_service["SoundCloud"].state is AccountState.SIGNED_OUT
+        assert by_service["YouTube"].state is AccountState.SIGNED_OUT
 
         # FakeGui has no orpheus_instance, so TIDAL cannot be reached at all.
         assert by_service["TIDAL"].state is AccountState.UNAVAILABLE
@@ -957,7 +1163,7 @@ class TestSetupTabsWiring:
         """
         _gui, result = self._build(root, tmp_path, "hifi")
         tabs = result["tabs"]
-        assert tabs["accounts"].controller.spotify_controller is tabs["spotify"].controller
+        assert tabs["accounts"].controller.spotify_controller is tabs["port"].controller
 
     def test_tidal_sign_in_reaches_the_module(self, root, tmp_path):
         """The wiring's whole point: the button drives the real module call."""
@@ -998,7 +1204,7 @@ class TestSetupTabsWiring:
         forever without anything failing.
         """
         gui, result = self._build(root, tmp_path, "hifi")
-        tab = result["tabs"]["tidal"]
+        tab = result["tabs"]["playlists"]
 
         seen = {}
 
@@ -1015,7 +1221,7 @@ class TestSetupTabsWiring:
                 seen["flat"] = True
                 return []
 
-        tab.controller.library_provider = lambda: FolderLibrary()
+        tab.controller.browsers["TIDAL"].library_provider = lambda: FolderLibrary()
         tab.load()
         pump_until(root, lambda: tab.list.has_folders)
 
@@ -1026,7 +1232,7 @@ class TestSetupTabsWiring:
     def test_batch_queueing_through_the_real_assembly_stays_hi_res(self, root, tmp_path):
         """Same guarantee as the single-playlist path, on the new batch path."""
         gui, result = self._build(root, tmp_path, "high")
-        tab, queue = result["tabs"]["tidal"], result["queue"]
+        tab, queue = result["tabs"]["playlists"], result["queue"]
 
         playlists = [
             PlaylistRef(id="a", name="One", platform="TIDAL"),
@@ -1324,13 +1530,13 @@ class TestPlaylistListSelection:
 
 class TestTidalTabBatch:
     def _tab(self, root, tabview, queue, library, tmp_path):
-        controller = TidalBrowserController(
-            lambda: library,
+        tab = tidal_playlists_tab(
+            tabview.add("TIDAL"),
             queue,
+            library,
             dispatch=UiDispatcher(root),
             output_provider=lambda: str(tmp_path),
         )
-        tab = TidalPlaylistTab(tabview.add("TIDAL"), controller)
         pump(root)
         return tab
 

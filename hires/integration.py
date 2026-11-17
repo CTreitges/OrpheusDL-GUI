@@ -26,6 +26,12 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
+from .account_providers import (
+    make_open_settings,
+    make_soundcloud_status_provider,
+    make_youtube_status_provider,
+)
+from .convert_job import folder_job_running
 from .models import AuthRequiredError, HiresError, QueueItem, QueueStatus
 from .queue_store import QueueStore
 from .quality import HIRES, build_search_result_data
@@ -119,6 +125,12 @@ class HiresRuntime:
         self._baseline_mtime: float = 0.0
         #: gui.py's ``_active_download_thread`` right after our start.
         self._active_thread: Any = None
+        #: Quality label per finished download thread, from
+        #: :func:`hires.download_finish.after_download`.
+        self._reports: dict = {}
+        #: Set while an app update waits for the running download to finish:
+        #: the queue then starts nothing new (hires/update_flow.py).
+        self._held = False
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> bool:
@@ -179,6 +191,10 @@ class HiresRuntime:
 
             if self.queue.is_paused or self._gui_is_busy() or not self._gui_is_ready():
                 return
+            if folder_job_running():
+                return  # never download into a folder "Convert folder…" is working on
+            if self._held:
+                return  # an app update waits for the app to become free
             item = self.queue.claim_next()
             if item is None:
                 return
@@ -234,6 +250,39 @@ class HiresRuntime:
         """
         return self._active_id is not None or self._gui_is_busy()
 
+    def hold_new_items(self, held: bool) -> None:
+        """Start no new queue item while ``held`` (a running one finishes)."""
+        self._held = bool(held)
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def stop_active(self) -> bool:
+        """Stop the download this runtime started, if there is one.
+
+        Used by "Clear all": a cleared queue must not keep downloading the
+        item it just dropped. Goes through gui.py's own ``stop_download`` so
+        the stock cancellation path runs; a download the user started by hand
+        is never touched. Returns True when a stop was requested.
+        """
+        with self._lock:
+            if self._active_id is None:
+                return False
+            # Our item may be over already while the GUI runs a download the
+            # user started; the next poll would notice. Never stop that one.
+            if self._gui_started_another_download():
+                return False
+        stopper = getattr(self.gui, "stop_download", None)
+        if callable(stopper):
+            stopper()
+            return True
+        stop_event = getattr(self.gui, "stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+            return True
+        return False
+
     # -- dispatch / completion ---------------------------------------------
     def _dispatch(self, item: QueueItem) -> None:
         start = getattr(self.gui, "_start_single_download", None)
@@ -282,6 +331,18 @@ class HiresRuntime:
             if self.queue.retry(item.id):
                 self._log(f"|GRAY|[Hi-Res] {reason}; re-queued.|RESET|")
 
+    def note_download_result(self, thread: Any, quality: str) -> None:
+        """Remember what a finished download produced (called on its thread).
+
+        Keyed by the download thread, so a download the user started by hand
+        can never lend its quality to a queue entry. Only the latest few are
+        kept: anything not ours is simply never asked for.
+        """
+        with self._lock:
+            self._reports[thread] = quality
+            while len(self._reports) > 8:
+                self._reports.pop(next(iter(self._reports)))
+
     def _finish_active(self) -> None:
         item_id = self._active_id
         path = self._active_path
@@ -290,6 +351,7 @@ class HiresRuntime:
         # Read the baseline before clearing it -- _clear_active() resets the
         # counters that _produced_audio compares against.
         baseline = (self._baseline_count, self._baseline_mtime)
+        quality = self._reports.pop(self._active_thread, "") if self._active_thread else ""
         self._clear_active()
 
         if self._was_cancelled():
@@ -299,7 +361,7 @@ class HiresRuntime:
 
         produced, detail = self._produced_audio(path, baseline)
         if produced:
-            self.queue.mark_done(item_id)
+            self.queue.mark_done(item_id, actual_quality=quality)
         else:
             self.queue.mark_failed(item_id, detail)
             self._log(f"|GRAY|[Hi-Res] Item failed: {detail}|RESET|")
@@ -424,28 +486,6 @@ def _spotify_credentials(gui: Any) -> tuple:
         return "", ""
     creds = (settings.get("credentials") or {}).get("Spotify") or {}
     return (creds.get("client_id") or "").strip(), (creds.get("client_secret") or "").strip()
-
-
-def make_tidal_library_provider(gui: Any) -> Callable[[], Any]:
-    def provider():
-        from .tidal_library import TidalLibrary
-
-        return TidalLibrary.from_orpheus(getattr(gui, "orpheus_instance", None))
-
-    return provider
-
-
-def make_matcher_provider(gui: Any) -> Callable[[], Any]:
-    def provider():
-        from .matcher import TrackMatcher
-        from .tidal_library import TidalLibrary
-
-        library = TidalLibrary.from_orpheus(getattr(gui, "orpheus_instance", None))
-        if library is None:
-            return None
-        return TrackMatcher(library)
-
-    return provider
 
 
 def make_spotify_source_provider(gui: Any) -> Callable[[], Any]:
@@ -650,11 +690,66 @@ def make_spotify_status_provider(gui: Any) -> Callable[[], Any]:
     return provider
 
 
+def _open_url(url: str) -> None:
+    try:
+        from utils.utils import open_url_in_browser
+
+        open_url_in_browser(url)
+    except Exception:
+        import webbrowser
+
+        webbrowser.open(url, new=2)
+
+
+def make_updater(gui: Any, runtime: HiresRuntime) -> Any:
+    """The in-app updater, wired to the running GUI and the queue runtime.
+
+    Busy means: anything downloads (stock GUI or queue) or "Convert folder…"
+    runs. While an update waits for that to end, the runtime starts nothing
+    new. Quitting goes through gui.py's own exit path, which also releases
+    the single-instance mutex the restarted EXE waits for.
+    """
+    import sys
+
+    from .app_version import current_version
+    from .controllers import UiDispatcher
+    from .self_update import EXE_NAME
+    from .update_flow import UpdateController, updates_enabled
+
+    app = getattr(gui, "app", None)
+    frozen = bool(getattr(sys, "frozen", False))
+    script_dir = getattr(gui, "get_script_directory", None)
+    app_dir = script_dir() if callable(script_dir) else (getattr(gui, "application_path", None) or os.getcwd())
+    exe_name = os.path.basename(sys.executable) if frozen else EXE_NAME
+    quit_app = getattr(gui, "_on_gui_exit", None) or (lambda: None)
+
+    def view_factory():
+        from .update_panel import UpdateDialog
+
+        return UpdateDialog(app, updater)
+
+    updater = UpdateController(
+        version=current_version(),
+        app_dir=app_dir,
+        exe_name=exe_name,
+        dispatch=UiDispatcher(app),
+        schedule=lambda ms, fn: app.after(ms, fn),
+        busy=lambda: runtime.is_busy() or folder_job_running(),
+        hold=runtime.hold_new_items,
+        quit_app=quit_app,
+        enabled=lambda: updates_enabled(getattr(gui, "current_settings", None)),
+        view_factory=view_factory,
+        can_self_install=frozen and os.name == "nt",
+        open_page=_open_url,
+    )
+    return updater
+
+
 def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> Optional[dict]:
-    """Add the Queue / TIDAL / Spotify tabs and start the queue runner.
+    """Add the Accounts / Queue / Playlists / Port tabs and start the queue runner.
 
     This is the single entry point gui.py calls. Everything is wrapped so a
-    failure here degrades to "the three extra tabs are missing" rather than
+    failure here degrades to "the extra tabs are missing" rather than
     breaking the application.
 
     Returns a dict with ``runtime``, ``queue`` and ``tabs``, or ``None``.
@@ -669,13 +764,15 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
         store = QueueStore(queue_path or default_queue_path(gui))
         runtime = HiresRuntime(gui, store)
 
+        from .provider_registry import make_playlist_providers
+
         tabs = build_tabs(
             tabview,
             queue=store,
             app=getattr(gui, "app", None),
-            tidal_library_provider=make_tidal_library_provider(gui),
+            # Spotify, TIDAL, YouTube, SoundCloud for the Playlists and Port tabs.
+            playlist_providers=make_playlist_providers(gui),
             spotify_source_provider=make_spotify_source_provider(gui),
-            matcher_provider=make_matcher_provider(gui),
             # Deliberately NOT the GUI's global quality: the whole point of
             # this suite is hi-res, and both tabs say so on screen. Reading the
             # global setting here silently downgraded every converted playlist
@@ -688,13 +785,23 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
             # Signing in mid-download would swap the TIDAL session out from
             # under the running transfer.
             busy_provider=runtime.is_busy,
+            soundcloud_status_provider=make_soundcloud_status_provider(gui),
+            youtube_status_provider=make_youtube_status_provider(gui),
+            open_settings=make_open_settings(gui),
+            # "Clear all" must stop the item the runner is downloading.
+            stop_active=runtime.stop_active,
         )
         runtime.start()
 
         pending = store.stats().remaining
         if pending:
             print(f"|GRAY|[Hi-Res] Restored {pending} queued item(s).|RESET|")
-        return {"runtime": runtime, "queue": store, "tabs": tabs}
+        try:
+            updater = make_updater(gui, runtime)
+        except Exception as exc:  # the tabs work without it
+            updater = None
+            print(f"[Update] In-app update unavailable: {exc}")
+        return {"runtime": runtime, "queue": store, "tabs": tabs, "updater": updater}
     except Exception as exc:
         print(f"[Hi-Res] Disabled: {exc}")
         return None

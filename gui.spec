@@ -228,6 +228,9 @@ a = Analysis(
         'pywinstyles',
         'pystray',
         'six',
+        # Written by the release build (hires/app_version.py); only imported
+        # lazily, so name it here. Missing in development builds: harmless.
+        'hires._build_version',
         'tkinterdnd2',
         'packaging',
         'base62',                   # Spotify ID conversion (module name is 'base62')

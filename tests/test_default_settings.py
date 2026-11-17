@@ -168,3 +168,52 @@ class TestTrackFormatMigration:
             assert default not in legacy, (
                 f"{default!r} is both the current default and treated as legacy"
             )
+
+
+# ---------------------------------------------------------------------------
+# DJ upgrade: safer pacing for a fresh install (Checkpoint 1->2, 16.11.2026)
+# ---------------------------------------------------------------------------
+
+def _default_setting(*path):
+    """One value of DEFAULT_SETTINGS in gui.py, parsed rather than imported.
+
+    The dict holds calls (paths), so only the leaf is evaluated.
+    """
+    with open(GUI_PY, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "DEFAULT_SETTINGS" for t in node.targets)
+            and isinstance(node.value, ast.Dict)
+        ):
+            value = node.value
+            for key in path:
+                value = next(
+                    v for k, v in zip(value.keys, value.values)
+                    if isinstance(k, ast.Constant) and k.value == key
+                )
+            return ast.literal_eval(value)
+    raise AssertionError("DEFAULT_SETTINGS not found in gui.py")
+
+
+class TestDjPacingDefaults:
+    """Research (W/research-delays.md): YouTube 10-20 s, 1-4 tracks in parallel.
+
+    Only the defaults of a fresh install change; an existing settings.json keeps
+    its values, because loading never overwrites keys the user already has.
+    """
+
+    def test_youtube_pause_default_is_10_seconds(self):
+        assert _default_setting("credentials", "YouTube", "download_pause_seconds") == 10
+
+    def test_concurrent_downloads_default_is_3(self):
+        assert _default_setting("globals", "general", "concurrent_downloads") == 3
+
+    def test_the_orpheus_config_of_a_fresh_install_agrees(self):
+        """The first-run orpheus settings block must not reintroduce 5 s."""
+        with open(GUI_PY, encoding="utf-8") as handle:
+            source = handle.read()
+        block = re.search(r'"youtube":\s*\{\s*"cookies_path"[^}]*\}', source)
+        assert block, "first-run youtube block not found"
+        assert '"download_pause_seconds": 10' in block.group(0)

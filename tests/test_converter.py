@@ -173,6 +173,16 @@ class TestConvert:
         assert report.playlist is playlist
         assert ("get_playlist", "https://open.spotify.com/playlist/pl1") in spotify.calls
 
+    def test_a_link_is_read_once_then_the_ref_is_used(self, playlist):
+        """Code review: a pasted link was resolved and then read again from the link."""
+        spotify = FakeSpotify(playlist, [sp_track("s1")])
+        conv = PlaylistConverter(spotify, FakeMatcher([accepted(sp_track("s1"), td_track("t1"))]), FakeQueue())
+
+        conv.convert("https://open.spotify.com/playlist/pl1")
+
+        assert spotify.calls == [("get_playlist", "https://open.spotify.com/playlist/pl1"),
+                                 ("get_playlist_tracks", playlist)]
+
     def test_playlist_ref_skips_the_lookup(self, playlist):
         spotify = FakeSpotify(playlist, [sp_track("s1")])
         conv = PlaylistConverter(spotify, FakeMatcher([accepted(sp_track("s1"), td_track("t1"))]), FakeQueue())

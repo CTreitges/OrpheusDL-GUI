@@ -20,6 +20,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .auto_refresh import AutoRefresh
 from .converter import PlaylistConverter, apply_review, queue_items_for_tracks
 from .models import (
     AccountState,
@@ -33,10 +34,13 @@ from .models import (
     PlaylistRef,
     QueueItem,
     QueueStatus,
+    RateLimitedError,
+    RunCancelled,
     TrackRef,
     flat_root,
 )
 from .quality import HIRES, label_for, normalize_tier
+from .queue_groups import QueueGroup, build_groups, group_key
 
 # ---------------------------------------------------------------------------
 # Threading helpers
@@ -159,6 +163,9 @@ class QueueRow:
     quality: str
     error: str = ""
     group_label: str = ""
+    #: The detail without the playlist name -- what a line inside its own
+    #: playlist group shows.
+    subtitle: str = ""
 
     @property
     def text(self) -> str:
@@ -185,8 +192,15 @@ _DISPLAY_PRIORITY = {
 class QueueController:
     """Drives the queue tab."""
 
-    def __init__(self, queue):
+    def __init__(self, queue, stop_active: Optional[Callable[[], Any]] = None):
+        """
+        Args:
+            stop_active: stops the download the queue runner is running right
+                now. "Clear all" calls it so the dropped item does not keep
+                downloading. ``None`` when there is no runner (tests, no GUI).
+        """
         self.queue = queue
+        self.stop_active = stop_active
 
     # -- display ------------------------------------------------------------
     def rows(self, status: Optional[str] = None) -> List[QueueRow]:
@@ -216,9 +230,13 @@ class QueueController:
             status=item.status,
             title=item.title or item.url,
             detail=" · ".join(detail_parts),
-            quality=label_for(item.quality) if item.quality else "",
+            # A finished entry shows what really arrived, not what was asked for.
+            quality=(item.actual_quality if item.status == QueueStatus.DONE.value
+                     and item.actual_quality else
+                     label_for(item.quality) if item.quality else ""),
             error=item.error or "",
             group_label=item.group_label,
+            subtitle=item.subtitle,
         )
 
     def summary(self) -> str:
@@ -264,7 +282,80 @@ class QueueController:
         return self.queue.clear_finished()
 
     def clear_all(self) -> int:
+        """Empty the queue, stopping the running item first.
+
+        Stop before clearing: the other way round the runner would see its
+        item vanish while the download carries on into a cleared queue.
+        """
+        if self.queue.stats().active and self.stop_active is not None:
+            try:
+                self.stop_active()
+            except Exception:
+                # Clearing must still happen; the runner copes with an item
+                # that disappeared under it.
+                traceback.print_exc()
         return self.queue.clear_all()
+
+    def clear_all_question(self) -> Optional[str]:
+        """The confirmation text for "Clear all", or ``None`` when empty."""
+        stats = self.queue.stats()
+        if stats.total == 0:
+            return None
+        noun = "entry" if stats.total == 1 else "entries"
+        text = f"Remove all {stats.total} {noun} from the queue?"
+        if stats.active:
+            text += "\n\nThe track that is downloading right now will be stopped and removed."
+        text += "\n\nThis cannot be undone."
+        return text
+
+    # -- groups -------------------------------------------------------------
+    def groups(self) -> List[QueueGroup]:
+        return build_groups(self.queue.list())
+
+    def move_group_to_front(self, key: str) -> int:
+        return self.queue.move_group_to_front(key)
+
+    def next_group_key(self) -> Optional[str]:
+        """The group whose track is downloaded next, ``None`` when none waits."""
+        waiting = self.queue.list(status=QueueStatus.PENDING.value)
+        return group_key(waiting[0]) if waiting else None
+
+    def remove_group(self, key: str) -> int:
+        return self.queue.remove_group(key)
+
+    def grouped_rows(self, limit: int, collapsed: Optional[set] = None) -> tuple:
+        """``(groups, rows per group key, rows left out)`` for drawing.
+
+        Every group gets a header. Item rows are handed out group by group in
+        display order until ``limit`` rows are used, so a queue of thousands
+        never puts more than ``limit`` rows on screen. Within a group that
+        does not fit, running and waiting items win over finished ones -- the
+        same rule as :meth:`display_rows`, for the same reason. Collapsed
+        groups get no rows and cost nothing.
+        """
+        collapsed = collapsed or set()
+        items = {item.id: item for item in self.queue.list()}
+        groups = build_groups(items.values())
+        budget = max(0, int(limit))
+        rows: Dict[str, List[QueueRow]] = {}
+        hidden = 0
+        for group in groups:
+            if group.key in collapsed:
+                rows[group.key] = []
+                continue
+            if budget == 0:
+                # Nothing more fits; do not build rows only to throw them away.
+                hidden += group.total
+                rows[group.key] = []
+                continue
+            group_rows = [self._row(items[item_id]) for item_id in group.item_ids]
+            if len(group_rows) > budget:
+                group_rows.sort(key=lambda r: _DISPLAY_PRIORITY.get(r.status, 9))
+                hidden += len(group_rows) - budget
+                group_rows = group_rows[:budget]
+            budget -= len(group_rows)
+            rows[group.key] = group_rows
+        return groups, rows, hidden
 
     def subscribe(self, callback: Callable[[], None]):
         return self.queue.subscribe(callback)
@@ -275,7 +366,12 @@ class QueueController:
 # ---------------------------------------------------------------------------
 
 class TidalBrowserController:
-    """Lists the user's TIDAL playlists and queues them for download."""
+    """Lists a service's playlists and queues them for download.
+
+    Written for TIDAL, used by the Playlists tab for every service: ``service``
+    names the platform on queue items and in messages. With the default
+    ``"TIDAL"`` everything behaves exactly as before.
+    """
 
     def __init__(
         self,
@@ -283,17 +379,20 @@ class TidalBrowserController:
         queue,
         *,
         dispatch: Optional[UiDispatcher] = None,
-        quality_provider: Optional[Callable[[], str]] = None,
+        quality_provider: Optional[Callable[[], Optional[str]]] = None,
         output_provider: Optional[Callable[[], Optional[str]]] = None,
         folder_per_playlist: bool = True,
+        service: str = "TIDAL",
     ):
         """
         Args:
             library_provider: returns a ``TidalLibrary`` (or raises). Called
                 lazily so the tab works even if TIDAL is set up after startup.
-            quality_provider: returns the tier to download at. Defaults to hi-res.
+            quality_provider: returns the tier to download at. Defaults to hi-res;
+                ``None`` leaves the tier to the GUI (services other than TIDAL).
             output_provider: returns the base download folder.
         """
+        self.service = service
         self.library_provider = library_provider
         self.queue = queue
         self.dispatch = dispatch or UiDispatcher()
@@ -323,7 +422,8 @@ class TidalBrowserController:
                 library = self.library_provider()
                 if library is None:
                     raise HiresError(
-                        "TIDAL module not available. Install it and log in under Settings > TIDAL."
+                        f"{self.service} module not available. "
+                        f"Install it and log in under Settings > {self.service}."
                     )
                 lister = getattr(library, "list_folders", None)
                 if callable(lister):
@@ -332,7 +432,7 @@ class TidalBrowserController:
                     # A library that predates folders is still perfectly usable.
                     root = flat_root(
                         library.list_playlists(include_favorites=include_favorites),
-                        platform="TIDAL",
+                        platform=self.service,
                     )
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
@@ -353,14 +453,19 @@ class TidalBrowserController:
             try:
                 library = self.library_provider()
                 if library is None:
-                    raise HiresError("TIDAL module not available.")
-                tracks = library.get_playlist_tracks(playlist.id)
+                    raise HiresError(f"{self.service} module not available.")
+                # TIDAL's library wants the id; the other providers read a
+                # playlist through its link (SoundCloud answers playlists/<id>
+                # with 401 without a login).
+                tracks = library.get_playlist_tracks(
+                    playlist.id if self.service == "TIDAL" else playlist
+                )
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
             self.dispatch(on_done, list(tracks))
 
-        return run_in_background(work, name="hires-tidal-tracks")
+        return run_in_background(work, name="hires-playlist-tracks")
 
     # -- queueing -----------------------------------------------------------
     def enqueue_many(
@@ -395,20 +500,30 @@ class TidalBrowserController:
         """
         from .tidal_library import playlist_url
 
+        url = playlist.url
+        if not url and self.service == "TIDAL":
+            url = playlist_url(playlist.id)
+        if not url:
+            raise HiresError(f"{playlist.name or playlist.id} has no link to download from.")
+        svc = self.service.lower()
         item = QueueItem(
-            url=playlist.url or playlist_url(playlist.id),
+            url=url,
             title=playlist.name or playlist.id,
             subtitle=playlist.owner,
-            platform="TIDAL",
+            platform=self.service,
             media_kind="playlist",
             output_path=self.output_provider(),
-            quality=normalize_tier(self.quality_provider()),
+            quality=self._tier(),
             # The folder name when one was queued, so the queue shows what the
             # item belonged to rather than repeating its own title.
             group_label=group_label or playlist.name or playlist.id,
-            source={"kind": "tidal_playlist", "tidal_playlist_id": playlist.id},
+            source={"kind": f"{svc}_playlist", f"{svc}_playlist_id": playlist.id},
         )
         return self.queue.add(item)
+
+    def _tier(self) -> Optional[str]:
+        tier = self.quality_provider()
+        return normalize_tier(tier) if tier else None
 
     def enqueue_tracks(
         self, playlist: PlaylistRef, tracks: Sequence[TrackRef]
@@ -422,15 +537,17 @@ class TidalBrowserController:
         target = base
         if base and self.folder_per_playlist:
             target = os.path.join(
-                base, sanitize_folder_name(playlist.name or playlist.id, fallback="TIDAL Playlist")
+                base,
+                sanitize_folder_name(playlist.name or playlist.id, fallback=f"{self.service} Playlist"),
             )
 
         items = queue_items_for_tracks(
             tracks,
-            quality=normalize_tier(self.quality_provider()),
+            quality=self._tier(),
             output_path=target,
-            group_id=f"tidal-{playlist.id}-{int(time.time())}",
+            group_id=f"{self.service.lower()}-{playlist.id}-{int(time.time())}",
             group_label=playlist.name or playlist.id,
+            platform=self.service,
         )
         return self.queue.add_many(items)
 
@@ -636,13 +753,18 @@ class SpotifyImportController:
 
                 def progress(done, total, result, _i=index):
                     if cancel.is_set() or not self._is_current(generation):
-                        raise HiresError("Conversion cancelled")
+                        raise RunCancelled("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
                 try:
                     report = converter.convert(playlist, progress_callback=progress)
                     if enqueue:
                         converter.enqueue(report, include_review=False)
+                except RateLimitedError as exc:
+                    # The service said stop: the next playlist would only
+                    # make a block likelier. Reports done so far stay queued.
+                    failures.append(_describe(exc))
+                    break
                 except HiresError as exc:
                     if cancel.is_set():
                         break
@@ -687,7 +809,7 @@ class SpotifyImportController:
 
                 def progress(done, total, result):
                     if cancel.is_set() or not self._is_current(generation):
-                        raise HiresError("Conversion cancelled")
+                        raise RunCancelled("Conversion cancelled")
                     self.dispatch(on_progress, done, total, result)
 
                 report = converter.convert(playlist, progress_callback=progress)
@@ -813,8 +935,9 @@ class AccountsController:
     once at startup would say "unavailable" for the rest of the session.
     """
 
-    #: Services in the order they are shown.
-    SERVICES = ("TIDAL", "Spotify")
+    #: Every service the tab knows, in the order they are shown. An instance
+    #: shows the ones it got a status provider for (see ``self.SERVICES``).
+    ALL_SERVICES = ("TIDAL", "Spotify", "SoundCloud", "YouTube")
 
     #: What to show before the first read comes back.
     UNKNOWN_DETAIL = "Checking…"
@@ -824,10 +947,14 @@ class AccountsController:
         *,
         tidal_status_provider: Callable[[], AccountStatus],
         spotify_status_provider: Callable[[], AccountStatus],
+        soundcloud_status_provider: Optional[Callable[[], AccountStatus]] = None,
+        youtube_status_provider: Optional[Callable[[], AccountStatus]] = None,
         tidal_sign_in: Optional[Callable[[], Any]] = None,
         spotify_controller: Optional["SpotifyImportController"] = None,
         dispatch: Optional[UiDispatcher] = None,
         busy_provider: Optional[Callable[[], bool]] = None,
+        auto_wait: Optional[Callable[[threading.Event, float], bool]] = None,
+        auto_refresh_delays: Optional[Sequence[float]] = None,
     ):
         """
         Args:
@@ -837,9 +964,21 @@ class AccountsController:
                 one set of tokens.
             busy_provider: True while a download is running. Signing in mid-
                 download would swap the session out from under it.
+            auto_wait: ``wait(cancel_event, seconds) -> cancelled``. The clock of
+                the automatic re-checks; tests pass one that does not sleep.
         """
         self.tidal_status_provider = tidal_status_provider
         self.spotify_status_provider = spotify_status_provider
+        self._providers: Dict[str, Callable[[], AccountStatus]] = {
+            "TIDAL": tidal_status_provider,
+            "Spotify": spotify_status_provider,
+        }
+        if soundcloud_status_provider is not None:
+            self._providers["SoundCloud"] = soundcloud_status_provider
+        if youtube_status_provider is not None:
+            self._providers["YouTube"] = youtube_status_provider
+        self.SERVICES = tuple(s for s in self.ALL_SERVICES if s in self._providers)
+
         self.tidal_sign_in_callable = tidal_sign_in
         self.spotify_controller = spotify_controller
         self.dispatch = dispatch or UiDispatcher()
@@ -850,7 +989,19 @@ class AccountsController:
 
         # Last known status per service, for painting while a read is running.
         self._last: Dict[str, AccountStatus] = {}
-        self._reading = False
+        # Reads in flight. A counter under a lock rather than a bool: the
+        # automatic re-check and a Refresh can overlap, and the first one to
+        # finish must not report "idle" while the other is still reading.
+        self._reads = 0
+        self._reads_lock = threading.Lock()
+
+        self.auto_refresh = AutoRefresh(
+            self._read_for_auto_refresh,
+            lambda statuses: all(s.is_signed_in for s in statuses),
+            self.dispatch,
+            delays=auto_refresh_delays,
+            wait=auto_wait,
+        )
 
     # -- status -------------------------------------------------------------
     def statuses(self) -> List[AccountStatus]:
@@ -861,14 +1012,17 @@ class AccountsController:
         """
         return [self.status_for(service) for service in self.SERVICES]
 
-    def status_for(self, service: str) -> AccountStatus:
-        """Read one service's state. **Blocking** -- this can do HTTP."""
-        provider = (
-            self.tidal_status_provider
-            if service == "TIDAL"
-            else self.spotify_status_provider
-        )
+    def status_for(self, service: str, remember: bool = True) -> AccountStatus:
+        """Read one service's state. **Blocking** -- this can do HTTP.
+
+        ``remember=False`` leaves the cached state alone: the automatic
+        re-check stores its result only once it is known to be current, so
+        a superseded, slow read cannot overwrite a newer sign-in result.
+        """
+        provider = self._providers.get(service)
         try:
+            if provider is None:
+                raise HiresError(f"Unknown service: {service}")
             status = provider()
         except Exception as exc:
             # A broken provider must not blank the whole tab.
@@ -877,7 +1031,8 @@ class AccountsController:
                 state=AccountState.UNAVAILABLE,
                 detail=_describe(exc),
             )
-        self._last[service] = status
+        if remember:
+            self._last[service] = status
         return status
 
     def known_statuses(self) -> List[AccountStatus]:
@@ -899,7 +1054,20 @@ class AccountsController:
 
     @property
     def is_reading(self) -> bool:
-        return self._reading
+        with self._reads_lock:
+            return self._reads > 0
+
+    def _begin_read(self, exclusive: bool) -> bool:
+        """Count a read in. ``exclusive`` refuses while another one runs."""
+        with self._reads_lock:
+            if exclusive and self._reads:
+                return False
+            self._reads += 1
+            return True
+
+    def _end_read(self) -> None:
+        with self._reads_lock:
+            self._reads = max(0, self._reads - 1)
 
     def refresh(
         self,
@@ -911,29 +1079,73 @@ class AccountsController:
         Returns ``None`` when a read is already running -- the answer would be
         the same, and two concurrent reads would just race to repaint.
         """
-        if self._reading:
+        if not self._begin_read(exclusive=True):
             return None
-        self._reading = True
 
         def work():
             try:
                 statuses = self.statuses()
             except Exception as exc:
-                self._reading = False
+                self._end_read()
                 if on_error is not None:
                     self.dispatch(on_error, _describe(exc))
                 return
-            self._reading = False
+            self._end_read()
             self.dispatch(on_done, statuses)
 
         return run_in_background(work, name="hires-accounts-status")
+
+    # -- automatic re-checks ------------------------------------------------
+    def _read_for_auto_refresh(self, recheck: bool) -> Optional[List[AccountStatus]]:
+        """All statuses; a re-check only asks the services not signed in.
+
+        A missing module or cookie file never turns into "Signed in" on its
+        own, so most starts run all five re-checks. Re-reading the signed-in
+        services each time would repeat their HTTP calls (Spotify's /me,
+        SoundCloud's /me) for nothing (review part 1, finding 2).
+        """
+        self._begin_read(exclusive=False)
+        try:
+            out = []
+            for service in self.SERVICES:
+                last = self._last.get(service)
+                if recheck and last is not None and last.is_signed_in:
+                    out.append(last)
+                else:
+                    out.append(self.status_for(service, remember=False))
+            return out
+        except Exception:
+            return None
+        finally:
+            self._end_read()
+
+    @property
+    def auto_refresh_limit(self) -> int:
+        return self.auto_refresh.limit
+
+    def start_auto_refresh(self, on_update, **callbacks) -> threading.Thread:
+        """Read now, then re-check what is not signed in -- see :class:`AutoRefresh`.
+
+        Results are cached here, in the update callback, because AutoRefresh
+        only delivers it while its run is still the current one.
+        """
+
+        def update(statuses: List[AccountStatus]) -> None:
+            for status in statuses:
+                self._last[status.service] = status
+            on_update(statuses)
+
+        return self.auto_refresh.start(update, **callbacks)
+
+    def stop_auto_refresh(self) -> None:
+        self.auto_refresh.stop()
 
     def is_busy(self, service: str) -> bool:
         return bool(self._in_flight.get(service))
 
     def summary(self) -> str:
         """One line about what is signed in. Uses the last read, never the network."""
-        if self._reading and not self._last:
+        if self.is_reading and not self._last:
             return self.UNKNOWN_DETAIL
         signed_in = [s.service for s in self.known_statuses() if s.is_signed_in]
         if not signed_in:

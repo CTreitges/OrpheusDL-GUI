@@ -65,6 +65,9 @@ class QueueItem:
     added_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    #: What really arrived, read from the files ("FLAC 24-bit/96 kHz",
+    #: "AAC 256 kbit/s"). Empty until the item is done.
+    actual_quality: str = ""
 
     # -- serialisation ------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -276,12 +279,16 @@ class MatchResult:
 
 @dataclass
 class ConversionReport:
-    """Full result of converting one Spotify playlist to TIDAL."""
+    """Full result of porting one playlist (originally: Spotify to TIDAL)."""
 
     playlist: PlaylistRef
     results: List[MatchResult] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
+    #: Which direction produced it. Queueing later -- after the review --
+    #: must use this direction, not whatever the Port tab shows by then.
+    source_service: str = "Spotify"
+    target_service: str = "TIDAL"
 
     def by_decision(self, decision: MatchDecision) -> List[MatchResult]:
         return [r for r in self.results if r.decision == decision.value]
@@ -313,6 +320,8 @@ class ConversionReport:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "counts": self.counts,
+            "source_service": self.source_service,
+            "target_service": self.target_service,
         }
 
     @classmethod
@@ -322,6 +331,8 @@ class ConversionReport:
             results=[MatchResult.from_dict(r) for r in (data.get("results") or [])],
             started_at=float(data.get("started_at") or time.time()),
             finished_at=data.get("finished_at"),
+            source_service=data.get("source_service") or "Spotify",
+            target_service=data.get("target_service") or "TIDAL",
         )
 
 
@@ -479,3 +490,20 @@ class SourceUnavailableError(HiresError):
 
 class PlaylistNotFoundError(SourceUnavailableError):
     """Raised when a playlist is gone or private. Its text is meant for the user."""
+
+
+class RunCancelled(HiresError):
+    """A conversion was cancelled or superseded by a newer one.
+
+    The matcher passes exactly this on (and swallows anything else a progress
+    display raises), so a cancelled port stops searching instead of finishing
+    in the background.
+    """
+
+
+class RateLimitedError(SourceUnavailableError):
+    """A service answered HTTP 429 or asked for a captcha.
+
+    Never retried and never swallowed: matching stops at once, because every
+    further request makes a block of the user's account or IP likelier.
+    """

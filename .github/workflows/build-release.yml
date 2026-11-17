@@ -16,12 +16,29 @@ on:
       tag:
         description: "Tag to build (leave empty to build the current ref)"
         required: false
+      version:
+        description: "Test builds: version baked into the app, e.g. v2.0.3-hires.90 (empty = development build, no update check)"
+        required: false
+      second_version:
+        description: "Update tests: also build Windows as this version (second artifact)"
+        required: false
 
 permissions:
   contents: write
 
 env:
   ORPHEUS_REPO: https://github.com/bascurtiz/OrpheusDL
+  # Pinned: OrpheusDL ced62b5 (2026-08-17, "gamdl helpers removed") dropped
+  # utils.vendor_bootstrap.insert_gamdl_sys_path, which gui.py imports at
+  # startup. Built against a newer core the app dies before its window opens.
+  # d8f339e is the last commit before that, the core the hires.12 build used.
+  ORPHEUS_REF: d8f339e497b414ed60080fff1cdd63a90f46b285
+  # SoundCloud from our fork until upstream has the fix: upstream saves Go+
+  # tracks as their 30 s preview without an error, and its built-in client id
+  # answers 401 without a token (DJ upgrade run, 2026-11-17). Pinned commit =
+  # upstream e1eff2e + that fix.
+  SOUNDCLOUD_REPO: https://github.com/CTreitges/orpheusdl-soundcloud
+  SOUNDCLOUD_REF: d37a40373b978a30f18c46f062eca63608127a09
 
 jobs:
   test:
@@ -32,7 +49,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest requests
+      - run: pip install pytest requests mutagen
       - run: python -m pytest tests/ -v
 
   build:
@@ -77,7 +94,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 "$ORPHEUS_REPO" app
+          git clone "$ORPHEUS_REPO" app
+          git -C app checkout --quiet "$ORPHEUS_REF"
+          # Fail the build, not the user's start: gui.py needs this helper.
+          grep -q "def insert_gamdl_sys_path" app/utils/vendor_bootstrap.py
           # GUI files sit alongside orpheus.py. Use cp rather than rsync:
           # Windows runners have Git Bash but no rsync. Drop the GUI checkout's
           # own .git so it cannot clobber app/.git, and any stray virtualenv --
@@ -92,7 +112,9 @@ jobs:
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-spotify                     modules/spotify
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-qobuz                       modules/qobuz
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-deezer                      modules/deezer
-          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-soundcloud                  modules/soundcloud
+          git clone "$SOUNDCLOUD_REPO" modules/soundcloud
+          git -C modules/soundcloud checkout --quiet "$SOUNDCLOUD_REF"
+          grep -q "if i.get('snipped'):" modules/soundcloud/interface.py
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-youtube                     modules/youtube
           # Vendored librespot-python: gui.spec bundles vendor/librespot into
           # the frozen app; without it the Spotify module dies at runtime with
@@ -100,6 +122,30 @@ jobs:
           # installers, including the patched core.py the Spotify module ships.
           python -m pip install --no-deps --upgrade --target vendor/librespot "git+https://github.com/kokarare1212/librespot-python"
           cp modules/spotify/librespot/core.py vendor/librespot/librespot/core.py
+
+      # The app reads its own version from hires/_build_version.py
+      # (hires/app_version.py). Tag builds bake the tag; test builds the
+      # "version" input; anything else stays a development build, which never
+      # checks for or installs updates.
+      - name: Bake the release version into the app
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version=""
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then version="$GITHUB_REF_NAME"; fi
+          if [[ -z "$version" ]]; then version="${INPUT_VERSION:-}"; fi
+          if [[ -z "$version" ]]; then
+            echo "No version: development build without update check."
+            exit 0
+          fi
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-hires\.[0-9]+$ ]]; then
+            echo "::error::'$version' is not a release version like v2.0.3-hires.13"
+            exit 1
+          fi
+          printf 'VERSION = "%s"\n' "$version" > app/hires/_build_version.py
+          echo "Baked version $version"
 
       - name: Install Python dependencies
         working-directory: app
@@ -118,8 +164,42 @@ jobs:
         working-directory: app
         shell: bash
         run: |
+          # The update script goes next to the EXE: unpacked into the old
+          # folder, it installs this EXE there (hires/self_update.py).
+          cp "installer/windows/Update OrpheusDL.cmd" dist/
           cd dist
           7z a -tzip "../${{ matrix.artifact }}.zip" ./*
+
+      # Update tests only: the same code once more as a second version, so one
+      # run yields an "old" and a "new" EXE for a real update. Never on a tag:
+      # the release job would attach this ZIP too, under the same name.
+      - name: Build second version (Windows, update tests)
+        if: matrix.label == 'windows' && inputs.second_version != '' && !startsWith(github.ref, 'refs/tags/')
+        working-directory: app
+        shell: bash
+        env:
+          SECOND_VERSION: ${{ inputs.second_version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SECOND_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-hires\.[0-9]+$ ]]; then
+            echo "::error::'$SECOND_VERSION' is not a release version"
+            exit 1
+          fi
+          printf 'VERSION = "%s"\n' "$SECOND_VERSION" > hires/_build_version.py
+          pyinstaller gui.spec --noconfirm --distpath dist-second
+          cp "installer/windows/Update OrpheusDL.cmd" dist-second/
+          mkdir -p second
+          cd dist-second
+          7z a -tzip "../second/${{ matrix.artifact }}.zip" ./*
+
+      - name: Upload second version
+        if: matrix.label == 'windows' && inputs.second_version != '' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-second
+          path: app/second/${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Package (macOS)
         if: matrix.label == 'macos'

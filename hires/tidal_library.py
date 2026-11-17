@@ -19,6 +19,7 @@ from .models import (
     FolderRef,
     HiresError,
     PlaylistRef,
+    RateLimitedError,
     SourceUnavailableError,
     TrackRef,
     flat_root,
@@ -147,6 +148,31 @@ def _cover_id(data: Dict[str, Any]) -> Any:
         or data.get("cover")
         or data.get("picture")
     )
+
+
+TIDAL_RATE_LIMITED = "TIDAL is refusing requests (HTTP 429/403). Stopped; try again later."
+
+#: "429 Client Error", "HTTP 429", "status 429", "(429)" -- a status, not just digits.
+_STATUS_IN_TEXT = re.compile(r"^\s*(?:429|403)\b|\b(?:http|status|code|error)\W{0,3}(?:429|403)\b|\((?:429|403)\)")
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """HTTP 429 -- or 403 -- from a TIDAL catalogue call, however the module wrapped it.
+
+    A 403 counts too: the module renews its session on a 403 and retries, so
+    one that still reaches us is a block, and every further search would only
+    repeat it (review part 2, N1). Stopping is the safe direction.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) in (403, 429):
+        return True
+    # Only where the text says it is a status: a bare "429" also turns up in
+    # ISRCs, search words and URL offsets (code review), and a plain 404 must
+    # not stop a 300-track port.
+    text = str(exc).lower()
+    if "too many requests" in text or "forbidden" in text:
+        return True
+    return bool(_STATUS_IN_TEXT.search(text))
 
 
 def _is_error_payload(data: Dict[str, Any]) -> bool:
@@ -527,21 +553,33 @@ class TidalLibrary:
         try:
             data = _as_dict(self.api.get_search_data(query, limit=limit))
         except Exception as exc:
+            if _is_rate_limited(exc):
+                raise RateLimitedError(TIDAL_RATE_LIMITED) from exc
             raise SourceUnavailableError(f"TIDAL search for {query!r} failed: {exc}") from exc
+        if _int_or_none(data.get("status")) == 429:
+            raise RateLimitedError(TIDAL_RATE_LIMITED)
 
         items = _as_list(_as_dict(data.get("tracks")).get("items"))
         tracks = [_track_from_json(i) for i in items]
         return [t for t in tracks if t.id]
 
     def find_by_isrc(self, isrc: str) -> List[TrackRef]:
-        """Tracks with this ISRC. Never raises - an unknown ISRC yields ``[]``."""
+        """Tracks with this ISRC; an unknown ISRC yields ``[]``.
+
+        Raises only :class:`RateLimitedError` -- a 429 must stop a port, not
+        turn every remaining track into "no ISRC hit".
+        """
         code = _text(isrc).upper()
         if not code:
             return []
         try:
             data = _as_dict(self.api.get_tracks_by_isrc(code))
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limited(exc):
+                raise RateLimitedError(TIDAL_RATE_LIMITED) from exc
             return []
+        if _int_or_none(data.get("status")) == 429:
+            raise RateLimitedError(TIDAL_RATE_LIMITED)
         if _is_error_payload(data):
             return []
         tracks = [_track_from_json(i) for i in _as_list(data.get("items"))]
