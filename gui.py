@@ -19970,6 +19970,20 @@ def _auto_save_credential_change(platform_name, key, widget=None, *args):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    # Hi-Res suite: "Update OrpheusDL.cmd" runs the new EXE with --install-into
+    # (hires/self_update.py). Handled before the single-instance mutex and
+    # before any folder is created next to the installer EXE. After an
+    # in-app update the new EXE first waits until the old one has quit.
+    try:
+        from hires import self_update as _hires_self_update
+        _install_code = _hires_self_update.run_cli(sys.argv)
+        if _install_code is not None:
+            sys.exit(_install_code)
+        _hires_self_update.wait_for_previous_instance(sys.argv)
+    except SystemExit:
+        raise
+    except Exception as _update_cli_error:
+        print(f"[Update] {_update_cli_error}")
     _mutex_handle = None
     if platform.system() == "Windows":
         try:
@@ -20023,6 +20037,18 @@ if __name__ == "__main__":
                 print(f"[CWD] Changed working directory to: {_DATA_DIR}")
                 print(f"[CWD] Verified CWD is now: {os.getcwd()}")
                 
+                # Hi-Res suite: the first start of a new version replaces the
+                # bundled modules (old ones -> modules.backup-<version>) and
+                # removes what an interrupted update left behind.
+                if getattr(sys, 'frozen', False) and platform.system() == "Windows":
+                    try:
+                        from hires import self_update as _hires_self_update
+                        from hires.app_version import current_version as _hires_version
+                        _hires_self_update.cleanup_leftovers(_SCRIPT_DIR)
+                        _hires_self_update.refresh_modules_on_start(
+                            _DATA_DIR, getattr(sys, '_MEIPASS', None), _hires_version())
+                    except Exception as _refresh_error:
+                        print(f"[Update] Module refresh skipped: {_refresh_error}")
                 # Copy bundled resources (modules, ffmpeg) to data directory
                 copy_bundled_resources_to_data_dir(_DATA_DIR)
                 packager_path = ensure_shaka_packager_in_data_dir(_DATA_DIR)

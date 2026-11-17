@@ -497,3 +497,22 @@ def test_wait_for_previous_instance():
                                          sleep=slept.append)
     assert len(slept) == 2
     assert not su.wait_for_previous_instance(["x"], exists=lambda: True)
+
+
+class TestGuiWiring:
+    """gui.py is too big to import; its source must call the core in the right order."""
+
+    @pytest.fixture
+    def main_block(self):
+        source = (Path(__file__).resolve().parents[1] / "gui.py").read_text(encoding="utf-8")
+        return source[source.index('if __name__ == "__main__":'):]
+
+    def test_install_into_runs_before_the_mutex_and_any_folder(self, main_block):
+        cli = main_block.index("_hires_self_update.run_cli(sys.argv)")
+        assert cli < main_block.index("CreateMutexW(None, True, mutex_name)")
+        assert cli < main_block.index("_DATA_DIR = get_data_directory()")
+        assert main_block.index("wait_for_previous_instance(sys.argv)") < main_block.index("CreateMutexW(None, True")
+
+    def test_modules_refresh_before_the_stock_copy(self, main_block):
+        refresh = main_block.index("_hires_self_update.refresh_modules_on_start(")
+        assert refresh < main_block.index("copy_bundled_resources_to_data_dir(_DATA_DIR)")
