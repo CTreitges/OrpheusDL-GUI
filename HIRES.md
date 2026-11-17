@@ -192,10 +192,12 @@ from any tab:
 |------|-----|
 | Sample rate and bit depth stay as they arrived; lossy sources become 16 bit | No upsampling: a bigger number would not mean better sound |
 | ffmpeg writes a `.part` file; it is checked (sample rate, bit depth, length ±50 ms) and tagged before it replaces the original | A failed or cut conversion never costs the original |
-| Tags and cover are copied with mutagen (ID3 in WAV/AIFF, Vorbis comments in FLAC) | ffmpeg's WAV writer cannot store a cover; DJ software reads the ID3 chunk |
+| All tags and covers are copied with mutagen: ID3 → WAV/AIFF frame by frame (Serato cue points, ratings, lyrics included); from FLAC/MP4 every field keeps its name (`TXXX` or Vorbis comment) | ffmpeg's WAV writer cannot store a cover; DJ software reads the ID3 chunk |
+| A tag the new format cannot hold (e.g. Serato's binary cue frames into FLAC) keeps the original next to the copy, with a log line | Never delete the only file that still has it |
 | Lossy sources (AAC, MP3, Opus, Vorbis) are converted with a note in the log | A WAV of a 160 kbit/s stream is still 160 kbit/s, just bigger |
-| Dolby Atmos / more than two channels, and float or 32-bit sources into FLAC, are skipped | WAV would fold Atmos to stereo; FLAC cannot hold them losslessly |
-| Only files created since the download started are touched | A library file another program re-tagged meanwhile is never converted or deleted |
+| Dolby Atmos / more than two channels, and float or 32-bit sources into FLAC, are skipped; float WAV/AIFF stay float at their width | WAV would fold Atmos to stereo; FLAC cannot hold them losslessly |
+| Only paths that did not exist when the download started, and were created since, are touched | A library file another program re-tagged meanwhile is never converted or deleted |
+| One converter per target file; the result never replaces an existing file | The download hook and "Convert folder…" can run side by side safely |
 | `.m3u` playlists written by the same download point at the new files | Playlist imports keep working |
 
 **Keep Original** keeps the downloaded file next to the converted one; off
@@ -206,10 +208,19 @@ as finished, so the queue starts its next item only afterwards. **Stop**
 interrupts it between files; the file being converted keeps its original.
 
 **Convert folder…** (next to the setting) does the same for a folder you
-already have, sub-folders included: pick a folder, a format and Keep original;
-without Keep original it asks first ("Replace originals?", Cancel is the
-default). Progress shows files done, failures and the time left; Cancel stops
-after the current file. Measured: 200 files in 12 s, 200 in, 200 out, 0 lost.
+already have, sub-folders included: pick a folder, a format and Keep original.
+It counts the files off the main thread, then — without Keep original — asks
+first ("Replace originals?", Cancel is the default). It refuses to start while
+a download runs, and the queue starts no new item while it converts. Progress
+shows files done, failures and the time left; Cancel stops at once (the file
+being converted keeps its original). Playlists in the folder are pointed at the
+new files. Where two files share a name (`x.flac`, `x.m4a`) the lossless one is
+converted. Measured: 200 files in 12 s, 200 in, 200 out, 0 lost.
+
+One case stays open by design: a file another program copies *into* the
+download folder while a download runs is new to the folder too, and is
+converted with it. Keep the download folder out of sync tools (OneDrive,
+Dropbox, Syncthing) — the help text of *Download path* says the same.
 
 Recommendation for DJ use: FLAC, or AIFF where a player or USB export needs
 uncompressed files with tags; WAV only when nothing else is accepted.
