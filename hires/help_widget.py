@@ -176,6 +176,13 @@ def keyboard_reachable(widget, message: str = "") -> None:
         target = entry if isinstance(entry, tkinter.Entry) else widget
         if target is widget:
             tkinter.Frame.configure(widget, takefocus=1)
+            # Its inner canvas and label are not stops of their own: in the
+            # app they were an invisible second Tab stop without ring or help.
+            for child in widget.winfo_children():
+                try:
+                    tkinter.Misc.configure(child, takefocus=0)
+                except Exception:
+                    pass
         tip = _tip_for(widget)
 
         def focus_in(_event=None):

@@ -92,6 +92,10 @@ def test_keyboard_help_button_ring_and_enter(root):
     root.update()
 
     assert str(tkinter.Frame.cget(button, "takefocus")) == "1"
+    # The real app showed an invisible second stop: the button's inner canvas
+    # (gui.py's bindings make Tk count it as focusable). Only the button counts.
+    inner = button.winfo_children()
+    assert inner and all(str(tkinter.Misc.cget(child, "takefocus")) == "0" for child in inner)
     for key in ("<Return>", "<space>", "<KP_Enter>"):
         assert tkinter.Misc.bind(button, key), f"{key} does not press the button"
     _focus(button)
@@ -149,9 +153,8 @@ def test_keyboard_help_every_hires_control_is_reachable(root, tmp_path):
     port = result["tabs"]["port"]
     view.set("Port")  # Tab skips what is not on screen
     root.update()
-    order = []
-    widget = port.url_entry._entry
-    for _ in range(4):
-        widget = widget.tk_focusNext()
-        order.append(widget)
-    assert port.port_queue_button in order, "Tab from the link field never reaches Port & queue"
+    # Link field -> "Port" -> "Port & queue": no invisible stop in between
+    # (customtkinter's inner canvas of a button was one, without ring or help).
+    first = port.url_entry._entry.tk_focusNext()
+    second = first.tk_focusNext()
+    assert second is port.port_queue_button, f"second Tab from the link field lands on {second}"
