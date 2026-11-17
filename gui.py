@@ -22465,10 +22465,12 @@ Unnecessary Lossless-to-Lossless""",
         # Hi-Res suite: updates come from CTreitges/OrpheusDL-GUI releases and
         # install in-app (hires/update_flow.py) instead of the stock check,
         # which asks bascurtiz/OrpheusDL-GUI and only opens its page.
+        # Through app.after: the check starts once the main loop runs, so its
+        # window never appears while this one is still being built.
         try:
             _hires_updater = hires_runtime.get("updater") if isinstance(hires_runtime, dict) else None
             if _hires_updater is not None:
-                _hires_updater.start_auto()
+                app.after(4000, _hires_updater.start_auto)
         except Exception as update_err:
             print(f"[Error] Failed to start update check: {update_err}")
 

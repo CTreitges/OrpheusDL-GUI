@@ -513,6 +513,11 @@ class TestGuiWiring:
         assert cli < main_block.index("_DATA_DIR = get_data_directory()")
         assert main_block.index("wait_for_previous_instance(sys.argv)") < main_block.index("CreateMutexW(None, True")
 
+    def test_update_check_replaces_the_stock_check_and_waits_for_the_main_loop(self, main_block):
+        assert "run_check_in_thread(__version__, app)" not in main_block, "stock check asks bascurtiz releases"
+        assert "app.after(4000, _hires_updater.start_auto)" in main_block
+        assert "add_check_button(mid_inner, _hires_updater)" in main_block
+
     def test_modules_refresh_before_the_stock_copy(self, main_block):
         refresh = main_block.index("_hires_self_update.refresh_modules_on_start(")
         assert refresh < main_block.index("copy_bundled_resources_to_data_dir(_DATA_DIR)")
