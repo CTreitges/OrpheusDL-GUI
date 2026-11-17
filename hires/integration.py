@@ -128,6 +128,9 @@ class HiresRuntime:
         #: Quality label per finished download thread, from
         #: :func:`hires.download_finish.after_download`.
         self._reports: dict = {}
+        #: Set while an app update waits for the running download to finish:
+        #: the queue then starts nothing new (hires/update_flow.py).
+        self._held = False
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> bool:
@@ -190,6 +193,8 @@ class HiresRuntime:
                 return
             if folder_job_running():
                 return  # never download into a folder "Convert folder…" is working on
+            if self._held:
+                return  # an app update waits for the app to become free
             item = self.queue.claim_next()
             if item is None:
                 return
@@ -244,6 +249,14 @@ class HiresRuntime:
         mid-transfer replaces the session the running download is using.
         """
         return self._active_id is not None or self._gui_is_busy()
+
+    def hold_new_items(self, held: bool) -> None:
+        """Start no new queue item while ``held`` (a running one finishes)."""
+        self._held = bool(held)
+
+    @property
+    def held(self) -> bool:
+        return self._held
 
     def stop_active(self) -> bool:
         """Stop the download this runtime started, if there is one.
@@ -677,6 +690,61 @@ def make_spotify_status_provider(gui: Any) -> Callable[[], Any]:
     return provider
 
 
+def _open_url(url: str) -> None:
+    try:
+        from utils.utils import open_url_in_browser
+
+        open_url_in_browser(url)
+    except Exception:
+        import webbrowser
+
+        webbrowser.open(url, new=2)
+
+
+def make_updater(gui: Any, runtime: HiresRuntime) -> Any:
+    """The in-app updater, wired to the running GUI and the queue runtime.
+
+    Busy means: anything downloads (stock GUI or queue) or "Convert folder…"
+    runs. While an update waits for that to end, the runtime starts nothing
+    new. Quitting goes through gui.py's own exit path, which also releases
+    the single-instance mutex the restarted EXE waits for.
+    """
+    import sys
+
+    from .app_version import current_version
+    from .controllers import UiDispatcher
+    from .self_update import EXE_NAME
+    from .update_flow import UpdateController, updates_enabled
+
+    app = getattr(gui, "app", None)
+    frozen = bool(getattr(sys, "frozen", False))
+    script_dir = getattr(gui, "get_script_directory", None)
+    app_dir = script_dir() if callable(script_dir) else (getattr(gui, "application_path", None) or os.getcwd())
+    exe_name = os.path.basename(sys.executable) if frozen else EXE_NAME
+    quit_app = getattr(gui, "_on_gui_exit", None) or (lambda: None)
+
+    def view_factory():
+        from .update_panel import UpdateDialog
+
+        return UpdateDialog(app, updater)
+
+    updater = UpdateController(
+        version=current_version(),
+        app_dir=app_dir,
+        exe_name=exe_name,
+        dispatch=UiDispatcher(app),
+        schedule=lambda ms, fn: app.after(ms, fn),
+        busy=lambda: runtime.is_busy() or folder_job_running(),
+        hold=runtime.hold_new_items,
+        quit_app=quit_app,
+        enabled=lambda: updates_enabled(getattr(gui, "current_settings", None)),
+        view_factory=view_factory,
+        can_self_install=frozen and os.name == "nt",
+        open_page=_open_url,
+    )
+    return updater
+
+
 def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> Optional[dict]:
     """Add the Accounts / Queue / Playlists / Port tabs and start the queue runner.
 
@@ -728,7 +796,12 @@ def setup_tabs(gui: Any, tabview: Any, *, queue_path: Optional[str] = None) -> O
         pending = store.stats().remaining
         if pending:
             print(f"|GRAY|[Hi-Res] Restored {pending} queued item(s).|RESET|")
-        return {"runtime": runtime, "queue": store, "tabs": tabs}
+        try:
+            updater = make_updater(gui, runtime)
+        except Exception as exc:  # the tabs work without it
+            updater = None
+            print(f"[Update] In-app update unavailable: {exc}")
+        return {"runtime": runtime, "queue": store, "tabs": tabs, "updater": updater}
     except Exception as exc:
         print(f"[Hi-Res] Disabled: {exc}")
         return None

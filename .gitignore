@@ -147,3 +147,6 @@ config/hires_queue.json
 # OrpheusDL service modules, cloned in beside the GUI at runtime. They belong
 # to their own repositories and must never be vendored into this one.
 modules/
+
+# Written by the release build (hires/app_version.py)
+hires/_build_version.py

@@ -12,6 +12,13 @@
 > the queue shows the quality each download really arrived in.
 > See **[HIRES.md](HIRES.md)**.
 >
+> **Updating the Windows one-folder build** keeps settings, logins, queue and
+> downloads: once, unpack the new release ZIP *into* your old folder and run
+> **`Update OrpheusDL.cmd`** from it; from then on the app's **auto-update**
+> (About › Check for updates, or the daily check) installs new releases of this
+> fork itself — after asking, with the download checked against GitHub's
+> SHA-256. Details: [HIRES.md › Updates](HIRES.md#updates).
+>
 > Upstream project: [bascurtiz/OrpheusDL-GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
 
 ## Trailer

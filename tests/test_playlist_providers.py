@@ -120,12 +120,47 @@ class TestPlaylistProviderInterface:
             ("Daft Punk - Get Lucky (Official Audio) ft. Pharrell", "Daft Punk", ["Daft Punk"], "Get Lucky ft. Pharrell"),
             ("Kygo, Conrad Sewell - Firestone", "Kygo", ["Kygo", "Conrad Sewell"], "Firestone"),
             ("Levels (Radio Edit)", "Avicii - Topic", ["Avicii"], "Levels (Radio Edit)"),
-            ("Animals [Official Video]", "MartinGarrixVEVO", ["MartinGarrix"], "Animals"),
+            ("Animals [Official Video]", "MartinGarrixVEVO", ["Martin Garrix"], "Animals"),
             ("Losing It (Live at Coachella)", "", [], "Losing It (Live at Coachella)"),
         ],
     )
     def test_split_artist_title_keeps_version_markers(self, title, uploader, artists, song):
         assert split_artist_title(title, uploader) == (artists, song)
+
+    @pytest.mark.parametrize(
+        "channel, artist",
+        [
+            ("BASTILLEvideos", "BASTILLE"),
+            ("Daft Punk - Topic", "Daft Punk"),
+            ("MartinGarrixVEVO", "Martin Garrix"),
+            ("AviciiOfficialVEVO", "Avicii"),
+            ("Dua Lipa Official", "Dua Lipa"),
+            ("DuaLipaOfficial", "Dua Lipa"),
+            ("Calvin Harris Music", "Calvin Harris Music"),  # spaced "Music" may be the name
+            ("Roxy Music - Topic", "Roxy Music"),  # review N8: was "Roxy"
+            ("Roxy Music", "Roxy Music"),
+            ("MTV", "MTV"),  # review N8: was "M"
+            ("Unofficial", "Unofficial"),  # review N8: was "Un"
+            ("Bastille Videos", "Bastille"),
+            ("RobinSchulzMusic", "Robin Schulz"),
+            ("KygoOfficialTV", "Kygo"),
+            ("Kraftwerk", "Kraftwerk"),
+            ("deadmau5", "deadmau5"),
+            ("McFlyVEVO", "McFly"),
+            ("The Music", "The Music"),
+            ("Video", "Video"),
+            ("MUSIC", "MUSIC"),
+            ("", ""),
+        ],
+    )
+    def test_channel_name_is_reduced_to_the_artist(self, channel, artist):
+        """Channel endings are not part of the artist ("BASTILLEvideos", gui review)."""
+        from hires.playlist_providers import clean_channel
+
+        assert clean_channel(channel) == artist
+
+    def test_channel_name_feeds_the_artist_of_an_upload_without_dash(self):
+        assert split_artist_title("Pompeii (Official Music Video)", "BASTILLEvideos") == (["BASTILLE"], "Pompeii")
 
     def test_rate_limit_stops_a_port_instead_of_moving_on(self):
         """A 429 must end the run: every further search makes a block likelier."""

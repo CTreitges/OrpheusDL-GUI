@@ -598,6 +598,70 @@ def review(sid, tid, alternatives=None):
     )
 
 
+class TestPortAndQueue:
+    """One click: port, confident matches into the queue, the rest to review."""
+
+    def _tab(self, root, queue, matcher):
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root))
+
+    def test_port_and_queue_queues_confident_and_keeps_uncertain_for_review(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), accepted("s3", "t3"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        items = queue.list()
+        assert [i.url.rsplit("/", 1)[-1] for i in items] == ["t1", "t3"]
+        assert len({i.group_id for i in items}) == 1, "one port = one group in the queue"
+        assert "Queued 2 tracks" in tab.status_label.cget("text")
+        assert "1 uncertain wait for review" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "normal"
+        assert tab.queue_button.cget("state") == "disabled", "queueing again would download twice"
+
+    def test_port_and_queue_review_queues_only_the_reviewed(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: tab.review_button.cget("state") == "normal")
+        tab._apply_review({"s2": "t2"})
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1", "t2"]
+
+    def test_port_and_queue_without_link_warns(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.port_and_queue()
+        pump(root)
+        assert "Paste a Spotify playlist link" in tab.status_label.cget("text")
+        assert queue.list() == []
+
+    def test_port_and_queue_nothing_uncertain(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: queue.list())
+        assert "Nothing uncertain" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "disabled"
+
+    def test_port_link_row_appears_after_porting_a_link(self, root, queue):
+        """Regression (gui review): the list kept the intro text after a port by link."""
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.list.playlists)
+        assert [p.name for p in tab.list.playlists] == ["Remote"]
+        assert "x" in tab.list._rows
+
+    def test_port_link_row_keeps_own_playlists_and_no_duplicates(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.list.set_playlists([PlaylistRef(id="mine", name="Mine")])
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: len(tab.list.playlists) == 2)
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.status_label.cget("text").endswith("not found"))
+        assert [p.id for p in tab.list.playlists] == ["x", "mine"]
+
+
 class TestSpotifyConvertTab:
     def _tab(self, root, queue, source, matcher, **kwargs):
         return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root), **kwargs)
@@ -929,6 +993,112 @@ class TestSetupTabsWiring:
         assert gui.calls, "runtime never handed anything to gui.py"
         _url, _path, data = gui.calls[0]
         assert data["extra_kwargs"]["download_quality_override"] == "hifi"
+
+    # -- in-app update ------------------------------------------------------
+    def _updater(self, root, tmp_path):
+        """setup_tabs' own updater; only the outside edges are replaced."""
+        from hires import update_check as uc
+
+        gui, result = self._build(root, tmp_path, "hifi")
+        updater = result["updater"]
+        assert updater is not None, "setup_tabs built no updater"
+        events = {"swapped": [], "restarted": [], "quit": 0}
+        staged = tmp_path / "OrpheusDL_GUI.new.exe"
+
+        def stage(app_dir, release, channel, progress, cancelled):
+            staged.write_bytes(b"MZ")
+            return str(staged)
+
+        def quit_app():
+            events["quit"] += 1
+
+        updater.release = uc.ReleaseInfo(
+            tag="v2.0.3-hires.13", name="", notes="", page_url=uc.RELEASES_PAGE,
+            asset_url="https://github.com/CTreitges/OrpheusDL-GUI/releases/download/v2.0.3-hires.13/x.zip",
+            size=1, sha256="a" * 64,
+        )
+        updater.state = updater.OFFERED
+        updater.can_self_install = True
+        updater._stage = stage
+        updater._swap = lambda app_dir, path, exe_name: events["swapped"].append(path)
+        updater._restart = lambda app_dir, exe_name: events["restarted"].append(exe_name)
+        updater._quit = quit_app
+        updater._run_worker = lambda fn: fn()
+        updater._view_factory = lambda: type("V", (), {"__getattr__": lambda s, n: (lambda *a: None)})()
+        return gui, result, updater, events
+
+    def test_update_busy_no_restart_while_the_gui_downloads(self, root, tmp_path):
+        """N3 through the real assembly: busy = the runtime's view of gui.py."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        gui.download_process_active = True
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["swapped"] == [] and events["quit"] == 0
+        gui.download_process_active = False
+        updater._try_install()
+        assert events["swapped"] and events["restarted"] and events["quit"] == 1
+
+    def test_update_busy_queue_starts_nothing_new_while_waiting(self, root, tmp_path):
+        """While the update waits, the runtime holds; Cancel lets the queue go on."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        runtime, queue = result["runtime"], result["queue"]
+        queue.add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        gui.download_process_active = True  # a download the user started by hand
+        updater.accept()
+        pump_until(root, lambda: runtime.held)
+        assert runtime.held
+        gui.download_process_active = False
+        runtime._pump()
+        assert gui.calls == [], "queue started an item although an update waits"
+        updater.cancel()
+        assert not runtime.held
+        runtime._pump()
+        assert len(gui.calls) == 1
+
+    def test_update_busy_queue_item_counts_as_busy(self, root, tmp_path):
+        gui, result, updater, events = self._updater(root, tmp_path)
+        result["queue"].add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        result["runtime"]._pump()          # the queue hands an item to gui.py
+        assert gui.calls
+        gui.download_process_active = False  # between polls: GUI idle, item still ours
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["quit"] == 0
+
+    def test_update_busy_convert_folder_counts_as_busy(self, root, tmp_path, monkeypatch):
+        from hires import integration
+
+        gui, result, updater, events = self._updater(root, tmp_path)
+        monkeypatch.setattr(integration, "folder_job_running", lambda: True)
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        monkeypatch.setattr(integration, "folder_job_running", lambda: False)
+        updater._try_install()
+        assert events["quit"] == 1
+
+    def test_port_and_queue_button_in_the_real_assembly(self, root, tmp_path):
+        """The real button of setup_tabs' Port tab; only the services are fakes."""
+        gui, result = self._build(root, tmp_path, "high")
+        port, queue = result["tabs"]["port"], result["queue"]
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        controller = port.controller
+        controller.providers = {"Spotify": lambda: source, "TIDAL": lambda: object()}
+        controller.matcher_factory = lambda _t, _n: FakeMatcher([accepted("s1", "t1"), review("s2", "t2")])
+        controller._build_converter = lambda direction=None: __import__(
+            "hires.converter", fromlist=["PlaylistConverter"]
+        ).PlaylistConverter(source, controller.matcher_factory(None, "TIDAL"), queue, quality="hifi",
+                            output_root=str(tmp_path), source_name="Spotify", target_name="TIDAL")
+        port.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        port.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1"]
+        assert queue.list()[0].quality == "hifi"
+        assert port.review_button.cget("state") == "normal"
+        assert [p.name for p in port.list.playlists] == ["Remote"]
 
     def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")

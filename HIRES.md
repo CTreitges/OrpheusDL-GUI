@@ -13,6 +13,8 @@ Additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
    the default).
 5. **Target format** — convert every download to WAV, FLAC or AIFF, and whole
    folders on demand (*Settings → Codecs*).
+6. **Updates** — the Windows one-folder build updates without being set up
+   again: `Update OrpheusDL.cmd` once, then auto-update from the app.
 
 Everything lives in the `hires/` package. `gui.py` only wires it in: the lines
 that add the tabs (wrapped in a `try/except` — if anything here breaks, the
@@ -211,7 +213,8 @@ interrupts it between files; the file being converted keeps its original.
 already have, sub-folders included: pick a folder, a format and Keep original.
 It counts the files off the main thread, then — without Keep original — asks
 first ("Replace originals?", Cancel is the default). It refuses to start while
-a download runs, and the queue starts no new item while it converts. Progress
+a download runs, and the queue starts no new item while it converts; a
+download started by hand meanwhile shows a hint instead of starting. Progress
 shows files done, failures and the time left; Cancel stops at once (the file
 being converted keeps its original). Playlists in the folder are pointed at the
 new files. Where two files share a name (`x.flac`, `x.m4a`) the lossless one is
@@ -336,8 +339,13 @@ Matching works as described below for every direction: ISRC first where both
 sides have one (Spotify and TIDAL look ISRCs up; SoundCloud label uploads carry
 them as a source), otherwise title, artist and length with the version guard.
 YouTube and SoundCloud titles are split into artist and title first
-("Artist - Title (Official Video)" → artist, title; channel names lose
-"- Topic" and "VEVO").
+("Artist - Title (Official Video)" → artist, title). Where the title has no
+artist, the channel name stands in, without endings that are not part of the
+name: "Daft Punk - Topic", "BASTILLEvideos" → "BASTILLE",
+"MartinGarrixVEVO" → "Martin Garrix", "Dua Lipa Official", "RobinSchulzMusic".
+A glued ending only counts at a word boundary ("MTV", "Unofficial" stay), and
+"Music"/"TV" after a space stay too — "Roxy Music" is a band. Measured on ten
+artist channels (live, 17.11.): 8 → 9 of 10 channel names give the artist.
 
 Searches are paced — at least 1 s between two YouTube or SoundCloud requests
 (yt-dlp's own "sleep" preset spaces requests 0.75 s apart). An HTTP 429 or a
@@ -419,6 +427,12 @@ Each track lands in one of three buckets:
 dialog where each track can be confirmed, swapped for an alternative, or
 skipped. Nothing uncertain downloads without your say-so.
 
+**Port & queue** (next to *Port*) does both in one click: it ports the link —
+or the highlighted playlist — and queues the confident matches right away as
+one group; the uncertain ones wait in *Review uncertain…* and join the same
+group once confirmed. A track is never queued twice, whichever way you go.
+A playlist ported by link shows as a row in the list.
+
 ### Quality
 
 Queued items are pinned to `hifi`, which on TIDAL resolves to
@@ -431,12 +445,80 @@ after the playlist.
 
 ---
 
+## Updates
+
+The Windows build is one folder: `OrpheusDL_GUI.exe` next to `config/` (logins,
+settings, queue, Spotify token), `modules/`, `extensions/` and `downloads/`.
+Both ways of updating replace only the program and the bundled modules;
+`config/`, `downloads/` and `extensions/` are never written, moved or copied
+(the tests hash them before and after). Both run the same code
+(`hires/self_update.py`).
+
+### Once: `Update OrpheusDL.cmd`
+
+Every Windows release ZIP holds the EXE and `Update OrpheusDL.cmd`.
+
+1. Close OrpheusDL (also from the tray).
+2. Unpack the new ZIP **into** your old OrpheusDL folder — Windows' *Extract
+   all* puts it there as a sub folder.
+3. Double-click `Update OrpheusDL.cmd` in that sub folder.
+
+The script only starts the new EXE with `--install-into <old folder>`; the
+EXE does the rest: it checks that the folder above holds `OrpheusDL_GUI.exe`
+and `config/`, that OrpheusDL is not running, then renames the old EXE to
+`OrpheusDL_GUI.old.exe`, puts itself in its place, replaces the bundled
+modules (the old ones go to `modules.backup-<version>/`, a module of your own
+stays) and starts the updated app. Anything wrong — wrong folder, app still
+running, no write access — and it says why and changes nothing. Running it
+twice does nothing the second time. The sub folder can be deleted afterwards.
+
+### From then on: auto-update
+
+On start, at most once a day, the app asks GitHub for the latest release of
+**CTreitges/OrpheusDL-GUI** (no pre-releases) — on a worker thread, so the
+window never waits; without internet it stays silent (one log line).
+*About → Check for updates* asks at any time; *Settings → Advanced → Check For
+Updates* switches the daily check off.
+
+When a newer release exists, a window shows the version and its notes and
+asks. *Update now*:
+
+| Step | What is checked |
+|------|-----------------|
+| Download of `OrpheusDL-GUI-windows.zip` into `update/` | only from this repository's release URL over HTTPS; redirects only to GitHub hosts; size as announced |
+| SHA-256 of the ZIP | must equal the asset's `digest` in GitHub's API — a release without one is offered as a page, never installed |
+| Taking the EXE out | only the entry `OrpheusDL_GUI.exe` at the top of the ZIP, a Windows program, at most 1 GiB; nothing else is unpacked |
+| Waiting | while anything downloads (a download by hand, the queue, *Convert folder…*) the update waits and the queue starts nothing new; *Cancel update* lets the queue go on |
+| Swap | the running EXE is renamed to `OrpheusDL_GUI.old.exe` (Windows allows renaming a running program, not overwriting it), the new one takes its place; a failure puts the old one back |
+| Restart | the new EXE starts, waits until the old one has quit, replaces the bundled modules (backup as above) |
+
+Anything failing leaves the installed app as it was and says why ("checksum
+mismatch: the download is not the published file", "no write access to the
+program folder"). Should the new version not start, rename
+`OrpheusDL_GUI.old.exe` back to `OrpheusDL_GUI.exe`; it stays until the next
+update. macOS and Linux builds only point to the release page. The update log
+is `update/update.log` — versions and steps, no paths.
+
+**Versions.** The release build writes its tag (`v2.0.3-hires.N`) into the app
+(`hires/app_version.py`); releases are compared by the numbers, so `hires.10`
+is newer than `hires.9`. A build without a tag is a development build and never
+checks. For tests, `ORPHEUSDL_UPDATE_TEST_SERVER=http://127.0.0.1:<port>`
+points the check at a local stand-in — loopback only, downloads only from that
+same server.
+
+**Releasing.** Push a tag `v2.0.3-hires.N`: the build bakes the version in and
+attaches the ZIP; GitHub adds the SHA-256 `digest` to the asset by itself.
+
+---
+
 ## Help markers and recommendations
 
 Every setting on *Settings → Global* and on the Spotify, TIDAL, YouTube and
 SoundCloud tabs has a **?** behind its label; hovering it explains the
 setting and recommends a value for DJ use. Buttons of the hi-res tabs carry
-the same kind of text as a tooltip. The texts live in `hires/help_texts.py`;
+the same kind of text as a tooltip. Both work by keyboard too: every "?" and
+every control with help is a Tab stop with a visible ring, shows its text when
+it gets the focus, and Enter or Space presses a button. The texts live in `hires/help_texts.py`;
 `tests/test_help_coverage.py` reads the setting keys out of `gui.py` and fails
 for any setting without one.
 
@@ -503,6 +585,9 @@ free of tkinter and can be tested headlessly:
 | `download_finish.py` | After every download: actual quality, target format, `.m3u` fix-up |
 | `convert_job.py`, `convert_panel.py` | "Convert folder…": worker job and its dialog |
 | `integration.py` | The bridge into `gui.py` |
+| `app_version.py`, `update_check.py` | Version of the build; release check against GitHub |
+| `self_update.py` | Download, checks, EXE swap, modules, `--install-into` (script and app) |
+| `update_flow.py`, `update_panel.py` | In-app update: steps and waiting, the dialog |
 
 ```bash
 # Headless: everything except the widget tests (which skip themselves).

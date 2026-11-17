@@ -24,6 +24,19 @@ def folder_job_running() -> bool:
     return _ACTIVE.is_set()
 
 
+#: Shown instead of starting a download by hand while a folder is converted.
+MANUAL_DOWNLOAD_HINT = (
+    "\"Convert folder…\" is still running. Start the download when it has "
+    "finished (or cancel it) -- a download now could write into the folder "
+    "that is being converted. The queue waits the same way."
+)
+
+
+def manual_download_hint() -> str:
+    """The hint for a download started by hand, or ``""`` when nothing blocks it."""
+    return MANUAL_DOWNLOAD_HINT if folder_job_running() else ""
+
+
 @dataclass
 class Progress:
     done: int

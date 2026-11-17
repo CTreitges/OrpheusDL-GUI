@@ -289,3 +289,55 @@ class TestPortMatrixTab:
         assert tab.swap_button.cget("text") == "Swap"
         tab.swap_button.invoke()
         assert tab.controller.direction == ("TIDAL", "Spotify")
+
+
+def test_port_and_queue_controller_queues_once(tmp_path):
+    """Port & queue, then "Queue matches" or a review: no track is queued twice.
+
+    Regression: queueing the confident matches and then applying the review
+    queued the confident ones again -- each of them downloaded twice.
+    """
+    controller, queue, _services = make_controller(tmp_path)
+    done, errors = [], []
+    controller.convert_and_queue(
+        "https://example/playlist", lambda *_a: None, lambda report, items: done.append((report, items)),
+        errors.append,
+    ).join(5)
+    assert errors == [] and len(done) == 1
+    report, items = done[0]
+    assert len(items) == 3 and len(queue.list()) == 3
+    assert controller.enqueue_confident_only(report) == []
+    assert controller.apply_review_and_enqueue({}, report=report) == []
+    assert len(queue.list()) == 3
+    assert len({i.group_id for i in queue.list()}) == 1
+
+
+def test_port_and_queue_controller_forgets_older_reports(tmp_path):
+    """Review PR #3: the queued-ids bookkeeping keeps only the latest report,
+    not every report of the session with all its candidates."""
+    import gc
+    import weakref
+
+    controller, _queue, _services = make_controller(tmp_path)
+    reports = []
+    for _ in range(2):
+        controller.convert_and_queue(
+            "https://example/playlist", lambda *_a: None, lambda report, items: reports.append(report),
+            lambda exc: None,
+        ).join(5)
+    first = weakref.ref(reports.pop(0))
+    controller.report = reports[-1]
+    gc.collect()
+    assert first() is None, "the first report is still held"
+
+
+def test_port_link_row_helper_puts_the_link_on_top_once():
+    from hires.models import FolderRef
+    from hires.port_controller import with_linked_playlist
+
+    mine = FolderRef(playlists=[PlaylistRef(id="a", name="Mine")], folders=[FolderRef(name="F")])
+    linked = PlaylistRef(id="b", name="Linked")
+    root = with_linked_playlist(mine, linked)
+    assert [p.id for p in root.playlists] == ["b", "a"] and root.folders == mine.folders
+    assert with_linked_playlist(root, linked) is root
+    assert [p.id for p in with_linked_playlist(None, linked).playlists] == ["b"]
