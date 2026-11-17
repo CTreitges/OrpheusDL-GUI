@@ -112,7 +112,9 @@ class PlaylistConverter:
         ``NEEDS_REVIEW`` and are not queued until :meth:`enqueue` is called.
         """
         ref = self._resolve_playlist(playlist)
-        tracks = self.spotify.get_playlist_tracks(playlist)
+        # The resolved ref, not the link again: a pasted YouTube or SoundCloud
+        # link would otherwise be fetched twice (code review).
+        tracks = self.spotify.get_playlist_tracks(ref)
         if not tracks:
             raise SourceUnavailableError(f"Playlist '{ref.name or ref.id}' has no readable tracks")
 

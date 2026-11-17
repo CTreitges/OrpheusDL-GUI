@@ -152,6 +152,9 @@ def _cover_id(data: Dict[str, Any]) -> Any:
 
 TIDAL_RATE_LIMITED = "TIDAL is refusing requests (HTTP 429/403). Stopped; try again later."
 
+#: "429 Client Error", "HTTP 429", "status 429", "(429)" -- a status, not just digits.
+_STATUS_IN_TEXT = re.compile(r"^\s*(?:429|403)\b|\b(?:http|status|code|error)\W{0,3}(?:429|403)\b|\((?:429|403)\)")
+
 
 def _is_rate_limited(exc: BaseException) -> bool:
     """HTTP 429 -- or 403 -- from a TIDAL catalogue call, however the module wrapped it.
@@ -163,8 +166,13 @@ def _is_rate_limited(exc: BaseException) -> bool:
     response = getattr(exc, "response", None)
     if getattr(response, "status_code", None) in (403, 429):
         return True
+    # Only where the text says it is a status: a bare "429" also turns up in
+    # ISRCs, search words and URL offsets (code review), and a plain 404 must
+    # not stop a 300-track port.
     text = str(exc).lower()
-    return any(word in text for word in ("429", "too many requests", "403", "forbidden"))
+    if "too many requests" in text or "forbidden" in text:
+        return True
+    return bool(_STATUS_IN_TEXT.search(text))
 
 
 def _is_error_payload(data: Dict[str, Any]) -> bool:

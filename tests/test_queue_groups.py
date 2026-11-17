@@ -63,9 +63,21 @@ class TestGroupKey:
 
     def test_label_groups_playlists_queued_as_one_item(self):
         """A TIDAL playlist queued whole carries only its name."""
+        a = QueueItem(url="u1", group_label="Warm-up", platform="TIDAL")
+        b = QueueItem(url="u2", group_label="Warm-up", platform="TIDAL")
+        assert group_key(a) == group_key(b) == "label:TIDAL:Warm-up"
+
+    def test_queue_group_same_name_on_two_services_stays_apart(self):
+        """Code review: "Favorites" from TIDAL and from YouTube were one group,
+        so removing one removed the other's entries too."""
+        tidal = QueueItem(url="u1", group_label="Favorites", platform="TIDAL")
+        youtube = QueueItem(url="u2", group_label="Favorites", platform="YouTube")
+        assert group_key(tidal) != group_key(youtube)
+
+    def test_queue_group_old_entries_without_platform_still_group(self):
         a = QueueItem(url="u1", group_label="Warm-up")
         b = QueueItem(url="u2", group_label="Warm-up")
-        assert group_key(a) == group_key(b) == "label:Warm-up"
+        assert group_key(a) == group_key(b)
 
     def test_two_runs_of_the_same_playlist_stay_apart(self):
         first = QueueItem(url="u", group_id="spotify-x-1", group_label="Mix")

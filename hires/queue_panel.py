@@ -427,7 +427,7 @@ class QueueTab:
 
         self.clear_all_button.configure(state="normal" if groups else "disabled")
         self.empty_label.configure(
-            text="" if groups else "Queue is empty.\n\nAdd playlists from the TIDAL or Spotify tab."
+            text="" if groups else "Queue is empty.\n\nAdd playlists from the Playlists or Port tab."
         )
         self._set_notice(self.empty_label, not groups, grid_row, pady=30)
         self.overflow_label.configure(

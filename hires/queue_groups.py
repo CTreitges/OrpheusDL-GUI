@@ -31,6 +31,10 @@ def group_key(item: QueueItem) -> str:
     if item.group_id:
         return f"id:{item.group_id}"
     if item.group_label:
+        # With the service: "Favorites" from TIDAL and from YouTube are two
+        # playlists, and removing one must not remove the other (code review).
+        if item.platform:
+            return f"label:{item.platform}:{item.group_label}"
         return f"label:{item.group_label}"
     return SINGLES_KEY
 

@@ -107,7 +107,13 @@ class _QuietLogger:
 
 
 def make_ytdlp_extractor(cookies_path: str = "") -> Extractor:
-    """An extractor running yt-dlp flat, with a temp copy of the cookie file."""
+    """An extractor running yt-dlp flat, with a temp copy of the cookie file.
+
+    A copy, because yt-dlp's ``cookiefile`` is "read and dumped to": it would
+    rewrite the user's own file.
+    """
+    # Context7: yt-dlp (/yt-dlp/yt-dlp) v2026.10.26 -- YoutubeDL options extract_flat,
+    # skip_download, cookiefile, logger; extract_info(download=False), sanitize_info.
 
     def extract(url: str) -> Dict[str, Any]:
         import yt_dlp  # lazy: the tab must load even where yt-dlp is missing

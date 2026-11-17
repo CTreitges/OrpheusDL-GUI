@@ -322,3 +322,36 @@ def test_port_matrix_tidal_403_on_search_stops(message):
         library.search_tracks("x")
     with pytest.raises(RateLimitedError):
         library.find_by_isrc("USQX91300108")
+
+
+# -- code review: a TIDAL error is a block only when it says so ---------------------------
+
+class _HttpError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.response = type("R", (), {"status_code": status})() if status else None
+
+
+@pytest.mark.parametrize("message", [
+    "404 Client Error: Not Found for url: https://api.tidal.com/v1/tracks?isrc=GBAYE0601429",
+    "Not found: https://api.tidal.com/v1/search?query=x&offset=403",
+    "No result for 'Room 429'",
+])
+def test_port_matrix_tidal_digits_in_an_error_are_not_a_block(message):
+    from hires.tidal_library import _is_rate_limited
+
+    assert not _is_rate_limited(_HttpError(message))
+
+
+@pytest.mark.parametrize("error", [
+    _HttpError("anything", status=429),
+    _HttpError("anything", status=403),
+    _HttpError("429 Client Error: Too Many Requests for url: https://api.tidal.com/v1/search"),
+    _HttpError("403 Client Error: Forbidden for url: https://api.tidal.com/v1/search"),
+    _HttpError("TIDAL answered HTTP 429"),
+    _HttpError("Rate limited (status 429)"),
+])
+def test_port_matrix_tidal_real_blocks_still_stop(error):
+    from hires.tidal_library import _is_rate_limited
+
+    assert _is_rate_limited(error)
