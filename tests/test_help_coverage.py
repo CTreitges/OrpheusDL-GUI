@@ -231,6 +231,11 @@ class TestHelpCoverageOfHiresTabs:
             from hires.convert_panel import ConvertFolderDialog
 
             ConvertFolderDialog(root)
+            # About > "Check for updates", built from setup_tabs' own updater.
+            from hires.update_panel import add_check_button
+
+            assert result["updater"] is not None, "setup_tabs built no updater"
+            add_check_button(root, result["updater"])
             root.update()
 
             attached = help_keys_in(root)

@@ -20148,7 +20148,9 @@ if __name__ == "__main__":
                     "enable_undesirable_conversions": False,
                     "ignore_existing_files": False,
                     "ignore_different_artists": True,
-                    "hide_ffmpeg_warning": False
+                    "hide_ffmpeg_warning": False,
+                    # Hi-Res suite: check CTreitges releases on start, once a day (hires/update_flow.py).
+                    "check_for_updates": True
                 }
             },
             "credentials": {
@@ -21221,6 +21223,7 @@ Unnecessary Lossless-to-Lossless""",
             "advanced.ignore_existing_files": "Skips downloading a track only when its exact target file path already exists.\nDifferent album editions (e.g. Standard vs Deluxe) are saved to separate folders when they share a name, so one edition is not left half-skipped because of the other.\nWhen off, existing files at the same path are overwritten.",
             "advanced.ignore_different_artists": "When downloading albums, ignore tracks where the artist differs from the main album artist.",
             "advanced.hide_ffmpeg_warning": "Hide the warning message that appears when FFmpeg is not found on the system.",
+            "advanced.check_for_updates": "On start, at most once a day, ask GitHub (CTreitges/OrpheusDL-GUI releases) whether a newer version exists.\nIf so, a window asks before anything is downloaded. Settings, logins and queue are kept by an update.\nAbout > Check for updates asks at any time.",
             "advanced.conversion_flags.aac.audio_bitrate": "Set AAC audio bitrate. Higher is better quality but larger file. Options: 128k, 192k, 256k, 320k.",
             "advanced.conversion_flags.flac.compression_level": "Set FLAC compression level (0-8). Higher level means smaller file but slower encoding, 0 is fastest, 8 is smallest.",
             "advanced.conversion_flags.opus.b:a": "Set OPUS audio bitrate. Higher is better quality but larger file. Options: 64k, 96k, 128k, 160k, 192k, 256k, 320k."
@@ -21935,6 +21938,17 @@ Unnecessary Lossless-to-Lossless""",
         version_heading_label.pack(pady=(10, 0))
         version_number_label = customtkinter.CTkLabel(mid_inner, text=__version__)
         version_number_label.pack(pady=(0, 10))
+        # Hi-Res suite: release version and "Check for updates" (hires/update_flow.py).
+        try:
+            from hires.app_version import current_version as _hires_release
+            if _hires_release():
+                version_number_label.configure(text=f"{__version__} ({_hires_release()})")
+            _hires_updater = hires_runtime.get("updater") if isinstance(hires_runtime, dict) else None
+            if _hires_updater is not None:
+                from hires.update_panel import add_check_button
+                add_check_button(mid_inner, _hires_updater)
+        except Exception as _about_update_error:
+            print(f"[Update] About: {_about_update_error}")
         credits_heading_label = customtkinter.CTkLabel(mid_inner, text="CREDITS", font=section_header_font, text_color=section_header_color)
         credits_heading_label.pack(pady=(0, 2))
         credits_names_text = ("""OrfiDev (Project Lead)\nDniel97 (Current Lead Developer)\nCommunity developers (Modules)\nBas Curtiz (GUI)""")
@@ -22426,8 +22440,13 @@ Unnecessary Lossless-to-Lossless""",
         
         setup_logging(output_queue)
         update_log_area()
+        # Hi-Res suite: updates come from CTreitges/OrpheusDL-GUI releases and
+        # install in-app (hires/update_flow.py) instead of the stock check,
+        # which asks bascurtiz/OrpheusDL-GUI and only opens its page.
         try:
-            run_check_in_thread(__version__, app)
+            _hires_updater = hires_runtime.get("updater") if isinstance(hires_runtime, dict) else None
+            if _hires_updater is not None:
+                _hires_updater.start_auto()
         except Exception as update_err:
             print(f"[Error] Failed to start update check: {update_err}")
 

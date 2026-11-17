@@ -195,6 +195,12 @@ HELP: Dict[str, HelpEntry] = {
     "advanced.ignore_existing_files": H(recommendation="On, so a re-run of a playlist only fetches what is missing."),
     "advanced.ignore_different_artists": H(recommendation="Keep on."),
     "advanced.hide_ffmpeg_warning": H(recommendation="Off, so you notice when conversions cannot run."),
+    "advanced.check_for_updates": H(
+        recommendation=(
+            "On: you are asked before anything is installed, and an update keeps settings, logins, "
+            "queue and downloads. Without internet the check just stays silent."
+        ),
+    ),
     # -- SoundCloud -----------------------------------------------------------
     "credentials.SoundCloud.web_access_token": H(
         text=(
@@ -406,6 +412,15 @@ HELP: Dict[str, HelpEntry] = {
     "hires.port.select_all": H(
         text="Ticks or unticks every playlist.",
         recommendation="Untick playlists you already ported.",
+    ),
+    # -- About ----------------------------------------------------------------------
+    "hires.about.check_for_updates": H(
+        text=(
+            "Asks GitHub now whether a newer version exists. If so, a window shows what changed and "
+            "asks before anything is downloaded; the update is checked (SHA-256) and keeps settings, "
+            "logins, queue and downloads."
+        ),
+        recommendation="Leave the daily check on (Settings > Advanced); use this after a release.",
     ),
 }
 

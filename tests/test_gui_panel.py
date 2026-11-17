@@ -930,6 +930,91 @@ class TestSetupTabsWiring:
         _url, _path, data = gui.calls[0]
         assert data["extra_kwargs"]["download_quality_override"] == "hifi"
 
+    # -- in-app update ------------------------------------------------------
+    def _updater(self, root, tmp_path):
+        """setup_tabs' own updater; only the outside edges are replaced."""
+        from hires import update_check as uc
+
+        gui, result = self._build(root, tmp_path, "hifi")
+        updater = result["updater"]
+        assert updater is not None, "setup_tabs built no updater"
+        events = {"swapped": [], "restarted": [], "quit": 0}
+        staged = tmp_path / "OrpheusDL_GUI.new.exe"
+
+        def stage(app_dir, release, channel, progress, cancelled):
+            staged.write_bytes(b"MZ")
+            return str(staged)
+
+        def quit_app():
+            events["quit"] += 1
+
+        updater.release = uc.ReleaseInfo(
+            tag="v2.0.3-hires.13", name="", notes="", page_url=uc.RELEASES_PAGE,
+            asset_url="https://github.com/CTreitges/OrpheusDL-GUI/releases/download/v2.0.3-hires.13/x.zip",
+            size=1, sha256="a" * 64,
+        )
+        updater.state = updater.OFFERED
+        updater.can_self_install = True
+        updater._stage = stage
+        updater._swap = lambda app_dir, path, exe_name: events["swapped"].append(path)
+        updater._restart = lambda app_dir, exe_name: events["restarted"].append(exe_name)
+        updater._quit = quit_app
+        updater._run_worker = lambda fn: fn()
+        updater._view_factory = lambda: type("V", (), {"__getattr__": lambda s, n: (lambda *a: None)})()
+        return gui, result, updater, events
+
+    def test_update_busy_no_restart_while_the_gui_downloads(self, root, tmp_path):
+        """N3 through the real assembly: busy = the runtime's view of gui.py."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        gui.download_process_active = True
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["swapped"] == [] and events["quit"] == 0
+        gui.download_process_active = False
+        updater._try_install()
+        assert events["swapped"] and events["restarted"] and events["quit"] == 1
+
+    def test_update_busy_queue_starts_nothing_new_while_waiting(self, root, tmp_path):
+        """While the update waits, the runtime holds; Cancel lets the queue go on."""
+        gui, result, updater, events = self._updater(root, tmp_path)
+        runtime, queue = result["runtime"], result["queue"]
+        queue.add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        gui.download_process_active = True  # a download the user started by hand
+        updater.accept()
+        pump_until(root, lambda: runtime.held)
+        assert runtime.held
+        gui.download_process_active = False
+        runtime._pump()
+        assert gui.calls == [], "queue started an item although an update waits"
+        updater.cancel()
+        assert not runtime.held
+        runtime._pump()
+        assert len(gui.calls) == 1
+
+    def test_update_busy_queue_item_counts_as_busy(self, root, tmp_path):
+        gui, result, updater, events = self._updater(root, tmp_path)
+        result["queue"].add(QueueItem(url="https://tidal.com/track/1", title="T"))
+        result["runtime"]._pump()          # the queue hands an item to gui.py
+        assert gui.calls
+        gui.download_process_active = False  # between polls: GUI idle, item still ours
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        assert events["quit"] == 0
+
+    def test_update_busy_convert_folder_counts_as_busy(self, root, tmp_path, monkeypatch):
+        from hires import integration
+
+        gui, result, updater, events = self._updater(root, tmp_path)
+        monkeypatch.setattr(integration, "folder_job_running", lambda: True)
+        updater.accept()
+        pump_until(root, lambda: updater.state == updater.WAITING)
+        assert updater.state == updater.WAITING
+        monkeypatch.setattr(integration, "folder_job_running", lambda: False)
+        updater._try_install()
+        assert events["quit"] == 1
+
     def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")
         assert set(result["tabs"]) == {"accounts", "queue", "playlists", "port"}
