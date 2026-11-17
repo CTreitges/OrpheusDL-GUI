@@ -27,6 +27,12 @@ env:
   # startup. Built against a newer core the app dies before its window opens.
   # d8f339e is the last commit before that, the core the hires.12 build used.
   ORPHEUS_REF: d8f339e497b414ed60080fff1cdd63a90f46b285
+  # SoundCloud from our fork until upstream has the fix: upstream saves Go+
+  # tracks as their 30 s preview without an error, and its built-in client id
+  # answers 401 without a token (DJ upgrade run, 2026-11-17). Pinned commit =
+  # upstream e1eff2e + that fix.
+  SOUNDCLOUD_REPO: https://github.com/CTreitges/orpheusdl-soundcloud
+  SOUNDCLOUD_REF: d37a40373b978a30f18c46f062eca63608127a09
 
 jobs:
   test:
@@ -37,7 +43,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest requests
+      - run: pip install pytest requests mutagen
       - run: python -m pytest tests/ -v
 
   build:
@@ -100,7 +106,9 @@ jobs:
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-spotify                     modules/spotify
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-qobuz                       modules/qobuz
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-deezer                      modules/deezer
-          git clone --depth 1 https://github.com/bascurtiz/orpheusdl-soundcloud                  modules/soundcloud
+          git clone "$SOUNDCLOUD_REPO" modules/soundcloud
+          git -C modules/soundcloud checkout --quiet "$SOUNDCLOUD_REF"
+          grep -q "if i.get('snipped'):" modules/soundcloud/interface.py
           git clone --depth 1 https://github.com/bascurtiz/orpheusdl-youtube                     modules/youtube
           # Vendored librespot-python: gui.spec bundles vendor/librespot into
           # the frozen app; without it the Spotify module dies at runtime with
