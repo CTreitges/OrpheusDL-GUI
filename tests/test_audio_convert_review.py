@@ -55,7 +55,19 @@ class TestTagsSurvive:
         assert txxx["REPLAYGAIN_TRACK_GAIN"] == "-7.5 dB"
         assert txxx["SERATO_MARKERS_V2"] == "YXBwbGljYXRpb24="
         assert txxx["MUSICBRAINZ_TRACKID"] == "abc-123" and txxx["UPC"] == "0123456789012"
-        assert result.removed_original
+        # Re-check: Serato cannot read its markers as TXXX text -> the FLAC stays.
+        assert not result.removed_original and os.path.exists(source)
+        assert "SERATO_MARKERS_V2" in result.reason
+
+    def test_audio_convert_flac_without_serato_data_is_replaced(self, tmp_path):
+        from mutagen.flac import FLAC
+
+        source = make_tone(str(tmp_path / "t.flac"), rate=44100, bits=16, seconds=0.5)
+        audio = FLAC(source)
+        audio.update({"title": "Tone", "lyrics": "la la la"})
+        audio.save()
+        result = ac.convert_file(source, "aiff", ffmpeg=FFMPEG)
+        assert result.status == "converted" and result.removed_original
 
     def test_audio_convert_id3_frames_are_copied_one_to_one(self, tmp_path):
         from mutagen.id3 import APIC, GEOB, POPM, TIT2, TXXX, USLT

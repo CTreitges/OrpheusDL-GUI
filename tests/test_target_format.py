@@ -340,6 +340,27 @@ class TestConvertFolderDialog:
         finally:
             root.destroy()
 
+    def test_target_format_folder_dialog_rechecks_after_the_question(self, tmp_path):
+        """Re-check of the review: a download starting while "Replace originals?" is open."""
+        _tone(tmp_path / "a.flac")
+        root = _tk_root()
+        try:
+            from hires.convert_panel import ConvertFolderDialog
+
+            state = {"busy": False}
+            dialog = ConvertFolderDialog(root, ffmpeg=FFMPEG, target="wav", folder=str(tmp_path),
+                                         busy=lambda: state["busy"])
+
+            def answer(*_a):
+                state["busy"] = True  # the queue started a download meanwhile
+                return True
+
+            assert dialog.start(confirm=answer)
+            assert _pump(root, lambda: "started meanwhile" in dialog.status.cget("text"))
+            assert not dialog.job.running and os.listdir(tmp_path) == ["a.flac"]
+        finally:
+            root.destroy()
+
 
 class TestFolderJobHoldsTheQueue:
     def test_target_format_queue_waits_while_a_folder_is_converted(self, tmp_path):

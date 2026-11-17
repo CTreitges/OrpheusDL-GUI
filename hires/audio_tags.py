@@ -136,7 +136,10 @@ def write_tags(path: str, kind: str, tags: TagSet) -> List[str]:
             return []
         _fill_id3(audio.tags, tags.fields, tags.covers)
         audio.save()
-        return list(tags.unportable)
+        # Serato keeps cue points as base64 text in FLAC but as binary GEOB
+        # frames in ID3; as TXXX text Serato would not read them any more.
+        serato = [f"{name.upper()} (Serato)" for name in tags.fields if name.startswith("serato")]
+        return list(tags.unportable) + serato
 
     raise ValueError(f"No tag writer for {kind!r}")
 

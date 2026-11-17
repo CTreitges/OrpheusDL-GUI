@@ -118,6 +118,10 @@ class ConvertFolderDialog:
         ):
             self.status.configure(text="Nothing changed.", text_color=SECONDARY_TEXT)
             return
+        if self.busy():  # a download may have started while the question was open
+            self.status.configure(text="A download started meanwhile. Nothing changed; try again "
+                                       "when it has finished.", text_color=WARNING)
+            return
         self._set_running(True)
         self.status.configure(text=f"Converting {len(audio)} files…", text_color=SECONDARY_TEXT)
         self.job.start(audio, target, keep, self._on_progress, self._on_done, playlists=playlists)
