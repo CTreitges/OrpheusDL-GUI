@@ -18,7 +18,7 @@ from typing import Optional
 import customtkinter
 
 from .help_texts import help_message, short_hint
-from .ui_style import GRAY_TEXT, SECONDARY_TEXT, WHITE_TEXT
+from .ui_style import FOCUS_RING, FOCUS_TEXT, GRAY_TEXT, SECONDARY_TEXT, WHITE_TEXT
 
 #: Tooltip background, the same as gui.py's TOOLTIP_MENU_BG.
 TOOLTIP_BG = "#222323"
@@ -118,16 +118,91 @@ class _SharedTip:
 _TIPS: dict = {}
 
 
-def _tooltip(widget, message: str) -> None:
+def _tip_for(widget) -> _SharedTip:
     toplevel = widget.winfo_toplevel()
     tip = _TIPS.get(str(toplevel))
     if tip is None or tip.toplevel is not toplevel:
         tip = _SharedTip(toplevel)
         _TIPS[str(toplevel)] = tip
+    return tip
+
+
+def _tooltip(widget, message: str) -> None:
+    tip = _tip_for(widget)
     widget._hires_help_text = message
     widget.bind("<Enter>", lambda _e: tip.schedule(widget, message), add="+")
     widget.bind("<Leave>", lambda _e: tip.cancel(), add="+")
     widget.bind("<ButtonPress>", lambda _e: tip.cancel(), add="+")
+    keyboard_reachable(widget, message)
+
+
+# -- keyboard -------------------------------------------------------------------
+#
+# customtkinter draws its controls on canvases that Tab skips and that show no
+# focus. Every control with help (and every "?") is made a Tab stop: a ring in
+# FOCUS_RING shows where the focus is, the help text appears as on hover, and
+# Enter or Space presses a button.
+
+def _ring(widget, on: bool) -> None:
+    """Draw or remove the focus ring: the border where the control has one."""
+    saved = getattr(widget, "_hires_ring_saved", None)
+    try:
+        if on:
+            if saved is None:
+                # Buttons and entries draw a border to show the ring with; a
+                # label ("?") draws none, so it is filled instead.
+                if not isinstance(widget, customtkinter.CTkLabel):
+                    saved = ("border", widget.cget("border_width"), widget.cget("border_color"))
+                else:
+                    saved = ("fill", widget.cget("fg_color"), widget.cget("text_color"))
+                widget._hires_ring_saved = saved
+            if saved[0] == "border":
+                widget.configure(border_width=2, border_color=FOCUS_RING)
+            else:
+                widget.configure(fg_color=FOCUS_RING, text_color=FOCUS_TEXT)
+        elif saved is not None:
+            if saved[0] == "border":
+                widget.configure(border_width=saved[1], border_color=saved[2])
+            else:
+                widget.configure(fg_color=saved[1], text_color=saved[2])
+    except Exception:
+        pass  # widget gone, or a kind without either option
+
+
+def keyboard_reachable(widget, message: str = "") -> None:
+    """Make ``widget`` a Tab stop with a visible ring and its help on focus."""
+    try:
+        entry = getattr(widget, "_entry", None)  # CTkEntry: its tk Entry takes the focus
+        target = entry if isinstance(entry, tkinter.Entry) else widget
+        if target is widget:
+            tkinter.Frame.configure(widget, takefocus=1)
+        tip = _tip_for(widget)
+
+        def focus_in(_event=None):
+            _ring(widget, True)
+            if message:
+                tip.schedule(widget, message)
+
+        def focus_out(_event=None):
+            _ring(widget, False)
+            tip.cancel()
+
+        tkinter.Misc.bind(target, "<FocusIn>", focus_in, add="+")
+        tkinter.Misc.bind(target, "<FocusOut>", focus_out, add="+")
+        widget._hires_focus_handlers = (focus_in, focus_out)
+
+        press = getattr(widget, "invoke", None) or getattr(widget, "_open_dropdown_menu", None)
+        if target is widget and callable(press):
+            def activate(_event=None):
+                press()
+                return "break"
+
+            for key in ("<Return>", "<KP_Enter>", "<space>"):
+                tkinter.Misc.bind(widget, key, activate, add="+")
+            widget._hires_key_press = activate
+        widget._hires_keyboard = True
+    except Exception:
+        pass
 
 
 def help_icon(parent, key: str, base_text: str = ""):
@@ -206,7 +281,15 @@ def attach_tooltip(widget, key: str):
     """Hover help on a control itself -- for buttons of the hi-res tabs."""
     try:
         widget._hires_help_key = key
-        _tooltip(widget, help_message(key))
+        segments = getattr(widget, "_buttons_dict", None)
+        if isinstance(segments, dict):
+            # CTkSegmentedButton refuses bind(); its segments are buttons
+            # that take hover, focus and Enter one by one.
+            for segment in segments.values():
+                _tooltip(segment, help_message(key))
+            widget._hires_keyboard = True
+        else:
+            _tooltip(widget, help_message(key))
     except Exception:
         pass
     return widget

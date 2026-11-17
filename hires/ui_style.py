@@ -23,6 +23,11 @@ ERROR = "#E53935"
 DANGER_BG = "#6B2B2B"
 DANGER_HOVER = "#8A3535"
 ROW_HOVER = "#272828"
+#: Keyboard focus ring of the hi-res controls and "?" markers (WCAG 2.4.7);
+#: at least 3:1 against every background it is drawn on (tests/test_ui_contrast.py).
+FOCUS_RING = "#6CB4FF"
+#: Text on a "?" marker filled with FOCUS_RING while it has the focus.
+FOCUS_TEXT = "#101214"
 
 
 def button(parent, text, command, width=110, fg=BUTTON_BG, **kwargs):

@@ -39,3 +39,15 @@ def test_contrast_formula_matches_known_values():
 def test_text_colors_reach_4_5_to_1(text, background):
     ratio = contrast(getattr(ui_style, text), getattr(ui_style, background))
     assert ratio >= 4.5, f"{text} on {background}: {ratio:.2f}:1"
+
+
+@pytest.mark.parametrize("background", ["SURFACE", "CONTAINER", "BUTTON_BG", "ROW_HOVER", "PRIMARY_ACTION"])
+def test_keyboard_help_focus_ring_reaches_3_to_1(background):
+    """WCAG 1.4.11: the focus ring is a UI component, 3:1 against its neighbours."""
+    ratio = contrast(ui_style.FOCUS_RING, getattr(ui_style, background))
+    assert ratio >= 3.0, f"FOCUS_RING on {background}: {ratio:.2f}:1"
+
+
+def test_keyboard_help_focused_marker_text_reaches_4_5_to_1():
+    ratio = contrast(ui_style.FOCUS_TEXT, ui_style.FOCUS_RING)
+    assert ratio >= 4.5, f"FOCUS_TEXT on FOCUS_RING: {ratio:.2f}:1"

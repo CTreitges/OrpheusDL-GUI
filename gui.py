@@ -13276,6 +13276,9 @@ def start_download_thread(search_result_data=None):
     global download_process_active, current_settings, orpheus_instance, url_entry, path_var_main, stop_event
     global file_download_queue, current_batch_output_path, spotify_pre_download_warning_acknowledged
 
+    if _hires_folder_job_blocks_download():
+        return
+
     if orpheus_instance is None:
         show_centered_messagebox("Error", "Orpheus library not initialized. Cannot start download.", dialog_type="error")
         print("Download cancelled: Orpheus instance is None.")
@@ -16509,6 +16512,8 @@ def build_url_from_result(result_data):
 def download_selected():
     global tabview, url_entry, file_download_queue, current_batch_output_path
     global spotify_pre_download_warning_acknowledged
+    if _hires_folder_job_blocks_download():
+        return
     try:
         # New user-initiated download session from search results.
         _clear_failed_tracks()
@@ -17155,6 +17160,23 @@ def _hires_open_convert_folder():
         open_convert_dialog(sys.modules[__name__])
     except Exception as exc:
         print(f"[Hi-Res] Convert folder unavailable: {exc}")
+
+
+def _hires_folder_job_blocks_download():
+    """A download by hand while "Convert folder…" runs: a hint instead of a start."""
+    try:
+        from hires.convert_job import manual_download_hint
+        hint = manual_download_hint()
+    except Exception:
+        return False
+    if not hint:
+        return False
+    print(f"[Hi-Res] {hint}")
+    try:
+        show_centered_messagebox("Convert folder is running", hint, dialog_type="info")
+    except Exception:
+        pass
+    return True
 
 
 def _hires_hint(parent, key, row, column=1, **grid_kwargs):
