@@ -230,7 +230,10 @@ class QueueController:
             status=item.status,
             title=item.title or item.url,
             detail=" · ".join(detail_parts),
-            quality=label_for(item.quality) if item.quality else "",
+            # A finished entry shows what really arrived, not what was asked for.
+            quality=(item.actual_quality if item.status == QueueStatus.DONE.value
+                     and item.actual_quality else
+                     label_for(item.quality) if item.quality else ""),
             error=item.error or "",
             group_label=item.group_label,
             subtitle=item.subtitle,

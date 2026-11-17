@@ -124,6 +124,9 @@ class HiresRuntime:
         self._baseline_mtime: float = 0.0
         #: gui.py's ``_active_download_thread`` right after our start.
         self._active_thread: Any = None
+        #: Quality label per finished download thread, from
+        #: :func:`hires.download_finish.after_download`.
+        self._reports: dict = {}
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> bool:
@@ -312,6 +315,18 @@ class HiresRuntime:
             if self.queue.retry(item.id):
                 self._log(f"|GRAY|[Hi-Res] {reason}; re-queued.|RESET|")
 
+    def note_download_result(self, thread: Any, quality: str) -> None:
+        """Remember what a finished download produced (called on its thread).
+
+        Keyed by the download thread, so a download the user started by hand
+        can never lend its quality to a queue entry. Only the latest few are
+        kept: anything not ours is simply never asked for.
+        """
+        with self._lock:
+            self._reports[thread] = quality
+            while len(self._reports) > 8:
+                self._reports.pop(next(iter(self._reports)))
+
     def _finish_active(self) -> None:
         item_id = self._active_id
         path = self._active_path
@@ -320,6 +335,7 @@ class HiresRuntime:
         # Read the baseline before clearing it -- _clear_active() resets the
         # counters that _produced_audio compares against.
         baseline = (self._baseline_count, self._baseline_mtime)
+        quality = self._reports.pop(self._active_thread, "") if self._active_thread else ""
         self._clear_active()
 
         if self._was_cancelled():
@@ -329,7 +345,7 @@ class HiresRuntime:
 
         produced, detail = self._produced_audio(path, baseline)
         if produced:
-            self.queue.mark_done(item_id)
+            self.queue.mark_done(item_id, actual_quality=quality)
         else:
             self.queue.mark_failed(item_id, detail)
             self._log(f"|GRAY|[Hi-Res] Item failed: {detail}|RESET|")

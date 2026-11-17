@@ -227,6 +227,10 @@ class TestHelpCoverageOfHiresTabs:
             view.pack(fill="both", expand=True)
             result = setup_tabs(gui, view, queue_path=path)
             assert result is not None
+            # Settings > Codecs > "Convert folder…" opens this dialog.
+            from hires.convert_panel import ConvertFolderDialog
+
+            ConvertFolderDialog(root)
             root.update()
 
             attached = help_keys_in(root)

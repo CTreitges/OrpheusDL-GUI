@@ -365,13 +365,14 @@ class QueueStore:
             item.started_at = time.time()
             item.finished_at = None
             item.error = None
+            item.actual_quality = ""
             item.attempts += 1
             self._maybe_save_locked()
         self._notify()
         return item
 
     # -- outcome ------------------------------------------------------------
-    def mark_done(self, item_id: str) -> bool:
+    def mark_done(self, item_id: str, actual_quality: str = "") -> bool:
         with self._lock:
             item = self._index.get(item_id)
             if item is None:
@@ -379,6 +380,7 @@ class QueueStore:
             item.status = QueueStatus.DONE.value
             item.error = None
             item.finished_at = time.time()
+            item.actual_quality = actual_quality or ""
             self._maybe_save_locked()
         self._notify()
         return True

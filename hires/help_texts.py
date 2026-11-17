@@ -110,6 +110,33 @@ HELP: Dict[str, HelpEntry] = {
     "codecs.proprietary_codecs": H(recommendation="Off: MQA and similar formats do not play on most DJ players."),
     "codecs.spatial_codecs": H(recommendation="Off for DJ use unless you really want Dolby Atmos files."),
     "codecs.include_dolby_atmos": H(recommendation="Off: Atmos files are not playable on club players."),
+    "codecs.target_format": H(
+        text=(
+            "Converts every finished download to WAV, FLAC or AIFF. Sample rate and bit depth stay as they "
+            "arrived (never upsampled), tags and cover are copied, and the original is only replaced once "
+            "the new file checked out. Dolby Atmos files are left alone. 'Convert folder…' does the same "
+            "for files you already have."
+        ),
+        recommendation=(
+            "off or FLAC for most DJ software (rekordbox, Serato, Traktor, Engine DJ read FLAC). AIFF if a "
+            "player or USB export needs uncompressed files with tags; WAV only if nothing else is accepted — "
+            "WAV tags are not read everywhere. A lossy source (SoundCloud, YouTube AAC/Opus) does not sound "
+            "better after converting, it only gets bigger."
+        ),
+        short="DJ use: FLAC, or AIFF for uncompressed with tags. Lossy sources do not get better.",
+    ),
+    "codecs.target_keep_original": H(
+        text="Keeps the downloaded file next to the converted one instead of replacing it.",
+        recommendation="Off, so the library holds one file per track; on while you try a new format.",
+    ),
+    "hires.convert.folder": H(
+        text="Converts every audio file in a folder and its sub-folders to the chosen format.",
+        recommendation="Try it on a copy of one crate first; with 'Keep original' off the originals are replaced.",
+    ),
+    "hires.convert.cancel": H(
+        text="Stops after the file being converted; that file keeps its original.",
+        recommendation="Safe to press at any time.",
+    ),
     # -- Global: module defaults --------------------------------------------
     "module_defaults.lyrics": H(recommendation="Keep 'default'."),
     "module_defaults.covers": H(recommendation="Keep 'default'."),

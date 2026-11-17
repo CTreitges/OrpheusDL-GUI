@@ -23,12 +23,20 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # The hires suite is deliberately tkinter-free and depends only on
-      # requests, so the test job needs almost nothing installed.
+      # The hires suite is deliberately tkinter-free; it needs requests, and
+      # mutagen (already an OrpheusDL dependency) for the target format.
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests
+          pip install pytest requests mutagen
+
+      # The conversion tests run real ffmpeg and check with ffprobe; elsewhere
+      # they skip themselves.
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Run test suite
         run: python -m pytest tests/ -v
@@ -50,12 +58,12 @@ jobs:
       - name: Install tkinter and Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk xvfb
+          sudo apt-get install -y python3-tk xvfb ffmpeg
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests customtkinter
+          pip install pytest requests customtkinter mutagen
 
       - name: Run widget tests
-        run: xvfb-run -a --server-args="-screen 0 1280x900x24" python -m pytest tests/test_gui_panel.py -v
+        run: xvfb-run -a --server-args="-screen 0 1280x900x24" python -m pytest tests/test_gui_panel.py tests/test_target_format.py tests/test_actual_quality.py -v

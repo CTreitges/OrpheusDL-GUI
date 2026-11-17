@@ -12962,7 +12962,12 @@ def run_download_in_thread(orpheus, url, output_path, gui_settings, search_resul
             except:
                 pass
         yielding_active.clear()
-        
+
+        # Hi-Res suite: read the quality that arrived, convert to the target
+        # format -- still on this thread, so the GUI stays busy until it is done.
+        if not is_cancelled and not download_exception_occurred:
+            _hires_after_download(output_path, start_time.timestamp())
+
         end_time = datetime.datetime.now(); total_duration = end_time - start_time; formatted_time = beauty_format_seconds(total_duration.total_seconds())
 
         time_taken_message = f"Total time taken: {formatted_time}\n"
@@ -17122,6 +17127,24 @@ def _hires_help_pack(parent, key, base_text="", **pack_kwargs):
     return _hires_help_call("pack_help", parent, key, base_text or "", **pack_kwargs)
 
 
+def _hires_after_download(output_path, started_at):
+    """Actual quality and target format of a finished download (hires/download_finish.py)."""
+    try:
+        from hires.download_finish import after_download
+        after_download(sys.modules[__name__], output_path, started_at)
+    except Exception as exc:
+        print(f"[Hi-Res] After-download step unavailable: {exc}")
+
+
+def _hires_open_convert_folder():
+    """The "Convert folder…" dialog next to Settings > Codecs > Target format."""
+    try:
+        from hires.convert_panel import open_convert_dialog
+        open_convert_dialog(sys.modules[__name__])
+    except Exception as exc:
+        print(f"[Hi-Res] Convert folder unavailable: {exc}")
+
+
 def _hires_hint(parent, key, row, column=1, **grid_kwargs):
     """Grid the visible recommendation for key; True when a row was used."""
     return bool(_hires_help_call("grid_recommendation", parent, key, row, column, **grid_kwargs))
@@ -20062,6 +20085,9 @@ if __name__ == "__main__":
                     "proprietary_codecs": False,
                     "spatial_codecs": True,
                     "include_dolby_atmos": False,
+                    # Hi-Res suite: convert every finished download (hires/download_finish.py).
+                    "target_format": "off",
+                    "target_keep_original": False,
                 },
                 "module_defaults": { "lyrics": "default", "covers": "default", "credits": "default" },
                 "lyrics": { "embed_lyrics": True, "embed_synced_lyrics": False, "save_synced_lyrics": True },
@@ -21320,7 +21346,7 @@ Unnecessary Lossless-to-Lossless""",
                             row += 1
                         row += 1
                         continue
-                    label_widget = customtkinter.CTkLabel(global_settings_frame, text=field.replace("_", " ").title())
+                    label_widget = customtkinter.CTkLabel(global_settings_frame, text="Keep Original" if full_key == "codecs.target_keep_original" else field.replace("_", " ").title())
                     label_widget.grid(row=row, column=0, sticky="w", padx=(10, 10), pady=5)
                     widget = None; browse_btn = None
 
@@ -21513,6 +21539,15 @@ Unnecessary Lossless-to-Lossless""",
                             var.set(str(current_concurrent))
 
                             widget = slider_frame
+                         elif section_key == "codecs" and field == "target_format":
+                            target_options = ["off", "wav", "flac", "aiff"]
+                            if var.get().lower() not in target_options: var.set("off")
+                            widget = customtkinter.CTkComboBox(global_settings_frame, variable=var, values=target_options, state="readonly",
+                                                                dropdown_fg_color=CONTAINER_COLOR)
+                            widget.grid(row=row, column=1, sticky="ew", padx=(5, 5), pady=2)
+                            browse_btn = customtkinter.CTkButton(global_settings_frame, text="Convert folder…", width=100, height=30,
+                                                                 command=_hires_open_convert_folder, fg_color=UI_ELEMENT_BG_COLOR, hover_color=LINK_COLOR)
+                            browse_btn.grid(row=row, column=2, sticky="w", padx=(5, 5))
                          elif section_key == "covers" and field == "main_compression":
                             compression_options = ["high", "low"]
                             if var.get() not in compression_options: var.set(compression_options[0])
