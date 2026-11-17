@@ -490,6 +490,35 @@ def test_restart_starts_the_new_exe_waiting_for_us(app):
     assert kw["cwd"] == str(app)
 
 
+def test_restart_runs_as_an_independent_instance(app, monkeypatch):
+    """Regression (real EXE run, 17.11.): the restarted EXE showed "Fatal Error".
+
+    A one-file PyInstaller app hands its private environment (_PYI_*) to every
+    child; the restarted EXE then tried to use the old instance's temp folder,
+    which its loader was deleting. PYINSTALLER_RESET_ENVIRONMENT=1 makes the
+    child a fresh instance (PyInstaller >= 6.10, "Implementing application
+    restart").
+    """
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", "C:/old/OrpheusDL_GUI.exe")
+    calls = []
+    su.restart(str(app), popen=lambda args, **kw: calls.append(kw))
+    env = calls[0]["env"]
+    assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert env["PATH"] == os.environ["PATH"], "the rest of the environment is kept"
+
+
+def test_script_start_runs_as_an_independent_instance(app, bundle, tmp_path, monkeypatch):
+    """The update script's EXE starts the installed one: same rule."""
+    monkeypatch.setattr(su, "mutex_exists", lambda name=su.MUTEX_NAME: False)
+    exe = tmp_path / "new" / "OrpheusDL_GUI.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(NEW_EXE_BYTES)
+    calls = []
+    su.run_cli(["x", "--install-into", str(app), "--quiet"], own_exe=str(exe), bundle_dir=str(bundle),
+               new_version=NEW_VERSION, popen=lambda args, **kw: calls.append(kw))
+    assert calls[0]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+
+
 def test_wait_for_previous_instance():
     states = iter([True, True, False])
     slept = []

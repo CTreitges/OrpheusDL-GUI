@@ -405,13 +405,27 @@ def stage_release(
     return staged
 
 
+def independent_env() -> dict:
+    """Environment for an EXE that must outlive this process.
+
+    A one-file PyInstaller app passes its private variables (_PYI_*) to its
+    children; a child started from them re-uses this instance's temp folder,
+    which is deleted when this process ends -- the restarted EXE died with
+    "Fatal Error". PYINSTALLER_RESET_ENVIRONMENT=1 makes it a new instance.
+    Context7: PyInstaller (/pyinstaller/pyinstaller) >= 6.10, "Implementing
+    application restart".
+    """
+    return {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+
+
 def restart(app_dir: str, exe_name: str = EXE_NAME, popen: Callable = subprocess.Popen):
     """Start the (new) EXE, telling it to wait until this process has gone."""
     exe = os.path.join(app_dir, exe_name)
     flags = 0
     if os.name == "nt":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    return popen([exe, "--after-update"], cwd=app_dir, close_fds=True, creationflags=flags)
+    return popen([exe, "--after-update"], cwd=app_dir, close_fds=True, creationflags=flags,
+                 env=independent_env())
 
 
 # -- single instance ----------------------------------------------------------
@@ -563,7 +577,8 @@ def run_cli(argv: Sequence[str], *, own_exe: Optional[str] = None,
         exe = os.path.join(os.path.abspath(target), EXE_NAME)
         try:
             flags = subprocess.DETACHED_PROCESS if os.name == "nt" else 0
-            popen([exe], cwd=os.path.abspath(target), close_fds=True, creationflags=flags)
+            popen([exe], cwd=os.path.abspath(target), close_fds=True, creationflags=flags,
+                  env=independent_env())
         except OSError:
             pass
     return result.code
