@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
@@ -23,6 +24,15 @@ class Progress:
     skipped: int
     failed: int
     current: str = ""
+    #: Seconds since the job started; drives the time-left estimate.
+    elapsed: float = 0.0
+
+    @property
+    def seconds_left(self) -> Optional[float]:
+        """Estimate from the pace so far; ``None`` until two files are done."""
+        if self.done < 2 or self.done >= self.total or self.elapsed <= 0:
+            return None
+        return self.elapsed / self.done * (self.total - self.done)
 
     @property
     def text(self) -> str:
@@ -31,6 +41,9 @@ class Progress:
             parts.append(f"{self.skipped} skipped")
         if self.failed:
             parts.append(f"{self.failed} failed")
+        left = self.seconds_left
+        if left is not None:
+            parts.append(f"about {round(left / 60)} min left" if left >= 90 else f"about {max(1, round(left))} s left")
         return " · ".join(parts)
 
 
@@ -89,12 +102,13 @@ class FolderConvertJob:
             return False
         self._cancel.clear()
         counts = {"converted": 0, "skipped": 0, "failed": 0}
+        started = time.monotonic()
 
         def progress(done: int, total: int, result: ac.ConvertResult) -> None:
             if result.status in counts:
                 counts[result.status] += 1
             self.dispatch(on_progress, Progress(done, total, current=os.path.basename(result.source),
-                                                **counts))
+                                                elapsed=time.monotonic() - started, **counts))
 
         def work() -> None:
             try:

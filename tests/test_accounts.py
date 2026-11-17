@@ -489,7 +489,8 @@ class TestSoundCloudStatus:
     def test_soundcloud_without_token_is_signed_out_with_a_hint(self, tmp_path):
         status = make_soundcloud_status_provider(ProviderGui(tmp_path))()
         assert status.state is AccountState.SIGNED_OUT
-        assert "128" in status.detail and "preview" in status.detail
+        # 160 kbit/s AAC is what free streams measured on 17.11. (W/soundcloud-quality.md)
+        assert "AAC 160 kbit/s" in status.detail and "preview" in status.detail
         assert "Settings > SoundCloud" in status.hint
 
     def test_soundcloud_go_plus_is_named(self, tmp_path):

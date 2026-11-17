@@ -245,6 +245,21 @@ class TestQueueItemFinish:
 
 # -- Convert folder… dialog ------------------------------------------------------
 
+class TestFolderProgressText:
+    def test_target_format_folder_progress_estimates_the_time_left(self):
+        from hires.convert_job import Progress
+
+        assert Progress(10, 40, 10, 0, 0, elapsed=5.0).text == "10 of 40 · 10 converted · about 15 s left"
+        assert Progress(10, 200, 9, 0, 1, elapsed=60.0).text == (
+            "10 of 200 · 9 converted · 1 failed · about 19 min left")
+
+    def test_target_format_folder_progress_no_guess_too_early_or_at_the_end(self):
+        from hires.convert_job import Progress
+
+        assert Progress(1, 40, 1, 0, 0, elapsed=0.5).seconds_left is None
+        assert Progress(40, 40, 39, 1, 0, elapsed=20.0).text == "40 of 40 · 39 converted · 1 skipped"
+
+
 def _tk_root():
     """A real window; the Windows venv's Tcl sometimes needs a second try."""
     customtkinter = pytest.importorskip("customtkinter")

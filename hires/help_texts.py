@@ -204,7 +204,7 @@ HELP: Dict[str, HelpEntry] = {
         ),
         recommendation=(
             "Set it if you have SoundCloud Go+: only then are full-length tracks in AAC 256 kbit/s available. "
-            "Without a token you get the free streams (often 128 kbit/s) and 30-second previews of Go+ tracks."
+            "Without Go+ you get the free streams (AAC 160 kbit/s, measured) and Go+ tracks are skipped, because SoundCloud only serves their 30-second previews."
         ),
     ),
     # -- Spotify ---------------------------------------------------------------

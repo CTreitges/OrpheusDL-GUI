@@ -99,7 +99,7 @@ class PortTab:
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         attach_tooltip(self.url_entry, "hires.port.url")
 
-        convert_button = _button(top, "Convert", self.convert_from_url, width=90, fg=PRIMARY_ACTION)
+        convert_button = _button(top, "Port", self.convert_from_url, width=90, fg=PRIMARY_ACTION)
         convert_button.pack(side="left", padx=(0, 6))
         attach_tooltip(convert_button, "hires.port.convert")
         self.mine_button = _button(top, "⟳  My playlists", self.load_playlists, width=130)
@@ -246,7 +246,7 @@ class PortTab:
             state="normal" if self.list.playlists else "disabled",
         )
         if checked:
-            self.queue_button.configure(text=f"⬇  Convert & queue {len(checked)}", state="normal")
+            self.queue_button.configure(text=f"⬇  Port & queue {len(checked)}", state="normal")
             self.review_button.configure(state="disabled")
             self.status_label.configure(text=_selection_label(checked), text_color=SECONDARY_TEXT)
         else:
@@ -333,7 +333,7 @@ class PortTab:
         self.review_button.configure(state="disabled")
         self._batch_total = len(playlists)
         self.status_label.configure(
-            text=f"Converting {self._batch_total} playlists…", text_color=SECONDARY_TEXT
+            text=f"Porting {self._batch_total} playlists…", text_color=SECONDARY_TEXT
         )
         self.controller.convert_many(
             playlists,

@@ -39,7 +39,10 @@ def _duration(seconds: Optional[int]) -> str:
 def track_line(index: int, track: TrackRef) -> str:
     """One row of the track list: number, artist - title, length."""
     length = _duration(track.duration_sec)
-    return f"{index:>4}   {track.display_name}" + (f"   {length}" if length else "")
+    # Padded with FIGURE SPACE, which is as wide as a digit: plain spaces are
+    # narrower in the list's proportional font, so "9" and "10" did not line up.
+    number = str(index).rjust(4, " ")
+    return f"{number}   {track.display_name}" + (f"   {length}" if length else "")
 
 
 class PlaylistsTab:

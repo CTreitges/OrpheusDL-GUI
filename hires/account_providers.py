@@ -45,7 +45,7 @@ SERVICE_INFO: Dict[str, str] = {
     "SoundCloud": (
         "Uses the OAuth token of your browser session, entered under Settings > SoundCloud. "
         "With Go+ you get full-length tracks in AAC 256 kbit/s; without Go+ you get the free "
-        "streams (often 128 kbit/s) and only 30-second previews of Go+ tracks."
+        "streams (AAC 160 kbit/s) and Go+ tracks are skipped, since only 30-second previews exist."
     ),
     "YouTube": (
         "Uses a cookies.txt exported from a browser where you are signed in to YouTube "
@@ -174,7 +174,7 @@ def make_soundcloud_status_provider(
         if not token:
             return status(
                 AccountState.SIGNED_OUT,
-                "No token set — free streams only (often 128 kbit/s), Go+ tracks as 30-second previews.",
+                "No token set — free streams only (AAC 160 kbit/s), Go+ tracks skipped (30-second previews only).",
                 hint="Enter your OAuth token under Settings > SoundCloud.",
             )
         fetch = me_fetcher or _module_me_fetcher(gui)
@@ -206,7 +206,7 @@ def make_soundcloud_status_provider(
         if go_plus:
             detail = "Go+ active — full-length tracks in AAC 256 kbit/s."
         else:
-            detail = f"Plan: {plan} — free streams only (often 128 kbit/s), Go+ tracks as previews."
+            detail = f"Plan: {plan} — free streams only (AAC 160 kbit/s), Go+ tracks skipped (previews only)."
         return status(AccountState.SIGNED_IN, detail, account=f"{username} ({plan})" if username else plan)
 
     return provider

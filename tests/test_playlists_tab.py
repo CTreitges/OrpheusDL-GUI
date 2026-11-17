@@ -202,6 +202,19 @@ def assemble(window, tmp_path):
 
 
 class TestPlaylistsTabWidgets:
+    def test_playlists_tab_track_numbers_line_up(self, window, tmp_path):
+        """GUI review: "9" and "10" start their titles at the same x in the list font."""
+        import tkinter.font
+
+        from hires.models import TrackRef
+        from hires.playlists_panel import track_line
+
+        _view, result = assemble(window, tmp_path)
+        font = tkinter.font.Font(font=result["tabs"]["playlists"].track_list.cget("font"))
+        lines = [track_line(n, TrackRef(id=str(n), title="Song", artists=["A"])) for n in (1, 9, 10, 120)]
+        prefixes = {font.measure(line[: line.index("A - Song")]) for line in lines}
+        assert len(prefixes) == 1, f"title starts differ: {sorted(prefixes)} px"
+
     def test_playlists_tab_replaces_the_tidal_tab(self, window, tmp_path):
         view, result = assemble(window, tmp_path)
         names = list(getattr(view, "_name_list", []))
