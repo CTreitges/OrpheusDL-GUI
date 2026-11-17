@@ -12433,6 +12433,9 @@ def run_download_in_thread(orpheus, url, output_path, gui_settings, search_resul
     start_time = datetime.datetime.now()
     media_type = None
     am_q_prev = None
+    # Hi-Res suite: remember which audio files exist, so the target format
+    # afterwards only touches what this download wrote.
+    _hires_before_download(output_path)
     yield_to_gui()
 
     try:
@@ -17125,6 +17128,15 @@ def _hires_help(label, key, base_text=""):
 def _hires_help_pack(parent, key, base_text="", **pack_kwargs):
     """A "?" packed into a row of checkboxes."""
     return _hires_help_call("pack_help", parent, key, base_text or "", **pack_kwargs)
+
+
+def _hires_before_download(output_path):
+    """Snapshot of the download folder for the target format (hires/download_finish.py)."""
+    try:
+        from hires.download_finish import before_download
+        before_download(sys.modules[__name__], output_path)
+    except Exception as exc:
+        print(f"[Hi-Res] Before-download step unavailable: {exc}")
 
 
 def _hires_after_download(output_path, started_at):

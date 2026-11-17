@@ -123,9 +123,9 @@ class TestLosslessConversions:
         assert after["codec"] == "pcm_s24be"
         assert (after["rate"], after["bits"]) == (96000, 24)
         assert abs(after["duration"] - before["duration"]) <= 0.010
-        values, covers = read_tags(result.output)
-        assert values["title"] == ["Tone"] and values["album"] == ["Test Crate"]
-        assert covers and covers[0].data == PNG
+        tags = read_tags(result.output)
+        assert tags.fields["title"] == ["Tone"] and tags.fields["album"] == ["Test Crate"]
+        assert tags.covers and tags.covers[0].data == PNG
         assert os.path.exists(flac24), "Keep original must keep the source"
 
     def test_audio_convert_wav_to_flac_16_bit(self, tmp_path):
@@ -144,8 +144,8 @@ class TestLosslessConversions:
         after = ffprobe(result.output)
         assert (after["codec"], after["rate"], after["bits"]) == ("flac", 44100, 16)
         assert abs(after["duration"] - before["duration"]) <= 0.010
-        values, covers = read_tags(result.output)
-        assert values["title"] == ["CD Tone"] and covers[0].data == PNG
+        tags = read_tags(result.output)
+        assert tags.fields["title"] == ["CD Tone"] and tags.covers[0].data == PNG
 
     def test_audio_convert_never_raises_the_bit_depth(self, tmp_path):
         source = make_tone(str(tmp_path / "cd.flac"), rate=44100, bits=16)

@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 
 from . import audio_convert as ac
 
-PLAYLIST_EXTENSIONS = (".m3u", ".m3u8")
+#: Audio paths present when a download started, per download thread.
+_SNAPSHOTS: Dict[Any, FrozenSet[str]] = {}
+_SNAPSHOTS_LOCK = threading.Lock()
 
 #: A file whose creation time lies this far before the start still counts:
 #: filesystems round timestamps (FAT: 2 s) and clocks drift a little.
@@ -42,6 +44,11 @@ def target_settings(settings: Any) -> Tuple[str, bool]:
     return target, bool(codecs.get("target_keep_original", False))
 
 
+def snapshot(root: Optional[str]) -> FrozenSet[str]:
+    """Every audio path under ``root`` right now (normalised for comparison)."""
+    return frozenset(_key(p) for p in ac.scan(root)[0]) if root else frozenset()
+
+
 def process_download(
     output_path: str,
     started_at: float,
@@ -51,10 +58,19 @@ def process_download(
     ffmpeg: str = "ffmpeg",
     cancel: Optional[threading.Event] = None,
     log: Callable[[str], None] = print,
+    existing: Optional[FrozenSet[str]] = None,
 ) -> str:
-    """Probe and convert the files one download produced; returns the quality label."""
+    """Probe and convert the files one download produced; returns the quality label.
+
+    A file counts as produced when it was created since the start *and*, where
+    a snapshot from the start is given (``existing``), its path did not exist
+    then -- so neither a missing creation time (Linux) nor a re-tag can pull a
+    library file into the conversion.
+    """
     since = started_at - START_SLACK_SEC
-    new_files = ac.find_audio(output_path, since=since)
+    audio, playlists = ac.scan(output_path)
+    new_files = [p for p in audio
+                 if (existing is None or _key(p) not in existing) and ac.created_at(p) >= since]
     if not new_files:
         return ""
     quality = ac.summarize(ac.describe(ac.probe(path)) for path in new_files)
@@ -64,18 +80,33 @@ def process_download(
 
     summary = ac.convert_paths(new_files, target, keep_original=keep_original,
                                ffmpeg=ffmpeg, cancel=cancel)
-    renamed = {r.source: r.output for r in summary.results
-               if r.status == "converted" and r.removed_original and r.output}
+    renamed = ac.renamed_by(summary)
     if renamed:
-        ac.rewrite_playlists(_new_playlists(output_path, since), renamed)
+        ac.rewrite_playlists([p for p in playlists if _touched_since(p, since)], renamed)
     _log_summary(summary, target, log)
     if summary.converted:
         quality = f"{quality} → {target.upper()}"
     return quality
 
 
+def before_download(gui: Any, output_path: Optional[str]) -> None:
+    """Entry point for gui.py at the start of a download: remember what is there."""
+    try:
+        path = output_path or _default_output(gui)
+        taken = snapshot(path)
+        with _SNAPSHOTS_LOCK:
+            _SNAPSHOTS[threading.current_thread()] = taken
+            # A stopped or failed download never reaches after_download.
+            while len(_SNAPSHOTS) > 8:
+                _SNAPSHOTS.pop(next(iter(_SNAPSHOTS)))
+    except Exception as exc:
+        print(f"[Hi-Res] Before-download step failed: {exc}")
+
+
 def after_download(gui: Any, output_path: Optional[str], started_at: float) -> None:
     """Entry point for gui.py. Never raises: a failed extra must not fail a download."""
+    with _SNAPSHOTS_LOCK:
+        existing = _SNAPSHOTS.pop(threading.current_thread(), None)
     try:
         path = output_path or _default_output(gui)
         if not path:
@@ -86,7 +117,7 @@ def after_download(gui: Any, output_path: Optional[str], started_at: float) -> N
         if callable(finder):
             ffmpeg = finder() or "ffmpeg"
         quality = process_download(path, started_at, target, keep_original=keep, ffmpeg=ffmpeg,
-                                   cancel=getattr(gui, "stop_event", None))
+                                   cancel=getattr(gui, "stop_event", None), existing=existing)
         runtime = _runtime(gui)
         if runtime is not None and quality:
             runtime.note_download_result(threading.current_thread(), quality)
@@ -107,19 +138,24 @@ def _log_summary(summary: ac.FolderSummary, target: str, log: Callable[[str], No
     if any(r.lossy_source for r in summary.results if r.status == "converted"):
         log(f"|GRAY|[Target format] Note: {ac.LOSSY_WARNING}.|RESET|")
     for result in summary.results:
-        if result.status == "failed":
-            log(f"|GRAY|[Target format] {os.path.basename(result.source)}: {result.reason}|RESET|")
+        name = os.path.basename(result.source)
+        if result.status == "failed" or result.reason.startswith("original kept"):
+            log(f"|GRAY|[Target format] {name}: {result.reason}|RESET|")
+        elif result.status == "skipped" and result.reason == "target file exists":
+            log(f"|GRAY|[Target format] {name}: kept as downloaded, "
+                f"{os.path.basename(result.output or '')} already exists (downloaded again?)|RESET|")
 
 
-def _new_playlists(root: str, since: float) -> List[str]:
-    found = []
-    for folder, _dirs, files in os.walk(root):
-        for name in files:
-            if name.lower().endswith(PLAYLIST_EXTENSIONS):
-                path = os.path.join(folder, name)
-                if ac.created_at(path) >= since or os.path.getmtime(path) >= since:
-                    found.append(path)
-    return found
+def _touched_since(path: str, since: float) -> bool:
+    """Created or rewritten by this download; a vanished file is simply skipped."""
+    try:
+        return ac.created_at(path) >= since or os.path.getmtime(path) >= since
+    except OSError:
+        return False
+
+
+def _key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
 
 
 def _default_output(gui: Any) -> Optional[str]:

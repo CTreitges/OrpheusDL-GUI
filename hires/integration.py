@@ -31,6 +31,7 @@ from .account_providers import (
     make_soundcloud_status_provider,
     make_youtube_status_provider,
 )
+from .convert_job import folder_job_running
 from .models import AuthRequiredError, HiresError, QueueItem, QueueStatus
 from .queue_store import QueueStore
 from .quality import HIRES, build_search_result_data
@@ -187,6 +188,8 @@ class HiresRuntime:
 
             if self.queue.is_paused or self._gui_is_busy() or not self._gui_is_ready():
                 return
+            if folder_job_running():
+                return  # never download into a folder "Convert folder…" is working on
             item = self.queue.claim_next()
             if item is None:
                 return

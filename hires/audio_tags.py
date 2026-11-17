@@ -1,11 +1,19 @@
-"""Carry tags and cover art from one audio file to another.
+"""Carry tags and cover art from one audio file to another -- all of them.
 
 ffmpeg converts the audio; this module moves the metadata, because ffmpeg's
 WAV muxer can only write a RIFF INFO chunk (no cover, few fields) and DJ
-software reads the ID3 chunk that Mp3tag, Serato and Traktor write. One
-neutral form sits in the middle: ``{field: [values]}`` plus a list of
-:class:`Cover`, read from FLAC/Ogg (Vorbis comments), MP4/M4A (atoms) or
-ID3 (MP3, WAV, AIFF), and written as Vorbis comments (FLAC) or ID3 (WAV, AIFF).
+software reads the ID3 chunk that Mp3tag, Serato and Traktor write.
+
+Nothing may get lost on the way, so there is no whitelist:
+
+* **ID3 → ID3** (MP3/WAV/AIFF → WAV/AIFF): every frame is copied as it is,
+  binary ones included (Serato cue points in GEOB, ratings in POPM, lyrics).
+* **Everything else** goes through a neutral form ``{name: [values]}`` that
+  keeps *every* text field: known ones map to their frame or atom, the rest
+  travel under their own name (``TXXX:<NAME>`` in ID3, ``NAME=`` in FLAC).
+  Pictures become APIC frames or FLAC pictures, lyrics USLT or ``LYRICS``.
+* What the target cannot hold (binary ID3 frames in FLAC, odd MP4 atoms) is
+  reported by :func:`write_tags`; the caller then keeps the original.
 
 Context7: mutagen (quodlibet/mutagen) -- FLAC.add_picture/Picture, AIFF/WAVE
 ``add_tags`` with ``mutagen.id3.ID3`` tags.
@@ -14,30 +22,31 @@ Context7: mutagen (quodlibet/mutagen) -- FLAC.add_picture/Picture, AIFF/WAVE
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+import copy
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-#: The fields that survive a conversion. Names follow Vorbis comments.
-FIELDS = (
-    "title", "artist", "album", "albumartist", "date", "genre", "tracknumber",
-    "discnumber", "isrc", "bpm", "initialkey", "comment", "composer", "label",
-    "copyright",
-)
+#: Neutral name (Vorbis comment style) <-> ID3 text frame.
+_ID3_TEXT = {
+    "title": "TIT2", "artist": "TPE1", "album": "TALB", "albumartist": "TPE2",
+    "date": "TDRC", "genre": "TCON", "isrc": "TSRC", "bpm": "TBPM", "initialkey": "TKEY",
+    "composer": "TCOM", "label": "TPUB", "copyright": "TCOP", "grouping": "TIT1",
+    "subtitle": "TIT3", "conductor": "TPE3", "remixer": "TPE4", "lyricist": "TEXT",
+    "encodedby": "TENC", "encoder": "TSSE", "media": "TMED", "language": "TLAN",
+    "mood": "TMOO", "originaldate": "TDOR", "artistsort": "TSOP", "albumsort": "TSOA",
+    "titlesort": "TSOT", "albumartistsort": "TSO2", "compilation": "TCMP",
+}
+_ID3_NAME = {frame: name for name, frame in _ID3_TEXT.items()}
 
 _VORBIS_ALIASES = {"organization": "label", "publisher": "label", "key": "initialkey",
-                   "description": "comment", "album artist": "albumartist"}
-
-_ID3_FRAMES = {
-    "title": "TIT2", "artist": "TPE1", "album": "TALB", "albumartist": "TPE2",
-    "date": "TDRC", "genre": "TCON", "tracknumber": "TRCK", "discnumber": "TPOS",
-    "isrc": "TSRC", "bpm": "TBPM", "initialkey": "TKEY", "composer": "TCOM",
-    "label": "TPUB", "copyright": "TCOP",
-}
+                   "description": "comment", "album artist": "albumartist",
+                   "unsyncedlyrics": "lyrics", "totaltracks": "tracktotal", "totaldiscs": "disctotal"}
 
 _MP4_ATOMS = {
     "\xa9nam": "title", "\xa9ART": "artist", "\xa9alb": "album", "aART": "albumartist",
     "\xa9day": "date", "\xa9gen": "genre", "\xa9wrt": "composer", "\xa9cmt": "comment",
-    "cprt": "copyright",
+    "cprt": "copyright", "\xa9lyr": "lyrics", "\xa9grp": "grouping", "\xa9too": "encoder",
+    "soar": "artistsort", "soal": "albumsort", "sonm": "titlesort", "soaa": "albumartistsort",
 }
 
 _FRONT_COVER = 3
@@ -54,47 +63,50 @@ class Cover:
 Tags = Dict[str, List[str]]
 
 
-def read_tags(path: str) -> Tuple[Tags, List[Cover]]:
-    """Tags and covers of ``path`` in neutral form; empty when unreadable."""
+@dataclass
+class TagSet:
+    fields: Tags = field(default_factory=dict)
+    covers: List[Cover] = field(default_factory=list)
+    #: The source's own ID3 tag, copied frame by frame into an ID3 target.
+    id3: Any = None
+    #: Source items the neutral form cannot hold (binary frames, odd atoms).
+    unportable: List[str] = field(default_factory=list)
+
+
+def read_tags(path: str) -> TagSet:
+    """Everything ``path`` carries; an empty set when it has no tags."""
     import mutagen
-
-    try:
-        audio = mutagen.File(path)
-    except Exception:
-        return {}, []
-    if audio is None:
-        return {}, []
-
     from mutagen.flac import FLAC
     from mutagen.id3 import ID3
     from mutagen.mp4 import MP4
 
-    if isinstance(audio, MP4):
-        return _from_mp4(audio)
+    audio = mutagen.File(path)  # raises on a broken file: the caller keeps the original
+    if audio is None:
+        return TagSet()
     tags = getattr(audio, "tags", None)
+    if isinstance(audio, MP4):
+        return _from_mp4(tags or {})
     if isinstance(tags, ID3):
         return _from_id3(tags)
     if isinstance(audio, FLAC):
-        values = _from_vorbis(audio.tags)
-        covers = [_cover_from_picture(p) for p in audio.pictures]
-        return values, covers
+        result = TagSet(fields=_from_vorbis(tags))
+        result.covers = [_cover_from_picture(p) for p in audio.pictures]
+        return result
     if tags is not None and hasattr(tags, "keys"):  # OggVorbis, OggOpus
-        values = _from_vorbis(tags)
-        covers = []
+        result = TagSet(fields=_from_vorbis(tags))
         for raw in tags.get("metadata_block_picture", []) or []:
             cover = _cover_from_ogg(raw)
             if cover is not None:
-                covers.append(cover)
-        return values, covers
-    return {}, []
+                result.covers.append(cover)
+        return result
+    return TagSet()
 
 
-def write_tags(path: str, kind: str, tags: Tags, covers: List[Cover]) -> None:
-    """Write ``tags`` and ``covers`` into ``path``, a fresh ``kind`` file.
+def write_tags(path: str, kind: str, tags: TagSet) -> List[str]:
+    """Write ``tags`` into ``path`` (a fresh ``kind`` file); returns what did not fit.
 
     ``kind`` is ``"flac"``, ``"wav"`` or ``"aiff"`` -- given explicitly because
-    the file is still a temporary ``.part`` file at this point. Raises on a
-    write error; the caller then keeps the original.
+    the file is still a temporary ``.part`` file. Raises on a write error.
     """
     if kind == "flac":
         from mutagen.flac import FLAC
@@ -102,12 +114,12 @@ def write_tags(path: str, kind: str, tags: Tags, covers: List[Cover]) -> None:
         audio = FLAC(path)
         if audio.tags is None:
             audio.add_tags()
-        for name, values in tags.items():
+        for name, values in tags.fields.items():
             audio.tags[name] = list(values)
-        for cover in covers:
+        for cover in tags.covers:
             audio.add_picture(_picture_from_cover(cover))
         audio.save()
-        return
+        return list(tags.unportable)
 
     if kind in ("wav", "aiff"):
         if kind == "wav":
@@ -117,9 +129,14 @@ def write_tags(path: str, kind: str, tags: Tags, covers: List[Cover]) -> None:
         audio = Container(path)
         if audio.tags is None:
             audio.add_tags()
-        _fill_id3(audio.tags, tags, covers)
+        if tags.id3 is not None:
+            for frame in tags.id3.values():  # 1:1, binary frames included
+                audio.tags.add(copy.deepcopy(frame))
+            audio.save()
+            return []
+        _fill_id3(audio.tags, tags.fields, tags.covers)
         audio.save()
-        return
+        return list(tags.unportable)
 
     raise ValueError(f"No tag writer for {kind!r}")
 
@@ -131,52 +148,87 @@ def _from_vorbis(comments) -> Tags:
     if not comments:
         return out
     for key, values in comments.items():
-        name = _VORBIS_ALIASES.get(key.lower(), key.lower())
-        if name in FIELDS and values:
+        name = key.lower()
+        if name == "metadata_block_picture":
+            continue
+        name = _VORBIS_ALIASES.get(name, name)
+        if values:
             out.setdefault(name, []).extend(str(v) for v in values)
     return out
 
 
-def _from_id3(id3) -> Tuple[Tags, List[Cover]]:
-    out: Tags = {}
-    for name, frame_id in _ID3_FRAMES.items():
-        frame = id3.get(frame_id)
-        if frame is not None and getattr(frame, "text", None):
-            out[name] = [str(t) for t in frame.text]
-    comments = [str(t) for f in id3.getall("COMM") for t in f.text]
-    if comments:
-        out["comment"] = comments
-    covers = [
-        Cover(data=f.data, mime=f.mime or "image/jpeg", kind=int(f.type), description=f.desc or "")
-        for f in id3.getall("APIC")
-    ]
-    return out, covers
+def _from_id3(id3) -> TagSet:
+    result = TagSet(id3=id3)
+    out = result.fields
+    for frame in id3.values():
+        frame_id = frame.FrameID
+        if frame_id == "TXXX":
+            out.setdefault((frame.desc or "txxx").lower(), []).extend(str(t) for t in frame.text)
+        elif frame_id == "TRCK" or frame_id == "TPOS":
+            number, _, total = str(frame.text[0]).partition("/")
+            base = "track" if frame_id == "TRCK" else "disc"
+            out[f"{base}number"] = [number]
+            if total:
+                out[f"{base}total"] = [total]
+        elif frame_id.startswith("T"):
+            name = _ID3_NAME.get(frame_id, frame_id.lower())
+            out.setdefault(name, []).extend(str(t) for t in frame.text)
+        elif frame_id == "COMM":
+            out.setdefault("comment", []).extend(str(t) for t in frame.text)
+        elif frame_id == "USLT":
+            out.setdefault("lyrics", []).append(str(frame.text))
+        elif frame_id == "APIC":
+            result.covers.append(Cover(data=frame.data, mime=frame.mime or "image/jpeg",
+                                       kind=int(frame.type), description=frame.desc or ""))
+        elif frame_id == "WXXX":
+            out.setdefault((frame.desc or "url").lower(), []).append(str(frame.url))
+        elif frame_id.startswith("W"):
+            out.setdefault(frame_id.lower(), []).append(str(frame.url))
+        else:  # GEOB, POPM, PRIV, UFID, SYLT, ...: binary, no text form
+            result.unportable.append(frame.HashKey)
+    return result
 
 
-def _from_mp4(audio) -> Tuple[Tags, List[Cover]]:
-    from mutagen.mp4 import MP4Cover
+def _from_mp4(tags) -> TagSet:
+    from mutagen.mp4 import MP4Cover, MP4FreeForm
 
-    out: Tags = {}
-    tags = audio.tags or {}
-    for atom, name in _MP4_ATOMS.items():
-        if atom in tags:
-            out[name] = [str(v) for v in tags[atom]]
-    for atom, name in (("trkn", "tracknumber"), ("disk", "discnumber")):
-        if atom in tags and tags[atom]:
-            number, total = (tuple(tags[atom][0]) + (0, 0))[:2]
-            out[name] = [f"{number}/{total}" if total else str(number)]
-    if "tmpo" in tags and tags["tmpo"]:
-        out["bpm"] = [str(tags["tmpo"][0])]
-    for key in tags.keys():
-        if key.startswith("----:") and key.rsplit(":", 1)[-1].lower() in ("isrc", "label", "initialkey"):
-            name = key.rsplit(":", 1)[-1].lower()
-            values = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in tags[key]]
-            out[name] = values
-    covers = []
-    for cover in tags.get("covr", []) or []:
-        mime = "image/png" if getattr(cover, "imageformat", None) == MP4Cover.FORMAT_PNG else "image/jpeg"
-        covers.append(Cover(data=bytes(cover), mime=mime))
-    return out, covers
+    result = TagSet()
+    out = result.fields
+    for atom, values in tags.items():
+        if atom in _MP4_ATOMS:
+            out[_MP4_ATOMS[atom]] = [str(v) for v in values]
+        elif atom in ("trkn", "disk"):
+            number, total = (tuple(values[0]) + (0, 0))[:2] if values else (0, 0)
+            base = "track" if atom == "trkn" else "disc"
+            out[f"{base}number"] = [str(number)]
+            if total:
+                out[f"{base}total"] = [str(total)]
+        elif atom == "tmpo":
+            out["bpm"] = [str(v) for v in values]
+        elif atom == "covr":
+            for cover in values:
+                mime = "image/png" if getattr(cover, "imageformat", None) == MP4Cover.FORMAT_PNG else "image/jpeg"
+                result.covers.append(Cover(data=bytes(cover), mime=mime))
+        elif atom.startswith("----:"):
+            name = atom.rsplit(":", 1)[-1].lower()
+            texts = []
+            for value in values:
+                if isinstance(value, (bytes, MP4FreeForm)):
+                    try:
+                        texts.append(bytes(value).decode("utf-8"))
+                    except UnicodeDecodeError:
+                        result.unportable.append(atom)
+                        texts = []
+                        break
+                else:
+                    texts.append(str(value))
+            if texts:
+                out[_VORBIS_ALIASES.get(name, name)] = texts
+        elif all(isinstance(v, (str, int, bool)) for v in values):
+            out[atom.replace("\xa9", "").lower()] = [str(int(v)) if isinstance(v, bool) else str(v) for v in values]
+        else:
+            result.unportable.append(atom)
+    return result
 
 
 def _cover_from_picture(picture) -> Cover:
@@ -184,7 +236,7 @@ def _cover_from_picture(picture) -> Cover:
                  kind=int(picture.type), description=picture.desc or "")
 
 
-def _cover_from_ogg(raw: str):
+def _cover_from_ogg(raw: str) -> Optional[Cover]:
     from mutagen.flac import Picture
 
     try:
@@ -209,13 +261,23 @@ def _picture_from_cover(cover: Cover):
 def _fill_id3(id3, tags: Tags, covers: List[Cover]) -> None:
     from mutagen import id3 as frames
 
+    for base, frame_id in (("track", "TRCK"), ("disc", "TPOS")):
+        number = (tags.get(f"{base}number") or [""])[0]
+        total = (tags.get(f"{base}total") or [""])[0]
+        if number or total:
+            id3.add(getattr(frames, frame_id)(encoding=3, text=[f"{number}/{total}" if total else number]))
+    skip = {"tracknumber", "tracktotal", "discnumber", "disctotal"}
     for name, values in tags.items():
+        if name in skip:
+            continue
         if name == "comment":
             id3.add(frames.COMM(encoding=3, lang="eng", desc="", text=list(values)))
-            continue
-        frame_id = _ID3_FRAMES.get(name)
-        if frame_id:
-            id3.add(getattr(frames, frame_id)(encoding=3, text=list(values)))
+        elif name == "lyrics":
+            id3.add(frames.USLT(encoding=3, lang="eng", desc="", text="\n".join(values)))
+        elif name in _ID3_TEXT:
+            id3.add(getattr(frames, _ID3_TEXT[name])(encoding=3, text=list(values)))
+        else:
+            id3.add(frames.TXXX(encoding=3, desc=name.upper(), text=list(values)))
     for cover in covers:
         id3.add(frames.APIC(encoding=3, mime=cover.mime, type=cover.kind,
                             desc=cover.description, data=cover.data))

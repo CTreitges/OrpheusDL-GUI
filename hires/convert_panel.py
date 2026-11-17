@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import tkinter
 from tkinter import filedialog
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import customtkinter
 
@@ -24,14 +24,19 @@ from .ui_style import PRIMARY_ACTION, SECONDARY_TEXT, WARNING, button
 
 class ConvertFolderDialog:
     def __init__(self, parent, *, ffmpeg: str = "ffmpeg", target: str = "flac",
-                 keep_original: bool = False, folder: str = ""):
+                 keep_original: bool = False, folder: str = "",
+                 busy: Optional[Callable[[], bool]] = None):
+        """``busy`` says whether a download runs right now; converting a folder
+        then could catch a file that is still being written."""
         self.window = customtkinter.CTkToplevel(parent)
         self.window.title("Convert folder")
         self.window.resizable(False, False)
         self.window.transient(parent.winfo_toplevel())
         self.dispatch = UiDispatcher(self.window)
         self.job = FolderConvertJob(self.dispatch, ffmpeg=ffmpeg)
+        self.busy = busy or (lambda: False)
         self._paths: list = []
+        self._confirm = confirm_destructive
 
         body = customtkinter.CTkFrame(self.window, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=20, pady=16)
@@ -80,32 +85,47 @@ class ConvertFolderDialog:
         if chosen:
             self.folder_var.set(chosen)
 
-    def start(self, confirm=confirm_destructive) -> bool:
+    def start(self, confirm=None) -> bool:
+        """Count the files (off the main thread), ask, then convert."""
         if self.job.running:
             return False
-        folder = self.folder_var.get().strip()
-        target = self.format_var.get()
-        self._paths = self.job.scan(folder)
-        if not self._paths:
-            self.status.configure(text="No audio files in this folder.", text_color=WARNING)
+        if self.busy():
+            self.status.configure(
+                text="A download is running. Wait until it has finished (or pause the queue): "
+                     "converting now could catch a file that is still being written.",
+                text_color=WARNING)
             return False
-        keep = bool(self.keep_var.get())
-        if not keep and not confirm(
-            self.window, "Replace originals?",
-            f"{len(self._paths)} audio files will be converted to {target.upper()}. Each original is "
-            "deleted once its converted copy checked out; files that fail stay as they are.",
-            "Convert and replace",
-        ):
-            return False
+        self._confirm = confirm or confirm_destructive
         self._set_running(True)
         self.progress.set(0)
-        self.status.configure(text=f"Converting {len(self._paths)} files…", text_color=SECONDARY_TEXT)
-        return self.job.start(self._paths, target, keep, self._on_progress, self._on_done)
+        self.status.configure(text="Counting audio files…", text_color=SECONDARY_TEXT)
+        return self.job.scan(self.folder_var.get().strip(), self._on_scanned)
+
+    def _on_scanned(self, audio: list, playlists: list) -> None:
+        self._set_running(False)
+        self._paths = audio
+        target = self.format_var.get()
+        if not audio:
+            self.status.configure(text="No audio files in this folder.", text_color=WARNING)
+            return
+        keep = bool(self.keep_var.get())
+        if not keep and not self._confirm(
+            self.window, "Replace originals?",
+            f"{len(audio)} audio files will be converted to {target.upper()}. Each original is "
+            "deleted once its converted copy checked out, with all its tags. Files that fail, and "
+            "files with tags the new format cannot hold, stay as they are.",
+            "Convert and replace",
+        ):
+            self.status.configure(text="Nothing changed.", text_color=SECONDARY_TEXT)
+            return
+        self._set_running(True)
+        self.status.configure(text=f"Converting {len(audio)} files…", text_color=SECONDARY_TEXT)
+        self.job.start(audio, target, keep, self._on_progress, self._on_done, playlists=playlists)
 
     def cancel_or_close(self) -> None:
         if self.job.running:
             self.job.cancel()
-            self.status.configure(text="Stopping after the current file…")
+            self.status.configure(text="Stopping… the file being converted keeps its original.")
             return
         self.dispatch.stop()
         self.window.destroy()
@@ -139,5 +159,9 @@ def open_convert_dialog(gui: Any) -> Optional[ConvertFolderDialog]:
     general = (settings or {}).get("globals", {}).get("general", {}) if isinstance(settings, dict) else {}
     finder = getattr(gui, "_get_ffmpeg_path", None)
     ffmpeg = (finder() if callable(finder) else None) or "ffmpeg"
+    bundle = getattr(gui, "hires_runtime", None)
+    runtime = bundle.get("runtime") if isinstance(bundle, dict) else None
+    busy = runtime.is_busy if runtime is not None else (
+        lambda: bool(getattr(gui, "download_process_active", False)))
     return ConvertFolderDialog(app, ffmpeg=ffmpeg, target=target if target != ac.TARGET_OFF else "flac",
-                               keep_original=keep, folder=general.get("output_path") or "")
+                               keep_original=keep, folder=general.get("output_path") or "", busy=busy)

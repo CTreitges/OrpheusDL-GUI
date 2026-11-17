@@ -272,13 +272,28 @@ def _tk_root():
             time.sleep(0.2)
 
 
+def _pump(root, predicate, timeout=60.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        root.update()
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _tone(path):
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "sine=duration=0.3", str(path)], check=True)
+
+
 @needs_ffmpeg
 class TestConvertFolderDialog:
     def test_target_format_folder_dialog_converts_and_reports(self, tmp_path):
         for name in ("a.flac", "sub/b.flac"):
-            os.makedirs(os.path.dirname(str(tmp_path / name)), exist_ok=True)
-            subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                            "sine=duration=0.3", str(tmp_path / name)], check=True)
+            _tone(tmp_path / name)
+        (tmp_path / "set.m3u").write_text("a.flac\nsub/b.flac\n", encoding="utf-8")
         root = _tk_root()
         try:
             from hires.convert_panel import ConvertFolderDialog
@@ -286,32 +301,88 @@ class TestConvertFolderDialog:
             dialog = ConvertFolderDialog(root, ffmpeg=FFMPEG, target="wav", folder=str(tmp_path))
             asked = []
             assert dialog.start(confirm=lambda *a: asked.append(a[1]) or True)
+            assert dialog.status.cget("text") == "Counting audio files…"
+            assert _pump(root, lambda: dialog.status.cget("text").startswith("2 of 2 files converted"))
             assert asked == ["Replace originals?"]
-            assert dialog.cancel_button.cget("text") == "Cancel"
-            deadline = time.time() + 60
-            while dialog.job.running and time.time() < deadline:
-                root.update()
-                time.sleep(0.02)
-            for _ in range(20):
-                root.update()
-                time.sleep(0.02)
             assert sorted(os.path.relpath(p, tmp_path) for p in ac.find_audio(str(tmp_path))) == [
                 "a.wav", os.path.join("sub", "b.wav")]
-            assert dialog.status.cget("text").startswith("2 of 2 files converted to WAV.")
+            # Review: the folder's playlists follow the converted files.
+            assert (tmp_path / "set.m3u").read_text(encoding="utf-8") == "a.wav\nsub/b.wav\n"
             assert dialog.cancel_button.cget("text") == "Close"
         finally:
             root.destroy()
 
     def test_target_format_folder_dialog_declined_confirmation_changes_nothing(self, tmp_path):
-        subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                        "sine=duration=0.3", str(tmp_path / "a.flac")], check=True)
+        _tone(tmp_path / "a.flac")
         root = _tk_root()
         try:
             from hires.convert_panel import ConvertFolderDialog
 
             dialog = ConvertFolderDialog(root, ffmpeg=FFMPEG, target="aiff", folder=str(tmp_path))
-            assert dialog.start(confirm=lambda *a: False) is False
+            assert dialog.start(confirm=lambda *a: False)
+            assert _pump(root, lambda: dialog.status.cget("text") == "Nothing changed.")
             assert not dialog.job.running
             assert os.listdir(tmp_path) == ["a.flac"]
         finally:
             root.destroy()
+
+    def test_target_format_folder_dialog_waits_for_a_running_download(self, tmp_path):
+        _tone(tmp_path / "a.flac")
+        root = _tk_root()
+        try:
+            from hires.convert_panel import ConvertFolderDialog
+
+            dialog = ConvertFolderDialog(root, ffmpeg=FFMPEG, target="wav", folder=str(tmp_path),
+                                         busy=lambda: True)
+            assert dialog.start(confirm=lambda *a: True) is False
+            assert "download is running" in dialog.status.cget("text")
+            assert os.listdir(tmp_path) == ["a.flac"]
+        finally:
+            root.destroy()
+
+
+class TestFolderJobHoldsTheQueue:
+    def test_target_format_queue_waits_while_a_folder_is_converted(self, tmp_path):
+        from hires import convert_job
+
+        out = tmp_path / "Downloads"
+        out.mkdir()
+        gui = _Gui(str(out))
+        store = QueueStore(str(tmp_path / "queue.json"))
+        runtime = HiresRuntime(gui, store, logger=lambda _m: None)
+        store.add(QueueItem(url="https://tidal.com/browse/track/1", title="T"))
+        convert_job._ACTIVE.set()
+        try:
+            runtime._pump()
+            assert store.list()[0].status == QueueStatus.PENDING.value
+        finally:
+            convert_job._ACTIVE.clear()
+
+
+class TestGuiStartHook:
+    def test_target_format_download_thread_takes_a_snapshot_first(self):
+        tree = ast.parse(_gui_source())
+        thread = _function(tree, "run_download_in_thread")
+        calls = [n for n in ast.walk(thread) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "_hires_before_download"]
+        assert len(calls) == 1 and [ast.unparse(a) for a in calls[0].args] == ["output_path"]
+        source = ast.unparse(thread)
+        assert source.index("_hires_before_download(") < source.index("_hires_after_download(")
+        hook = ast.unparse(_function(tree, "_hires_before_download"))
+        assert "before_download(sys.modules[__name__], output_path)" in hook
+
+    def test_target_format_snapshot_reaches_the_conversion(self, tmp_path, monkeypatch):
+        """before_download on the thread, after_download on the same thread uses it."""
+        seen = {}
+
+        def fake_process(path, started, target, **kwargs):
+            seen["existing"] = kwargs.get("existing")
+            return ""
+
+        monkeypatch.setattr(download_finish, "process_download", fake_process)
+        (tmp_path / "old.flac").write_bytes(b"x")
+        gui = _Gui(str(tmp_path))
+        download_finish.before_download(gui, str(tmp_path))
+        download_finish.after_download(gui, str(tmp_path), time.time())
+        assert seen["existing"] == download_finish.snapshot(str(tmp_path))
+        assert len(seen["existing"]) == 1

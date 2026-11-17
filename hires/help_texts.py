@@ -134,7 +134,7 @@ HELP: Dict[str, HelpEntry] = {
         recommendation="Try it on a copy of one crate first; with 'Keep original' off the originals are replaced.",
     ),
     "hires.convert.cancel": H(
-        text="Stops after the file being converted; that file keeps its original.",
+        text="Stops at once; the file being converted keeps its original, files already done stay converted.",
         recommendation="Safe to press at any time.",
     ),
     # -- Global: module defaults --------------------------------------------

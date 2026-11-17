@@ -11,9 +11,17 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Sequence
 
 from . import audio_convert as ac
+
+#: Set while a "Convert folder…" job runs. The queue runner starts no new item
+#: meanwhile, so a download never writes into a folder that is being converted.
+_ACTIVE = threading.Event()
+
+
+def folder_job_running() -> bool:
+    return _ACTIVE.is_set()
 
 
 @dataclass
@@ -81,9 +89,25 @@ class FolderConvertJob:
         self._cancel = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    @staticmethod
-    def scan(folder: str) -> List[str]:
-        return ac.find_audio(folder)
+    def scan(self, folder: str, on_done: Callable[[List[str], List[str]], None]) -> bool:
+        """Count the folder's audio files and playlists off the main thread.
+
+        A whole library can take seconds to walk; ``on_done(audio, playlists)``
+        arrives through ``dispatch``. False if a scan or job is running.
+        """
+        if self.running:
+            return False
+
+        def work() -> None:
+            try:
+                audio, playlists = ac.scan(folder)
+            except Exception:
+                audio, playlists = [], []
+            self.dispatch(on_done, audio, playlists)
+
+        self._thread = threading.Thread(target=work, name="hires-convert-scan", daemon=True)
+        self._thread.start()
+        return True
 
     @property
     def running(self) -> bool:
@@ -96,8 +120,13 @@ class FolderConvertJob:
         keep_original: bool,
         on_progress: Callable[[Progress], None],
         on_done: Callable[[ac.FolderSummary], None],
+        playlists: Sequence[str] = (),
     ) -> bool:
-        """Start converting ``paths``; False if a job is already running."""
+        """Start converting ``paths``; False if a job is already running.
+
+        ``playlists`` (.m3u/.m3u8 of the folder) are pointed at the new files
+        afterwards, as the download hook does for a fresh download.
+        """
         if self.running:
             return False
         self._cancel.clear()
@@ -111,12 +140,16 @@ class FolderConvertJob:
                                                 elapsed=time.monotonic() - started, **counts))
 
         def work() -> None:
+            _ACTIVE.set()
             try:
                 summary = self._convert(paths, target, keep_original=keep_original,
                                         ffmpeg=self.ffmpeg, cancel=self._cancel, progress=progress)
+                ac.rewrite_playlists(playlists, ac.renamed_by(summary))
             except Exception as exc:  # report, never leave the dialog hanging
                 summary = ac.FolderSummary(found=len(paths), failed=len(paths))
                 summary.results.append(ac.ConvertResult("", "failed", reason=str(exc)))
+            finally:
+                _ACTIVE.clear()
             self.dispatch(on_done, summary)
 
         self._thread = threading.Thread(target=work, name="hires-convert-folder", daemon=True)
