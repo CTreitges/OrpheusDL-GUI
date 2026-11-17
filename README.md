@@ -6,7 +6,11 @@
 > **download queue** grouped by playlist, a **Playlists** tab for Spotify,
 > TIDAL, YouTube and SoundCloud, and a **Port** tab that finds a playlist's
 > tracks on another of those services — Spotify → TIDAL downloads your Spotify
-> playlists from TIDAL in hi-res (24 bit FLAC). See **[HIRES.md](HIRES.md)**.
+> playlists from TIDAL in hi-res (24 bit FLAC). A **Target format** setting
+> (Settings › Codecs) turns every download into WAV, FLAC or AIFF without
+> upsampling, with a **Convert folder…** button for files you already have, and
+> the queue shows the quality each download really arrived in.
+> See **[HIRES.md](HIRES.md)**.
 >
 > Upstream project: [bascurtiz/OrpheusDL-GUI](https://github.com/bascurtiz/OrpheusDL-GUI)
 

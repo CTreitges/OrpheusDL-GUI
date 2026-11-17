@@ -1,19 +1,23 @@
 # Hi-Res Suite
 
-Four additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
+Additions to OrpheusDL-GUI, built on top of upstream `v2.0.3`:
 
 1. **Accounts** — TIDAL, Spotify, SoundCloud and YouTube: sign in or check the
    token/cookie file before you queue anything.
-2. **Download queue** — a persistent queue grouped by playlist that survives restarts.
+2. **Download queue** — a persistent queue grouped by playlist that survives
+   restarts, showing the quality each finished download really arrived in.
 3. **Playlists** — browse playlists of Spotify, TIDAL, YouTube and SoundCloud
    and queue them whole or in part.
 4. **Port** — read a playlist on one of the four services, find its tracks on
    another and queue the matches (12 directions; Spotify → TIDAL in hi-res is
    the default).
+5. **Target format** — convert every download to WAV, FLAC or AIFF, and whole
+   folders on demand (*Settings → Codecs*).
 
-Everything lives in the `hires/` package. The only change to `gui.py` is four
-lines that add the tabs, wrapped in a `try/except` — if anything here breaks,
-the stock GUI still starts, just without the extra tabs.
+Everything lives in the `hires/` package. `gui.py` only wires it in: the lines
+that add the tabs (wrapped in a `try/except` — if anything here breaks, the
+stock GUI still starts, just without the extra tabs), the "?" help markers,
+the two target-format settings and one call at the end of every download.
 
 ---
 
@@ -162,6 +166,77 @@ This is a heuristic. It is accurate for normal downloads, but a download that
 writes nothing because the file already existed *and* `ignore_existing_files` is
 enabled will be marked failed. Retrying such an item is harmless.
 
+### The quality that really arrived
+
+A finished entry shows what was actually downloaded — read from the files, not
+taken from the request: `FLAC 24-bit/96 kHz`, `AAC 160 kbit/s`,
+`WAV 16-bit/44.1 kHz`. A playlist entry with mixed files lists each label with
+its count (`FLAC 16-bit/44.1 kHz ×11 · AAC 256 kbit/s ×1`); a converted
+download adds the target (`AAC 160 kbit/s → AIFF`). Until an entry is done it
+shows the tier it asked for.
+
+The download thread reads the new files with mutagen right after they are
+written (`hires/download_finish.py`) and hands the label to the queue runner,
+keyed by that thread — a download you started by hand never lends its label to
+a queue entry.
+
+---
+
+## Target format
+
+*Settings → Codecs → Target format* (`off`, `wav`, `flac`, `aiff`; default
+`off`, so nothing changes until you pick one) converts every finished download,
+from any tab:
+
+| Rule | Why |
+|------|-----|
+| Sample rate and bit depth stay as they arrived; lossy sources become 16 bit | No upsampling: a bigger number would not mean better sound |
+| ffmpeg writes a `.part` file; it is checked (sample rate, bit depth, length ±50 ms) and tagged before it replaces the original | A failed or cut conversion never costs the original |
+| Tags and cover are copied with mutagen (ID3 in WAV/AIFF, Vorbis comments in FLAC) | ffmpeg's WAV writer cannot store a cover; DJ software reads the ID3 chunk |
+| Lossy sources (AAC, MP3, Opus, Vorbis) are converted with a note in the log | A WAV of a 160 kbit/s stream is still 160 kbit/s, just bigger |
+| Dolby Atmos / more than two channels, and float or 32-bit sources into FLAC, are skipped | WAV would fold Atmos to stereo; FLAC cannot hold them losslessly |
+| Only files created since the download started are touched | A library file another program re-tagged meanwhile is never converted or deleted |
+| `.m3u` playlists written by the same download point at the new files | Playlist imports keep working |
+
+**Keep Original** keeps the downloaded file next to the converted one; off
+(default) replaces it once the new file checked out.
+
+The conversion runs on the download thread before the GUI reports the download
+as finished, so the queue starts its next item only afterwards. **Stop**
+interrupts it between files; the file being converted keeps its original.
+
+**Convert folder…** (next to the setting) does the same for a folder you
+already have, sub-folders included: pick a folder, a format and Keep original;
+without Keep original it asks first ("Replace originals?", Cancel is the
+default). Progress shows files done, failures and the time left; Cancel stops
+after the current file. Measured: 200 files in 12 s, 200 in, 200 out, 0 lost.
+
+Recommendation for DJ use: FLAC, or AIFF where a player or USB export needs
+uncompressed files with tags; WAV only when nothing else is accepted.
+
+---
+
+## SoundCloud module (fork)
+
+The build takes the SoundCloud module from
+[CTreitges/orpheusdl-soundcloud](https://github.com/CTreitges/orpheusdl-soundcloud)
+at a pinned commit (upstream `e1eff2e` plus one fix), because measuring seven
+real tracks found two faults in upstream:
+
+- **Go+ tracks without Go+ were saved as their 30-second preview** — no error,
+  a 30 s file under the full track's name. SoundCloud marks those streams
+  `snipped`; the fork skips them and reports "only a 30-second preview is
+  available" instead.
+- **Without a token nothing downloaded**: the module's built-in public client
+  id is out of date (401). The fork reads the current one from soundcloud.com,
+  as yt-dlp does.
+
+Otherwise the module already picks the best stream: the uploader's original
+file where downloads are allowed (also WAV), else AAC 160 kbit/s (free) — Go+
+accounts get the full-length Go+ streams. Tracks offered only as encrypted
+streams cannot be downloaded. `tests/test_build_workflow.py` keeps the build on
+the pinned fork until upstream has the fix.
+
 ---
 
 ## Playlists
@@ -284,7 +359,7 @@ the live log file), and differs per platform and per install type.
 
 That is not shipped here. The list is flat, and **the checkboxes cover what
 folders would have been used for**: tick several playlists — or hit *Select
-all* — and **Convert & queue N** works through them one after another, queueing
+all* — and **Port & queue N** works through them one after another, queueing
 each playlist's matches as soon as that playlist is done. A long run is
 therefore useful even if a later playlist fails: the earlier downloads have
 already started.
@@ -413,6 +488,9 @@ free of tkinter and can be tested headlessly:
 | `queue_panel.py` | Widgets of the grouped Queue tab |
 | `playlists_panel.py`, `port_panel.py` | Widgets of the Playlists and Port tabs |
 | `help_widget.py`, `dialogs.py`, `ui_style.py` | "?" marker and tooltip, confirmation dialog, palette |
+| `audio_convert.py`, `audio_tags.py` | Target format: probing, conversion with checks, tags and cover |
+| `download_finish.py` | After every download: actual quality, target format, `.m3u` fix-up |
+| `convert_job.py`, `convert_panel.py` | "Convert folder…": worker job and its dialog |
 | `integration.py` | The bridge into `gui.py` |
 
 ```bash
