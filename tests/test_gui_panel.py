@@ -598,6 +598,70 @@ def review(sid, tid, alternatives=None):
     )
 
 
+class TestPortAndQueue:
+    """One click: port, confident matches into the queue, the rest to review."""
+
+    def _tab(self, root, queue, matcher):
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root))
+
+    def test_port_and_queue_queues_confident_and_keeps_uncertain_for_review(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), accepted("s3", "t3"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        items = queue.list()
+        assert [i.url.rsplit("/", 1)[-1] for i in items] == ["t1", "t3"]
+        assert len({i.group_id for i in items}) == 1, "one port = one group in the queue"
+        assert "Queued 2 tracks" in tab.status_label.cget("text")
+        assert "1 uncertain wait for review" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "normal"
+        assert tab.queue_button.cget("state") == "disabled", "queueing again would download twice"
+
+    def test_port_and_queue_review_queues_only_the_reviewed(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1"), review("s2", "t2")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: tab.review_button.cget("state") == "normal")
+        tab._apply_review({"s2": "t2"})
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1", "t2"]
+
+    def test_port_and_queue_without_link_warns(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.port_and_queue()
+        pump(root)
+        assert "Paste a Spotify playlist link" in tab.status_label.cget("text")
+        assert queue.list() == []
+
+    def test_port_and_queue_nothing_uncertain(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.port_and_queue()
+        pump_until(root, lambda: queue.list())
+        assert "Nothing uncertain" in tab.status_label.cget("text")
+        assert tab.review_button.cget("state") == "disabled"
+
+    def test_port_link_row_appears_after_porting_a_link(self, root, queue):
+        """Regression (gui review): the list kept the intro text after a port by link."""
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.list.playlists)
+        assert [p.name for p in tab.list.playlists] == ["Remote"]
+        assert "x" in tab.list._rows
+
+    def test_port_link_row_keeps_own_playlists_and_no_duplicates(self, root, queue):
+        tab = self._tab(root, queue, FakeMatcher([accepted("s1", "t1")]))
+        tab.list.set_playlists([PlaylistRef(id="mine", name="Mine")])
+        tab.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        tab.convert_from_url()
+        pump_until(root, lambda: len(tab.list.playlists) == 2)
+        tab.convert_from_url()
+        pump_until(root, lambda: tab.status_label.cget("text").endswith("not found"))
+        assert [p.id for p in tab.list.playlists] == ["x", "mine"]
+
+
 class TestSpotifyConvertTab:
     def _tab(self, root, queue, source, matcher, **kwargs):
         return spotify_port_tab(root, queue, source, matcher, dispatch=UiDispatcher(root), **kwargs)
@@ -1014,6 +1078,27 @@ class TestSetupTabsWiring:
         monkeypatch.setattr(integration, "folder_job_running", lambda: False)
         updater._try_install()
         assert events["quit"] == 1
+
+    def test_port_and_queue_button_in_the_real_assembly(self, root, tmp_path):
+        """The real button of setup_tabs' Port tab; only the services are fakes."""
+        gui, result = self._build(root, tmp_path, "high")
+        port, queue = result["tabs"]["port"], result["queue"]
+        source = FakeSpotifySource(tracks=[TrackRef(id="s1", title="Song", artists=["A"])])
+        controller = port.controller
+        controller.providers = {"Spotify": lambda: source, "TIDAL": lambda: object()}
+        controller.matcher_factory = lambda _t, _n: FakeMatcher([accepted("s1", "t1"), review("s2", "t2")])
+        controller._build_converter = lambda direction=None: __import__(
+            "hires.converter", fromlist=["PlaylistConverter"]
+        ).PlaylistConverter(source, controller.matcher_factory(None, "TIDAL"), queue, quality="hifi",
+                            output_root=str(tmp_path), source_name="Spotify", target_name="TIDAL")
+        port.url_entry.insert(0, "https://open.spotify.com/playlist/abc")
+        port.port_queue_button.invoke()
+        pump_until(root, lambda: queue.list())
+
+        assert [i.url.rsplit("/", 1)[-1] for i in queue.list()] == ["t1"]
+        assert queue.list()[0].quality == "hifi"
+        assert port.review_button.cget("state") == "normal"
+        assert [p.name for p in port.list.playlists] == ["Remote"]
 
     def test_all_tabs_are_registered(self, root, tmp_path):
         _gui, result = self._build(root, tmp_path, "hifi")

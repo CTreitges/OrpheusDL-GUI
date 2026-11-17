@@ -169,7 +169,18 @@ _NOISE = re.compile(
     re.IGNORECASE,
 )
 _DASH = re.compile(r"\s+[-–—:]\s+")
-_CHANNEL_SUFFIX = re.compile(r"\s*(?:-\s*topic|vevo|official)\s*$", re.IGNORECASE)
+#: Channel endings that are not part of the artist's name: "Daft Punk - Topic",
+#: "MartinGarrixVEVO", "BASTILLEvideos", "Dua Lipa Official", "Avicii Music".
+_CHANNEL_SUFFIX = re.compile(
+    r"(?P<sep>\s*-\s*|\s+|)(?P<word>topic|vevo|official|officiel|videos?|music|tv)\s*$",
+    re.IGNORECASE,
+)
+#: "MartinGarrix" -> "Martin Garrix"; only after a glued suffix ("…VEVO") and
+#: only after a word of 3+ letters and before a capitalised word, so "McFly",
+#: "deadmau5" or "BASTILLE" stay as they are.
+_CAMEL = re.compile(r"(?:(?<=[a-z]{3})|(?<=[A-Z][a-z]{2}))(?=[A-Z][a-z])")
+#: What may never be left over: "The Music" is a band, not "The".
+_TOO_SHORT = {"", "the", "a", "an", "dj", "mc"}
 
 
 #: Separators between several artists in an upload title ("A, B", "A & B",
@@ -184,8 +195,28 @@ def split_artists(text: str) -> List[str]:
 
 
 def clean_channel(name: str) -> str:
-    """"Daft Punk - Topic" / "DaftPunkVEVO" -> the artist behind the channel."""
-    return _CHANNEL_SUFFIX.sub("", (name or "").strip()).strip()
+    """The artist behind a channel name.
+
+    "Daft Punk - Topic" -> "Daft Punk", "BASTILLEvideos" -> "BASTILLE",
+    "AviciiOfficialVEVO" -> "Avicii", "MartinGarrixVEVO" -> "Martin Garrix".
+    Endings are stripped one at a time; a name that would shrink to nothing
+    or to an article ("The Music") is left alone.
+    """
+    original = (name or "").strip()
+    text = original
+    glued = False
+    while True:
+        match = _CHANNEL_SUFFIX.search(text)
+        if match is None:
+            break
+        rest = text[: match.start()].strip()
+        if rest.lower() in _TOO_SHORT:
+            break
+        glued = glued or match.group("sep") == ""
+        text = rest
+    if glued and " " not in text:
+        text = _CAMEL.sub(" ", text)
+    return text or original
 
 
 def split_artist_title(title: str, uploader: str = "") -> Tuple[List[str], str]:

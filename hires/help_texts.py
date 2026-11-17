@@ -397,6 +397,13 @@ HELP: Dict[str, HelpEntry] = {
         text="Reads the linked playlist and searches every track on the target.",
         recommendation="Review uncertain matches before queueing.",
     ),
+    "hires.port.port_and_queue": H(
+        text=(
+            "Ports the linked (or highlighted) playlist and queues the confident matches at once, "
+            "as one group. Uncertain matches are not downloaded; they wait in Review uncertain…"
+        ),
+        recommendation="Use it when you trust the matching; use Port to look at the result first.",
+    ),
     "hires.port.my_playlists": H(
         text="Lists your own playlists on the source service.",
         recommendation="Spotify needs Client ID and Secret; SoundCloud a token; YouTube a cookie file.",

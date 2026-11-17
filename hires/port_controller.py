@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .controllers import SpotifyImportController, UiDispatcher, _describe, run_in_background
 from .converter import PlaylistConverter
 from .matcher import TrackMatcher
-from .models import ConversionReport, HiresError, QueueItem
+from .models import ConversionReport, FolderRef, HiresError, PlaylistRef, QueueItem, flat_root
 from .playlist_providers import SERVICES, TARGET_QUALITY, ProviderStatus, port_directions
 from .playlists_controller import provider_status
 
@@ -64,6 +64,8 @@ class PortController(SpotifyImportController):
         )
         self.providers = dict(providers)
         self.matcher_factory = matcher_factory or _default_matcher
+        #: id(report) -> (report, source ids already queued from it).
+        self._queued: Dict[int, Tuple[ConversionReport, set]] = {}
         self.source_service = "Spotify"
         self.target_service = "TIDAL"
 
@@ -150,13 +152,58 @@ class PortController(SpotifyImportController):
         if report is None:
             return []
         apply_review(report, decisions)
-        return self._converter_for(report).enqueue(report, include_review=include_unreviewed)
+        return self._enqueue_new(report, include_review=include_unreviewed)
 
     def enqueue_confident_only(self, report: Optional[ConversionReport] = None) -> List[QueueItem]:
         report = report or self.report
         if report is None:
             return []
-        return self._converter_for(report).enqueue(report, include_review=False)
+        return self._enqueue_new(report, include_review=False)
+
+    def _enqueue_new(self, report: ConversionReport, *, include_review: bool) -> List[QueueItem]:
+        """Queue the accepted matches of ``report`` that are not queued yet.
+
+        "Queue matches" (or "Port & queue") and then "Review uncertain…" both
+        queue from the same report; without this the confident tracks were
+        queued -- and downloaded -- a second time with the reviewed ones.
+        Same playlist, same start time: the remainder joins the same group.
+        """
+        entry = self._queued.get(id(report))
+        if entry is None or entry[0] is not report:
+            entry = (report, set())
+            self._queued[id(report)] = entry
+        done = entry[1]
+        fresh = ConversionReport(
+            playlist=report.playlist,
+            results=[r for r in report.results if r.source.id not in done],
+            started_at=report.started_at,
+            finished_at=report.finished_at,
+            source_service=report.source_service,
+            target_service=report.target_service,
+        )
+        items = self._converter_for(report).enqueue(fresh, include_review=include_review)
+        accepted = fresh.auto_accepted + (fresh.needs_review if include_review else [])
+        done.update(r.source.id for r in accepted if r.best is not None)
+        return items
+
+    def convert_and_queue(self, playlist: Any, on_progress, on_done, on_error) -> threading.Thread:
+        """*Port & queue*: port, then queue the confident matches at once.
+
+        ``on_done(report, items)`` runs on the main thread like every other
+        callback. Uncertain matches are not queued; they stay in the report
+        for the review dialog. A run superseded by a newer one queues nothing,
+        because :meth:`convert` drops its result.
+        """
+
+        def finished(report: ConversionReport) -> None:
+            try:
+                items = self.enqueue_confident_only(report)
+            except Exception as exc:
+                on_error(_describe(exc))
+                return
+            on_done(report, items)
+
+        return self.convert(playlist, on_progress, finished, on_error)
 
     # -- listing ------------------------------------------------------------
     def load_playlists(self, on_done, on_error, on_status=None) -> threading.Thread:
@@ -190,3 +237,21 @@ class PortController(SpotifyImportController):
             self.dispatch(on_done, root)
 
         return run_in_background(work, name="hires-port-playlists")
+
+
+def with_linked_playlist(root: Optional[FolderRef], playlist: PlaylistRef) -> FolderRef:
+    """The Port list after porting ``playlist`` by link: it shows as a row.
+
+    Put on top of what is listed (your own playlists, earlier links); a
+    playlist already listed is not added twice.
+    """
+    root = root or flat_root([])
+    if any(p.id == playlist.id for p in root.all_playlists()):
+        return root
+    return FolderRef(
+        id=root.id,
+        name=root.name,
+        playlists=[playlist] + list(root.playlists),
+        folders=list(root.folders),
+        platform=root.platform,
+    )

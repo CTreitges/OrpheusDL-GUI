@@ -16,7 +16,7 @@ from .gui_panel import PlaylistList, ReviewDialog, _selection_label
 from .help_widget import attach_tooltip
 from .models import ConversionReport, FolderRef, MatchDecision, PlaylistRef
 from .playlist_providers import SERVICES, ProviderStatus
-from .port_controller import PortController
+from .port_controller import PortController, with_linked_playlist
 from .quality import HIRES, label_for
 from .ui_style import (
     ERROR,
@@ -102,6 +102,10 @@ class PortTab:
         convert_button = _button(top, "Port", self.convert_from_url, width=90, fg=PRIMARY_ACTION)
         convert_button.pack(side="left", padx=(0, 6))
         attach_tooltip(convert_button, "hires.port.convert")
+        # One click: port, queue the confident matches, leave the rest for review.
+        self.port_queue_button = _button(top, "Port & queue", self.port_and_queue, width=110)
+        self.port_queue_button.pack(side="left", padx=(0, 6))
+        attach_tooltip(self.port_queue_button, "hires.port.port_and_queue")
         self.mine_button = _button(top, "⟳  My playlists", self.load_playlists, width=130)
         self.mine_button.pack(side="left")
         attach_tooltip(self.mine_button, "hires.port.my_playlists")
@@ -295,12 +299,56 @@ class PortTab:
 
     def _on_converted(self, report: ConversionReport) -> None:
         self.report = report
+        self._show_ported(report)
         self.progress.set(1)
         self.status_label.configure(
             text=self.controller.result_summary(report), text_color=WHITE_TEXT
         )
         self.queue_button.configure(state="normal")
         self.review_button.configure(state="normal" if report.needs_review else "disabled")
+
+    def _show_ported(self, report: ConversionReport) -> None:
+        """A playlist ported by link appears as a row instead of the intro text."""
+        if self.list.checked:
+            return  # never throw away ticks the user is working with
+        root = with_linked_playlist(self.list.root, report.playlist)
+        if root is not self.list.root:  # already listed: keep the highlight
+            self.list.set_root(root)
+
+    def port_and_queue(self) -> None:
+        """*Port & queue*: the link (or the highlighted playlist), straight into the queue."""
+        url = self.url_entry.get().strip()
+        playlist: Any = url or self.list.selected
+        if not playlist:
+            self.status_label.configure(
+                text=f"Paste a {self.source} playlist link first.", text_color=WARNING
+            )
+            return
+        self.report = None
+        self.review_choices = {}
+        self.progress.set(0)
+        self.queue_button.configure(state="disabled")
+        self.review_button.configure(state="disabled")
+        self.status_label.configure(text="Reading playlist…", text_color=SECONDARY_TEXT)
+        self.controller.convert_and_queue(
+            playlist, self._on_progress, self._on_ported_and_queued, self._on_error
+        )
+
+    def _on_ported_and_queued(self, report: ConversionReport, items) -> None:
+        self.report = report
+        self._show_ported(report)
+        self.progress.set(1)
+        uncertain = len(report.needs_review)
+        rest = (
+            f" {uncertain} uncertain wait for review." if uncertain else " Nothing uncertain."
+        )
+        self.status_label.configure(
+            text=queued_text(len(items), report.target_service) + rest, text_color=SUCCESS
+        )
+        # The confident ones are queued already: queueing them again would
+        # download every track twice.
+        self.queue_button.configure(state="disabled", text="⬇  Queue matches")
+        self.review_button.configure(state="normal" if uncertain else "disabled")
 
     def _on_error(self, message: str) -> None:
         self.progress.set(0)
