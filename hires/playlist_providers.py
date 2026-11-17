@@ -169,12 +169,13 @@ _NOISE = re.compile(
     re.IGNORECASE,
 )
 _DASH = re.compile(r"\s+[-–—:]\s+")
-#: Channel endings that are not part of the artist's name: "Daft Punk - Topic",
-#: "MartinGarrixVEVO", "BASTILLEvideos", "Dua Lipa Official", "Avicii Music".
-_CHANNEL_SUFFIX = re.compile(
-    r"(?P<sep>\s*-\s*|\s+|)(?P<word>topic|vevo|official|officiel|videos?|music|tv)\s*$",
-    re.IGNORECASE,
-)
+#: YouTube's auto-generated artist channels: the rest is the exact artist name.
+_TOPIC = re.compile(r"\s*-\s*topic\s*$", re.IGNORECASE)
+#: Endings after a space: "Dua Lipa Official", "Bastille Videos". Not "Music"
+#: or "TV" -- "Roxy Music" is a band.
+_SPACED_SUFFIX = re.compile(r"\s+(?:official|officiel|vevo|videos?)\s*$", re.IGNORECASE)
+#: Endings glued on: "MartinGarrixVEVO", "BASTILLEvideos", "RobinSchulzMusic".
+_GLUED_SUFFIX = re.compile(r"(?:official|officiel|vevo|videos?|music|tv)$", re.IGNORECASE)
 #: "MartinGarrix" -> "Martin Garrix"; only after a glued suffix ("…VEVO") and
 #: only after a word of 3+ letters and before a capitalised word, so "McFly",
 #: "deadmau5" or "BASTILLE" stay as they are.
@@ -203,20 +204,41 @@ def clean_channel(name: str) -> str:
     or to an article ("The Music") is left alone.
     """
     original = (name or "").strip()
+    topic = _TOPIC.search(original)
+    if topic is not None and original[: topic.start()].strip():
+        return original[: topic.start()].strip()
     text = original
     glued = False
     while True:
-        match = _CHANNEL_SUFFIX.search(text)
-        if match is None:
+        spaced = _SPACED_SUFFIX.search(text)
+        if spaced is not None:
+            rest = text[: spaced.start()].strip()
+        else:
+            match = _GLUED_SUFFIX.search(text)
+            if match is None or not _word_boundary(text[: match.start()], match.group(0)):
+                break
+            rest = text[: match.start()]
+            glued = True
+        if len(rest) < 2 or rest.lower() in _TOO_SHORT:
             break
-        rest = text[: match.start()].strip()
-        if rest.lower() in _TOO_SHORT:
-            break
-        glued = glued or match.group("sep") == ""
         text = rest
     if glued and " " not in text:
         text = _CAMEL.sub(" ", text)
     return text or original
+
+
+def _word_boundary(rest: str, ending: str) -> bool:
+    """Is a glued ending really a word of its own?
+
+    "GarrixVEVO", "SchulzMusic": lower case, then a capital. "BASTILLEvideos":
+    a name in capitals, then a lower-case word. Not "MTV" or "Unofficial".
+    """
+    if not rest or not ending:
+        return False
+    if (rest[-1].islower() or rest[-1].isdigit()) and ending[0].isupper():
+        return True
+    letters = [ch for ch in rest if ch.isalpha()]
+    return len(letters) >= 2 and all(ch.isupper() for ch in letters) and ending.islower()
 
 
 def split_artist_title(title: str, uploader: str = "") -> Tuple[List[str], str]:

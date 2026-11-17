@@ -342,8 +342,10 @@ YouTube and SoundCloud titles are split into artist and title first
 ("Artist - Title (Official Video)" → artist, title). Where the title has no
 artist, the channel name stands in, without endings that are not part of the
 name: "Daft Punk - Topic", "BASTILLEvideos" → "BASTILLE",
-"MartinGarrixVEVO" → "Martin Garrix", "Dua Lipa Official", "… Music", "… TV".
-Measured on ten artist channels: 7 → 8 of 10 channel names give the artist.
+"MartinGarrixVEVO" → "Martin Garrix", "Dua Lipa Official", "RobinSchulzMusic".
+A glued ending only counts at a word boundary ("MTV", "Unofficial" stay), and
+"Music"/"TV" after a space stay too — "Roxy Music" is a band. Measured on ten
+artist channels (live, 17.11.): 8 → 9 of 10 channel names give the artist.
 
 Searches are paced — at least 1 s between two YouTube or SoundCloud requests
 (yt-dlp's own "sleep" preset spaces requests 0.75 s apart). An HTTP 429 or a

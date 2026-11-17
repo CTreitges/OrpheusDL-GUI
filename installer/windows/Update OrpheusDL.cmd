@@ -10,9 +10,11 @@ rem modules.backup-VERSION. All the work is done by the new EXE itself
 rem (--install-into), the same code the in-app update uses.
 
 set "RC=2"
-set "TARGET=%~dp0.."
-rem Unpacked straight over the old folder: update that folder itself.
-if exist "%~dp0config\" set "TARGET=%~dp0."
+rem The old install is the folder above when it has the program and config.
+rem Otherwise this folder itself (the ZIP was unpacked straight over the old
+rem folder); the EXE refuses when neither is an OrpheusDL folder.
+set "TARGET=%~dp0."
+if exist "%~dp0..\OrpheusDL_GUI.exe" if exist "%~dp0..\config\" set "TARGET=%~dp0.."
 
 if not exist "%~dp0OrpheusDL_GUI.exe" (
   echo OrpheusDL_GUI.exe is missing next to this script. Unpack the whole ZIP.

@@ -20006,6 +20006,10 @@ if __name__ == "__main__":
         raise
     except Exception as _update_cli_error:
         print(f"[Update] {_update_cli_error}")
+        # Started as the update script's installer: never go on into the app
+        # here, it would create an empty config/ next to the new EXE.
+        if "--install-into" in sys.argv:
+            sys.exit(1)
     _mutex_handle = None
     if platform.system() == "Windows":
         try:

@@ -550,3 +550,84 @@ class TestGuiWiring:
     def test_modules_refresh_before_the_stock_copy(self, main_block):
         refresh = main_block.index("_hires_self_update.refresh_modules_on_start(")
         assert refresh < main_block.index("copy_bundled_resources_to_data_dir(_DATA_DIR)")
+
+
+class TestReviewFindings:
+    """Findings of the reviewer (W/review.md), each reproduced first."""
+
+    def test_unexpected_error_in_the_script_path_is_a_failure_not_a_crash(self, app, bundle, tmp_path, monkeypatch):
+        """M1: an OSError escaped install_into; gui.py then started the full app
+        from the unpacked sub folder and created an empty config/ there."""
+        monkeypatch.setattr(su, "mutex_exists", lambda name=su.MUTEX_NAME: False)
+
+        def boom(*a, **k):
+            raise PermissionError(13, "denied", str(tmp_path / "secret-user-path"))
+
+        monkeypatch.setattr(su, "refresh_modules", boom)
+        exe = tmp_path / "new" / "OrpheusDL_GUI.exe"
+        exe.parent.mkdir()
+        exe.write_bytes(NEW_EXE_BYTES)
+        shown = []
+        code = su.run_cli(["x", "--install-into", str(app), "--no-start"], own_exe=str(exe),
+                          bundle_dir=str(bundle), new_version=NEW_VERSION,
+                          show=lambda text, error: shown.append(text))
+        assert code == su.EXIT_FAILED
+        assert "PermissionError" in shown[0] and "secret-user-path" not in shown[0]
+
+    def test_gui_never_starts_the_app_after_a_failed_install(self):
+        source = (Path(__file__).resolve().parents[1] / "gui.py").read_text(encoding="utf-8")
+        start = source.index("_hires_self_update.run_cli(sys.argv)")
+        block = source[start:source.index("_mutex_handle = None", start)]
+        assert '"--install-into" in sys.argv' in block and "sys.exit(1)" in block
+
+    def test_script_prefers_the_old_folder_above(self):
+        """M2: a config/ next to the new EXE (it was started once) made the
+        script update the sub folder and never the real install."""
+        text = (Path(__file__).resolve().parents[1] / "installer" / "windows" / "Update OrpheusDL.cmd").read_text()
+        assert 'if exist "%~dp0..\OrpheusDL_GUI.exe" if exist "%~dp0..\config\\" set "TARGET=%~dp0.."' in text
+        assert text.index('set "TARGET=%~dp0."') < text.index('set "TARGET=%~dp0.."')
+
+    def test_failed_rollback_says_where_the_old_program_is(self, app, tmp_path, monkeypatch):
+        """N1: both renames failing left no OrpheusDL_GUI.exe and said 'nothing replaced'."""
+        new = tmp_path / "new.exe"
+        new.write_bytes(NEW_EXE_BYTES)
+        real = os.rename
+
+        def flaky(src, dst):
+            if os.path.basename(dst) == su.EXE_NAME:
+                raise PermissionError("locked")
+            return real(src, dst)
+
+        monkeypatch.setattr(su.os, "rename", flaky)
+        with pytest.raises(su.UpdateError, match="OrpheusDL_GUI.old.exe"):
+            su.swap_exe(str(app), str(new))
+        assert (app / su.OLD_EXE).read_bytes() == OLD_EXE_BYTES
+        assert (app / su.NEW_EXE).exists(), "the verified new EXE is kept for a manual fix"
+
+    def test_cleanup_keeps_the_staged_exe_when_the_program_is_missing(self, app):
+        """N2: after a crash between the renames only .old.exe and .new.exe exist."""
+        (app / "OrpheusDL_GUI.exe").rename(app / su.OLD_EXE)
+        (app / su.NEW_EXE).write_bytes(NEW_EXE_BYTES)
+        su.cleanup_leftovers(str(app))
+        assert (app / su.NEW_EXE).exists()
+
+    def test_module_failure_after_the_swap_says_the_program_is_new(self, app, bundle, tmp_path, monkeypatch):
+        """N4: the EXE was replaced but the message said nothing was."""
+        monkeypatch.setattr(su, "refresh_modules", lambda *a, **k: (_ for _ in ()).throw(su.UpdateError("module tidal is in use (PermissionError)")))
+        exe = tmp_path / "new" / "OrpheusDL_GUI.exe"
+        exe.parent.mkdir()
+        exe.write_bytes(NEW_EXE_BYTES)
+        result = su.install_into(str(app), own_exe=str(exe), bundle_dir=str(bundle),
+                                 new_version=NEW_VERSION, is_running=lambda: False)
+        assert result.code == su.EXIT_FAILED
+        assert "program is updated" in result.message and "run the update again" in result.message
+
+    def test_module_refresh_log_has_no_paths(self, app, bundle, tmp_path, monkeypatch):
+        """N5: an OSError text carries full paths into update.log."""
+        def boom(*a, **k):
+            raise PermissionError(13, "denied", str(app / "modules" / "tidal"))
+
+        monkeypatch.setattr(su, "refresh_modules", boom)
+        su.refresh_modules_on_start(str(app), str(bundle), NEW_VERSION)
+        text = (app / "update" / "update.log").read_text(encoding="utf-8")
+        assert "PermissionError" in text and str(app) not in text

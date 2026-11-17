@@ -136,7 +136,12 @@ class TestPlaylistProviderInterface:
             ("AviciiOfficialVEVO", "Avicii"),
             ("Dua Lipa Official", "Dua Lipa"),
             ("DuaLipaOfficial", "Dua Lipa"),
-            ("Calvin Harris Music", "Calvin Harris"),
+            ("Calvin Harris Music", "Calvin Harris Music"),  # spaced "Music" may be the name
+            ("Roxy Music - Topic", "Roxy Music"),  # review N8: was "Roxy"
+            ("Roxy Music", "Roxy Music"),
+            ("MTV", "MTV"),  # review N8: was "M"
+            ("Unofficial", "Unofficial"),  # review N8: was "Un"
+            ("Bastille Videos", "Bastille"),
             ("RobinSchulzMusic", "Robin Schulz"),
             ("KygoOfficialTV", "Kygo"),
             ("Kraftwerk", "Kraftwerk"),

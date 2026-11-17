@@ -257,7 +257,11 @@ def swap_exe(app_dir: str, new_exe: str, *, exe_name: str = EXE_NAME) -> None:
         try:
             os.rename(old, target)
         except OSError:
-            pass
+            # Neither EXE is at its place now. Keep both and say how to fix it.
+            raise UpdateError(
+                f"the new EXE could not be put in place ({type(exc).__name__}); the previous "
+                f"program is {OLD_EXE} and the new one {NEW_EXE} -- rename one of them to {EXE_NAME}"
+            ) from None
         _remove(staged)
         raise UpdateError(f"the new EXE could not be put in place ({type(exc).__name__})") from None
 
@@ -345,8 +349,11 @@ def refresh_modules_on_start(app_dir: str, bundle_dir: Optional[str], version: O
         return None
     try:
         result = refresh_modules(app_dir, bundled, version)
-    except (UpdateError, OSError) as exc:
+    except UpdateError as exc:
         log(app_dir, f"modules for {version} not refreshed: {exc}")
+        return None
+    except OSError as exc:  # its text names paths -- the log does not
+        log(app_dir, f"modules for {version} not refreshed ({type(exc).__name__})")
         return None
     log(
         app_dir,
@@ -357,8 +364,13 @@ def refresh_modules_on_start(app_dir: str, bundle_dir: Optional[str], version: O
 
 
 def cleanup_leftovers(app_dir: str) -> None:
-    """Remove what an interrupted update left behind (staged EXE, part files)."""
-    _remove(os.path.join(app_dir, NEW_EXE))
+    """Remove what an interrupted update left behind (staged EXE, part files).
+
+    A staged EXE is only removed while the program itself is in place: after a
+    crash between the two renames it may be the only complete new program.
+    """
+    if os.path.isfile(os.path.join(app_dir, EXE_NAME)):
+        _remove(os.path.join(app_dir, NEW_EXE))
     folder = update_dir(app_dir)
     try:
         names = os.listdir(folder)
@@ -507,17 +519,26 @@ def install_into(
     old_label = read_marker(target_dir) or "previous version"
     target_exe = os.path.join(target_dir, EXE_NAME)
     same_exe = os.path.abspath(own_exe) == target_exe or sha256_file(own_exe) == sha256_file(target_exe)
+    swapped = False
     try:
         if not same_exe:
             swap_exe(target_dir, own_exe)
+            swapped = True
         bundled = os.path.join(bundle_dir, MODULES) if bundle_dir else ""
         if new_version and read_marker(target_dir) != new_version:
             modules = refresh_modules(target_dir, bundled, new_version)
         else:
             modules = ModuleRefresh()
-    except UpdateError as exc:
-        log(target_dir, f"script update to {version} failed: {exc}")
-        return InstallResult(EXIT_FAILED, f"Update failed: {exc}. Your settings are untouched.")
+    except (UpdateError, OSError) as exc:
+        reason = str(exc) if isinstance(exc, UpdateError) else type(exc).__name__  # no paths
+        log(target_dir, f"script update to {version} failed: {reason}")
+        if swapped:
+            return InstallResult(
+                EXIT_FAILED,
+                f"The program is updated, but its modules are not ({reason}). Close everything "
+                "and run the update again. Your settings are untouched.",
+            )
+        return InstallResult(EXIT_FAILED, f"Update failed: {reason}. Your settings are untouched.")
     if same_exe and not modules.replaced and not modules.added:
         log(target_dir, f"script update: already {version}")
         return InstallResult(EXIT_OK, f"OrpheusDL is already {short_label(version)}. Nothing to do.")
@@ -570,7 +591,10 @@ def run_cli(argv: Sequence[str], *, own_exe: Optional[str] = None,
     if new_version is None:
         from .app_version import current_version
         new_version = current_version()
-    result = install_into(target, own_exe=own_exe, bundle_dir=bundle_dir, new_version=new_version)
+    try:
+        result = install_into(target, own_exe=own_exe, bundle_dir=bundle_dir, new_version=new_version)
+    except Exception as exc:  # never fall through into starting the app here
+        result = InstallResult(EXIT_FAILED, f"Update failed ({type(exc).__name__}). Your settings are untouched.")
     if "--quiet" not in args:
         show(result.message, result.code != EXIT_OK)
     if result.code == EXIT_OK and "--no-start" not in args:
