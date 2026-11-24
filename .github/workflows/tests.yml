@@ -24,11 +24,12 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # The hires suite is deliberately tkinter-free; it needs requests, and
-      # mutagen (already an OrpheusDL dependency) for the target format.
+      # mutagen (already an OrpheusDL dependency) for the target format, and
+      # pillow + tqdm (also already dependencies) for the cover resize test.
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests mutagen
+          pip install pytest requests mutagen pillow tqdm
 
       # The conversion tests run real ffmpeg and check with ffprobe; elsewhere
       # they skip themselves.

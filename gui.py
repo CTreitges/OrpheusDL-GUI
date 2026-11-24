@@ -11877,6 +11877,12 @@ def patch_download_file_for_cancellation():
 
                     from PIL import Image
                     with Image.open(file_location) as im:
+                        # JPEG has no alpha or palette: flatten such covers onto white first
+                        if new_format == 'jpeg' and (im.mode in ('RGBA', 'LA', 'PA', 'P') or 'transparency' in im.info):
+                            im = im.convert('RGBA')
+                            background = Image.new('RGB', im.size, (255, 255, 255))
+                            background.paste(im, mask=im.getchannel('A'))
+                            im = background
                         im = im.resize((new_resolution, new_resolution), Image.Resampling.BICUBIC)
                         im.save(file_location, new_format, quality=new_compression)
 
