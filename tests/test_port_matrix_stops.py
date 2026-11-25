@@ -319,6 +319,33 @@ def test_port_matrix_late_spotify_playlists_of_the_old_direction_are_dropped(tmp
     assert ctrl.playlists == []
 
 
+def test_port_matrix_spotify_sign_in_status_after_a_switch_is_dropped(tmp_path):
+    """A sign-in status line from the old direction must not overwrite the
+    hint of the new one (review of PR #5)."""
+    switched = threading.Event()
+
+    class SignInSpotify(FakeService):
+        def is_user_authorized(self):
+            return False
+
+        def list_user_playlists(self):
+            return []
+
+    ctrl, _queue, _services, _calls = controller_with(tmp_path, {"Spotify": SignInSpotify("Spotify")})
+
+    def sign_in(source, on_status):
+        switched.wait(5)  # the user changes direction while the browser opens
+
+    ctrl._authorize_blocking = sign_in
+    ctrl.set_direction("Spotify", "TIDAL")
+    statuses = []
+    thread = ctrl.load_playlists(lambda root: None, lambda msg: None, on_status=statuses.append)
+    ctrl.set_direction("SoundCloud", "TIDAL")
+    switched.set()
+    thread.join(5)
+    assert statuses == []
+
+
 # -- 9. queueing does not build providers on the UI thread ----------------------------
 
 def test_port_matrix_queueing_builds_no_provider(tmp_path):
