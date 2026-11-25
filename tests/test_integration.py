@@ -408,6 +408,37 @@ class TestCompletion:
 
         assert queue.list()[0].status == QueueStatus.CANCELLED.value
 
+    def test_cancel_then_own_download_still_marks_cancelled(self, queue, tmp_path):
+        """TS-ORPHEUS review finding 2: the user stops the hi-res item and
+        starts a download of his own before the next poll. gui.py's start
+        clears ``stop_event``, so the event alone no longer shows the stop."""
+
+        class StoppingGui(FakeGui):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._download_stop_requests = 0
+
+            def stop_download(self):
+                # Mimic gui.py: count the request, then signal the worker.
+                self._download_stop_requests += 1
+                self.stop_event.set()
+
+            def _start_single_download(self, url, path, search_result_data=None):
+                self.stop_event.clear()  # gui.py does this on every start
+                return super()._start_single_download(url, path, search_result_data)
+
+        gui = StoppingGui(output_path=str(tmp_path / "out"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        gui.stop_download()
+        gui.download_process_active = False  # the hi-res worker has stopped
+        gui._start_single_download("user-url", str(tmp_path / "mine"))
+        runtime._pump()
+
+        assert queue.list()[0].status == QueueStatus.CANCELLED.value
+
     def test_unknown_target_folder_gets_benefit_of_the_doubt(self, queue):
         gui = FakeGui(output_path=None)
         runtime = make_runtime(gui, queue)

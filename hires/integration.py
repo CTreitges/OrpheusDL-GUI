@@ -125,6 +125,10 @@ class HiresRuntime:
         self._baseline_mtime: float = 0.0
         #: gui.py's ``_active_download_thread`` right after our start.
         self._active_thread: Any = None
+        #: gui.py's ``_download_stop_requests`` just before our start: a higher
+        #: count later means the user stopped our item, even after a new start
+        #: has cleared ``stop_event`` again.
+        self._stop_baseline: Optional[int] = None
         #: Quality label per finished download thread, from
         #: :func:`hires.download_finish.after_download`.
         self._reports: dict = {}
@@ -311,6 +315,7 @@ class HiresRuntime:
         )
 
         self._log(f"|GRAY|[Hi-Res] Queue -> {item.display_name}|RESET|")
+        self._stop_baseline = self._stop_requests()
         try:
             started = start(item.url, output_path, search_result_data)
         except Exception as exc:
@@ -351,10 +356,11 @@ class HiresRuntime:
         # Read the baseline before clearing it -- _clear_active() resets the
         # counters that _produced_audio compares against.
         baseline = (self._baseline_count, self._baseline_mtime)
+        stop_baseline = self._stop_baseline
         quality = self._reports.pop(self._active_thread, "") if self._active_thread else ""
         self._clear_active()
 
-        if self._was_cancelled():
+        if self._was_cancelled(stop_baseline):
             self.queue.mark_cancelled(item_id)
             self._log("|GRAY|[Hi-Res] Item cancelled.|RESET|")
             return
@@ -373,13 +379,21 @@ class HiresRuntime:
         self._baseline_count = 0
         self._baseline_mtime = 0.0
         self._active_thread = None
+        self._stop_baseline = None
 
-    def _was_cancelled(self) -> bool:
+    def _stop_requests(self) -> Optional[int]:
+        count = getattr(self.gui, "_download_stop_requests", None)
+        return count if isinstance(count, int) else None
+
+    def _was_cancelled(self, stop_baseline: Optional[int] = None) -> bool:
         stop_event = getattr(self.gui, "stop_event", None)
         try:
-            return bool(stop_event is not None and stop_event.is_set())
+            if stop_event is not None and stop_event.is_set():
+                return True
         except Exception:
-            return False
+            pass
+        count = self._stop_requests()
+        return stop_baseline is not None and count is not None and count > stop_baseline
 
     def _produced_audio(self, path: Optional[str], baseline: tuple) -> tuple:
         """Did the finished download actually write audio?

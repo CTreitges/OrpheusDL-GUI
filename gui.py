@@ -1590,6 +1590,9 @@ def amazonmusic_oauth_flow_handler(oauth_url: str, application_name: str) -> str
 file_download_queue = []
 output_queue = queue.Queue()
 _active_download_thread = None
+# Counts every stop request. The next start clears stop_event, so the hi-res
+# queue reads this to tell a stopped item from a failed one (hires/integration.py).
+_download_stop_requests = 0
 _interruptible_download_thread = None  # inner worker from run_interruptible_download (must not be abandoned)
 current_batch_output_path = None
 _current_download_context = None
@@ -13356,7 +13359,8 @@ def start_download_thread(search_result_data=None):
         current_batch_output_path = None
 
 def stop_download():
-    global stop_event, output_queue
+    global stop_event, output_queue, _download_stop_requests
+    _download_stop_requests += 1
     stop_event.set()
     output_queue.put("|GRAY|Download stop requested... Please wait.|RESET|\n")
 
