@@ -86,6 +86,23 @@ class FakeGui:
         return self._start_single_download(urls[0], path, None)
 
 
+class StoppingGui(FakeGui):
+    """FakeGui with gui.py's stop counter and its stop_event.clear() on start."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._download_stop_requests = 0
+
+    def stop_download(self):
+        # Mimic gui.py: count the request, then signal the worker.
+        self._download_stop_requests += 1
+        self.stop_event.set()
+
+    def _start_single_download(self, url, path, search_result_data=None):
+        self.stop_event.clear()  # gui.py does this on every start
+        return super()._start_single_download(url, path, search_result_data)
+
+
 @pytest.fixture
 def queue(tmp_path):
     return QueueStore(str(tmp_path / "queue.json"))
@@ -407,6 +424,48 @@ class TestCompletion:
         finish_download(runtime, gui)
 
         assert queue.list()[0].status == QueueStatus.CANCELLED.value
+
+    def test_cancel_then_own_download_still_marks_cancelled(self, queue, tmp_path):
+        """TS-ORPHEUS review finding 2: the user stops the hi-res item and
+        starts a download of his own before the next poll. gui.py's start
+        clears ``stop_event``, so the event alone no longer shows the stop."""
+
+        gui = StoppingGui(output_path=str(tmp_path / "out"))
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        gui.stop_download()
+        gui.download_process_active = False  # the hi-res worker has stopped
+        gui._start_single_download("user-url", str(tmp_path / "mine"))
+        runtime._pump()
+
+        assert queue.list()[0].status == QueueStatus.CANCELLED.value
+
+    def test_with_a_stop_counter_an_unstopped_item_is_done(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = StoppingGui(output_path=target)
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()
+        write_audio(target, "one.flac")
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
+
+    def test_a_stop_before_the_item_started_does_not_cancel_it(self, queue, tmp_path):
+        target = str(tmp_path / "out")
+        gui = StoppingGui(output_path=target)
+        gui.stop_download()  # an earlier download of the user's
+        runtime = make_runtime(gui, queue)
+        queue.add(QueueItem(url="u"))
+
+        runtime._pump()  # gui.py's start clears stop_event
+        write_audio(target, "one.flac")
+        finish_download(runtime, gui)
+
+        assert queue.list()[0].status == QueueStatus.DONE.value
 
     def test_unknown_target_folder_gets_benefit_of_the_doubt(self, queue):
         gui = FakeGui(output_path=None)
