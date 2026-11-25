@@ -676,8 +676,13 @@ class SpotifyImportController:
         on_done: Callable[[List[PlaylistRef]], None],
         on_error: Callable[[str], None],
         on_status: Optional[Callable[[str], None]] = None,
+        is_current: Optional[Callable[[], bool]] = None,
     ) -> threading.Thread:
-        """List the user's playlists, signing in first if that has not happened."""
+        """List the user's playlists, signing in first if that has not happened.
+
+        ``is_current`` lets a caller that can switch away (the Port tab) keep a
+        late answer from replacing the list it shows now.
+        """
 
         def work():
             try:
@@ -695,11 +700,13 @@ class SpotifyImportController:
             except Exception as exc:
                 self.dispatch(on_error, _describe(exc))
                 return
-            self.playlists = list(playlists)
+            playlists = list(playlists)
+            if is_current is None or is_current():
+                self.playlists = playlists
             # Same contract as the TIDAL tab, so one widget renders both.
             # Spotify's Web API does not expose folders at all, so this root is
             # always unnamed -- see HIRES.md.
-            self.dispatch(on_done, flat_root(self.playlists, platform="Spotify"))
+            self.dispatch(on_done, flat_root(playlists, platform="Spotify"))
 
         return run_in_background(work, name="hires-spotify-playlists")
 

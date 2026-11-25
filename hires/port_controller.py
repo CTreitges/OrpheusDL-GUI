@@ -219,8 +219,15 @@ class PortController(SpotifyImportController):
             return deliver
 
         on_done, on_error = still(on_done), still(on_error)
+        # The sign-in status lines too: they would overwrite the new direction's hint.
+        on_status = still(on_status) if on_status else None
         if self.source_service == "Spotify":
-            return super().load_playlists(on_done, on_error, on_status=on_status)
+            return super().load_playlists(
+                on_done,
+                on_error,
+                on_status=on_status,
+                is_current=lambda: self.direction == direction,
+            )
         service = self.source_service
 
         def work():
