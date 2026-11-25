@@ -298,6 +298,27 @@ def test_port_matrix_late_playlists_of_the_old_direction_are_dropped(tmp_path):
     assert ctrl.playlists == []
 
 
+def test_port_matrix_late_spotify_playlists_of_the_old_direction_are_dropped(tmp_path):
+    """N2: the Spotify path keeps its own sign-in loader; a late answer there
+    must not overwrite the list of the direction that is now shown."""
+    gate = threading.Event()
+
+    class SlowSpotify(FakeService):
+        def list_user_playlists(self):
+            gate.wait(5)
+            return [PlaylistRef(id="sp1", name="Spotify list", platform="Spotify")]
+
+    ctrl, _queue, _services, _calls = controller_with(tmp_path, {"Spotify": SlowSpotify("Spotify")})
+    ctrl.set_direction("Spotify", "TIDAL")
+    roots, errors = [], []
+    thread = ctrl.load_playlists(roots.append, errors.append)
+    ctrl.set_direction("SoundCloud", "TIDAL")
+    gate.set()
+    thread.join(5)
+    assert roots == [] and errors == []
+    assert ctrl.playlists == []
+
+
 # -- 9. queueing does not build providers on the UI thread ----------------------------
 
 def test_port_matrix_queueing_builds_no_provider(tmp_path):
